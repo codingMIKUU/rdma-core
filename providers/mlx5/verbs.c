@@ -2799,7 +2799,6 @@ struct ibv_qp *mlx5_create_qp(struct ibv_pd *pd,
 	qp = create_qp(pd->context, &attrx, NULL);
 	if (qp)
 		memcpy(attr, &attrx, sizeof(*attr));
-
 	return qp;
 }
 
