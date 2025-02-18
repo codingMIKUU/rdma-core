@@ -374,7 +374,7 @@ int create_ah(struct ud_resources *ud_res)
 	ah_attr.dlid = ud_res->port_attr.sm_lid;
 	ah_attr.port_num = config->port_num;
 
-	ud_res->ah = ibv_create_ah(ud_res->pd, &ah_attr);
+	ud_res->ah = ibv_create_ah(ud_res->pd, &ah_attr,NULL,NULL,NULL);
 	if (!ud_res->ah) {
 		pr_err("failed to create UD AV\n");
 		return -1;

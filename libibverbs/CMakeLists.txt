@@ -54,6 +54,7 @@ rdma_library(ibverbs "${CMAKE_CURRENT_BINARY_DIR}/libibverbs.map"
   static_driver.c
   sysfs.c
   verbs.c
+  conn.c
   )
 target_link_libraries(ibverbs LINK_PRIVATE
   ${NL_LIBRARIES}

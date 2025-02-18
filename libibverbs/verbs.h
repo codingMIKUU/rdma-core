@@ -69,7 +69,11 @@ union ibv_gid {
 		__be64	interface_id;
 	} global;
 };
-
+struct ibv_qp_info {
+    uint32_t qpn;
+    union ibv_gid gid;
+	char rconn_server[64];
+};
 enum ibv_gid_type {
 	IBV_GID_TYPE_IB,
 	IBV_GID_TYPE_ROCE_V1,
@@ -767,6 +771,8 @@ struct ibv_ah_attr {
 	uint8_t			static_rate;
 	uint8_t			is_global;
 	uint8_t			port_num;
+	uint8_t 	    check_xrc;// if 1, for xrc ini qp ;if 2, for xrc tgt qp 
+	uint32_t 		dqpn;
 };
 
 enum ibv_srq_attr_mask {
@@ -902,10 +908,10 @@ enum ibv_qp_type {
 	IBV_QPT_RC = 2,
 	IBV_QPT_UC,
 	IBV_QPT_UD,
+	IBV_QPT_SRM = 7,
 	IBV_QPT_RAW_PACKET = 8,
 	IBV_QPT_XRC_SEND = 9,
 	IBV_QPT_XRC_RECV,
-	IBV_QPT_SRM,
 	IBV_QPT_DRIVER = 0xff,
 };
 
@@ -1184,6 +1190,10 @@ struct ibv_send_wr {
 		struct {
 			uint32_t    remote_srqn;
 		} xrc;
+		struct {
+			uint32_t 	remote_srqn;
+			union ibv_gid     remote_gid;
+		} srm;
 	} qp_type;
 	union {
 		struct {
@@ -1197,6 +1207,47 @@ struct ibv_send_wr {
 			uint16_t		mss;
 		} tso;
 	};
+};
+
+struct ibv_send_wr_q{
+	uint64_t		wr_id;
+	enum ibv_wr_opcode	opcode;
+	unsigned int		send_flags;
+	/* When opcode is *_WITH_IMM: Immediate data in network byte order.
+	 * When opcode is *_INV: Stores the rkey to invalidate
+	 */
+	union {
+		__be32			imm_data;
+		uint32_t		invalidate_rkey;
+	};
+	union {
+		struct {
+			uint64_t	remote_addr;
+			uint32_t	rkey;
+		} rdma;
+		struct {
+			uint64_t	remote_addr;
+			uint64_t	compare_add;
+			uint64_t	swap;
+			uint32_t	rkey;
+		} atomic;
+		struct {
+			struct ibv_ah  *ah;
+			uint32_t	remote_qpn;
+			uint32_t	remote_qkey;
+		} ud;
+	} wr;
+	union {
+		struct {
+			uint32_t    remote_srqn;
+		} xrc;
+		struct {
+			uint32_t 	remote_srqn;
+			union ibv_gid     remote_gid;
+		} srm;
+	} qp_type;
+	struct ibv_sge sge;
+	uint8_t padding[26];
 };
 
 struct ibv_recv_wr {
@@ -1695,8 +1746,9 @@ static inline int ibv_post_wq_recv(struct ibv_wq *wq,
 
 struct ibv_ah {
 	struct ibv_context     *context;
-	struct ibv_pd	       *pd;
+	struct ibv_pd	       *pd;  		
 	uint32_t		handle;
+	uint32_t 		srmc_flags;
 };
 
 enum ibv_flow_flags {
@@ -3398,7 +3450,8 @@ static inline int ibv_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
 /**
  * ibv_create_ah - Create an address handle.
  */
-struct ibv_ah *ibv_create_ah(struct ibv_pd *pd, struct ibv_ah_attr *attr);
+struct ibv_ah *ibv_create_ah(struct ibv_pd *pd, struct ibv_ah_attr *attr,struct ibv_xrcd *xrcd,
+					struct ibv_qp_info *local_qp_info,struct ibv_qp_info *remote_qp_info);
 
 /**
  * ibv_init_ah_from_wc - Initializes address handle attributes from a

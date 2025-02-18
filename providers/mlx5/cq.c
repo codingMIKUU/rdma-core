@@ -986,7 +986,15 @@ static inline int mlx5_poll_one(struct mlx5_cq *cq,
 	struct mlx5_cqe64 *cqe64;
 	void *cqe;
 	int err;
-
+	// //TODO: add specific SRM type
+	// if(wc->wr_id){
+	// 	struct ibv_wc *buf_wc = cq->active_buf->buf + (cq->cons_index & cq->verbs_cq.cq.cqe)*cq->cqe_sz;//TODO:update cqe_sz to sz of wc
+	// 	buf_wc->src_qp = 0;
+	// 	memcpy(wc, buf_wc, sizeof(struct ibv_wc));
+	// 	buf_wc->wr_id = 0;
+	// 	++cq->cons_index;
+	// 	return CQ_OK;
+	// }
 	err = mlx5_get_next_cqe(cq, &cqe64, &cqe);
 	if (err == CQ_EMPTY)
 		return err;

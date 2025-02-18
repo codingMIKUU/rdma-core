@@ -935,7 +935,7 @@ COMPAT_SYMVER_FUNC(ibv_create_ah, 1_0, "IBVERBS_1.0",
 	if (!ah)
 		return NULL;
 
-	real_ah = ibv_create_ah(pd->real_pd, attr);
+	real_ah = ibv_create_ah(pd->real_pd, attr,NULL,NULL,NULL);
 	if (!real_ah) {
 		free(ah);
 		return NULL;

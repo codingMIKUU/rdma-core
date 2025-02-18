@@ -53,6 +53,7 @@
 #include <rdma/ib_user_ioctl_cmds.h>
 #include <rdma/mlx5_user_ioctl_cmds.h>
 #include <infiniband/cmd_write.h>
+#include <infiniband/verbs.h>
 
 #include "mlx5.h"
 #include "mlx5-abi.h"
@@ -64,6 +65,9 @@ int mlx5_single_threaded = 0;
 static inline int is_xrc_tgt(int type)
 {
 	return type == IBV_QPT_XRC_RECV;
+}
+static inline int is_srm(int type){
+	return type == IBV_QPT_SRM;
 }
 
 static int mlx5_read_clock(struct ibv_context *context, uint64_t *cycles)
@@ -1533,6 +1537,7 @@ static int _sq_overhead(struct mlx5_qp *qp,
 				sizeof(struct mlx5_wqe_eth_pad);
 		break;
 
+	case IBV_QPT_SRM:
 	case IBV_QPT_XRC_RECV:
 	case IBV_QPT_XRC_SEND:
 		size += sizeof(struct mlx5_wqe_xrc_seg);
@@ -1566,6 +1571,7 @@ static int sq_overhead(struct mlx5_qp *qp, struct ibv_qp_init_attr_ex *attr,
 		case IBV_QPT_RC:
 		case IBV_QPT_UC:
 		case IBV_QPT_DRIVER:
+		case IBV_QPT_SRM:
 		case IBV_QPT_XRC_RECV:
 		case IBV_QPT_XRC_SEND:
 			ops = IBV_QP_EX_WITH_SEND |
@@ -1613,6 +1619,10 @@ static int mlx5_calc_send_wqe(struct mlx5_context *ctx,
 	int inl_size = 0;
 	int max_gather;
 	int tot_size;
+
+	if(attr->qp_type == IBV_QPT_SRM){
+		return sizeof(struct ibv_send_wr_q);
+	}
 
 	size = sq_overhead(qp, attr, mlx5_qp_attr);
 	if (size < 0)
@@ -1689,7 +1699,7 @@ static int mlx5_calc_sq_size(struct mlx5_context *ctx,
 	}
 
 	qp->max_inline_data = wqe_size - sq_overhead(qp, attr, mlx5_qp_attr) -
-		sizeof(struct mlx5_wqe_inl_data_seg);
+		sizeof(struct mlx5_wqe_inl_data_seg); //doesn't set properly for SRM
 	attr->cap.max_inline_data = qp->max_inline_data;
 
 	/*
@@ -1702,13 +1712,18 @@ static int mlx5_calc_sq_size(struct mlx5_context *ctx,
 	}
 
 	wq_size = roundup_pow_of_two(attr->cap.max_send_wr * wqe_size);
-	qp->sq.wqe_cnt = wq_size / MLX5_SEND_WQE_BB;
+	if(attr->qp_type == IBV_QPT_SRM){
+		qp->sq.wqe_cnt = wq_size/wqe_size;
+	}else
+		qp->sq.wqe_cnt = wq_size / MLX5_SEND_WQE_BB;
 	if (qp->sq.wqe_cnt > ctx->max_send_wqebb) {
 		mlx5_dbg(fp, MLX5_DBG_QP, "\n");
 		return -EINVAL;
 	}
-
-	qp->sq.wqe_shift = STATIC_ILOG_32(MLX5_SEND_WQE_BB) - 1;
+	if(attr->qp_type == IBV_QPT_SRM)
+		qp->sq.wqe_shift = STATIC_ILOG_32(128) - 1;
+	else 
+		qp->sq.wqe_shift = STATIC_ILOG_32(MLX5_SEND_WQE_BB) - 1;
 	qp->sq.max_gs = attr->cap.max_send_sge;
 	qp->sq.max_post = wq_size / wqe_size;
 
@@ -2413,7 +2428,7 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 		return NULL;
 	}
 
-	ibqp = &qp->verbs_qp.qp;
+	ibqp = &qp->verbs_qp;
 	qp->ibv_qp = ibqp;
 
 	if ((attr->comp_mask & IBV_QP_INIT_ATTR_CREATE_FLAGS) &&
@@ -2650,7 +2665,7 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 		qp->db[MLX5_RCV_DBR] = 0;
 		qp->db[MLX5_SND_DBR] = 0;
 	}
-
+	
 	cmd.buf_addr = (uintptr_t) qp->buf.buf;
 	cmd.sq_buf_addr = (attr->qp_type == IBV_QPT_RAW_PACKET ||
 			   qp->flags & MLX5_QP_FLAGS_USE_UNDERLAY) ?

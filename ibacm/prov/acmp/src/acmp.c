@@ -64,7 +64,7 @@
 #define IB_LID_MCAST_START 0xc000
 
 #define MAX_EP_ADDR 4
-#define MAX_EP_MC   2
+#define MAX_EP_MC 2
 
 enum acmp_state {
 	ACMP_INIT,
@@ -74,29 +74,18 @@ enum acmp_state {
 	ACMP_READY
 };
 
-enum acmp_addr_prot {
-	ACMP_ADDR_PROT_ACM
-};
+enum acmp_addr_prot { ACMP_ADDR_PROT_ACM };
 
-enum acmp_route_prot {
-	ACMP_ROUTE_PROT_ACM,
-	ACMP_ROUTE_PROT_SA
-};
+enum acmp_route_prot { ACMP_ROUTE_PROT_ACM, ACMP_ROUTE_PROT_SA };
 
-enum acmp_loopback_prot {
-	ACMP_LOOPBACK_PROT_NONE,
-	ACMP_LOOPBACK_PROT_LOCAL
-};
+enum acmp_loopback_prot { ACMP_LOOPBACK_PROT_NONE, ACMP_LOOPBACK_PROT_LOCAL };
 
 enum acmp_route_preload {
 	ACMP_ROUTE_PRELOAD_NONE,
 	ACMP_ROUTE_PRELOAD_OSM_FULL_V1
 };
 
-enum acmp_addr_preload {
-	ACMP_ADDR_PRELOAD_NONE,
-	ACMP_ADDR_PRELOAD_HOSTS
-};
+enum acmp_addr_preload { ACMP_ADDR_PRELOAD_NONE, ACMP_ADDR_PRELOAD_HOSTS };
 
 /*
  * Nested locking order: dest -> ep, dest -> port
@@ -104,121 +93,121 @@ enum acmp_addr_preload {
 struct acmp_ep;
 
 struct acmp_dest {
-	uint8_t                address[ACM_MAX_ADDRESS]; /* keep first */
-	char                   name[ACM_MAX_ADDRESS];
-	struct ibv_ah          *ah;
-	struct ibv_ah_attr     av;
+	uint8_t address[ACM_MAX_ADDRESS]; /* keep first */
+	char name[ACM_MAX_ADDRESS];
+	struct ibv_ah *ah;
+	struct ibv_ah_attr av;
 	struct ibv_path_record path;
-	union ibv_gid          mgid;
-	__be64                 req_id;
-	struct list_head       req_queue;
-	uint32_t               remote_qpn;
-	pthread_mutex_t        lock;
-	enum acmp_state        state;
-	atomic_t               refcnt;
-	uint64_t	       addr_timeout;
-	uint64_t	       route_timeout;
-	uint8_t                addr_type;
-	struct acmp_ep         *ep;
+	union ibv_gid mgid;
+	__be64 req_id;
+	struct list_head req_queue;
+	uint32_t remote_qpn;
+	pthread_mutex_t lock;
+	enum acmp_state state;
+	atomic_t refcnt;
+	uint64_t addr_timeout;
+	uint64_t route_timeout;
+	uint8_t addr_type;
+	struct acmp_ep *ep;
 };
 
 struct acmp_device;
 
 struct acmp_port {
-	struct acmp_device  *dev;
+	struct acmp_device *dev;
 	const struct acm_port *port;
-	struct list_head    ep_list;
-	pthread_mutex_t     lock;
-	struct acmp_dest    sa_dest;
+	struct list_head ep_list;
+	pthread_mutex_t lock;
+	struct acmp_dest sa_dest;
 	enum ibv_port_state state;
-	enum ibv_mtu        mtu;
-	enum ibv_rate       rate;
-	int                 subnet_timeout;
-	uint16_t            default_pkey_ix;
-	uint16_t            lid;
-	uint16_t            lid_mask;
-	uint8_t             port_num;
+	enum ibv_mtu mtu;
+	enum ibv_rate rate;
+	int subnet_timeout;
+	uint16_t default_pkey_ix;
+	uint16_t lid;
+	uint16_t lid_mask;
+	uint8_t port_num;
 };
 
 struct acmp_device {
-	struct ibv_context      *verbs;
+	struct ibv_context *verbs;
 	const struct acm_device *device;
 	struct ibv_comp_channel *channel;
-	struct ibv_pd           *pd;
-	__be64                  guid;
-	struct list_node        entry;
-	pthread_t               comp_thread_id;
-	int                     port_cnt;
-	struct acmp_port        port[0];
+	struct ibv_pd *pd;
+	__be64 guid;
+	struct list_node entry;
+	pthread_t comp_thread_id;
+	int port_cnt;
+	struct acmp_port port[0];
 };
 
 /* Maintain separate virtual send queues to avoid deadlock */
 struct acmp_send_queue {
-	int                   credits;
-	struct list_head      pending;
+	int credits;
+	struct list_head pending;
 };
 
 struct acmp_addr {
-	uint16_t              type;
-	union acm_ep_info     info;
-	struct acm_address    addr;
-	struct acmp_ep        *ep;
+	uint16_t type;
+	union acm_ep_info info;
+	struct acm_address addr;
+	struct acmp_ep *ep;
 };
 
 struct acmp_addr_ctx {
-	struct acmp_ep	     *ep;
-	int		     addr_inx;
+	struct acmp_ep *ep;
+	int addr_inx;
 };
 
 struct acmp_ep {
-	struct acmp_port      *port;
-	struct ibv_cq         *cq;
-	struct ibv_qp         *qp;
-	struct ibv_mr         *mr;
-	uint8_t               *recv_bufs;
-	struct list_node      entry;
-	char		      id_string[IBV_SYSFS_NAME_MAX + 11];
-	void                  *dest_map[ACM_ADDRESS_RESERVED - 1];
-	struct acmp_dest      mc_dest[MAX_EP_MC];
-	int                   mc_cnt;
-	uint16_t              pkey_index;
-	uint16_t	      pkey;
+	struct acmp_port *port;
+	struct ibv_cq *cq;
+	struct ibv_qp *qp;
+	struct ibv_mr *mr;
+	uint8_t *recv_bufs;
+	struct list_node entry;
+	char id_string[IBV_SYSFS_NAME_MAX + 11];
+	void *dest_map[ACM_ADDRESS_RESERVED - 1];
+	struct acmp_dest mc_dest[MAX_EP_MC];
+	int mc_cnt;
+	uint16_t pkey_index;
+	uint16_t pkey;
 	const struct acm_endpoint *endpoint;
-	pthread_mutex_t       lock;
+	pthread_mutex_t lock;
 	struct acmp_send_queue resolve_queue;
 	struct acmp_send_queue resp_queue;
-	struct list_head      active_queue;
-	struct list_head      wait_queue;
-	enum acmp_state       state;
+	struct list_head active_queue;
+	struct list_head wait_queue;
+	enum acmp_state state;
 	/* This lock protects nmbr_ep_addrs and addr_info */
-	pthread_rwlock_t      rwlock;
-	int		      nmbr_ep_addrs;
-	struct acmp_addr      *addr_info;
-	atomic_t              counters[ACM_MAX_COUNTER];
+	pthread_rwlock_t rwlock;
+	int nmbr_ep_addrs;
+	struct acmp_addr *addr_info;
+	atomic_t counters[ACM_MAX_COUNTER];
 };
 
 struct acmp_send_msg {
-	struct list_node     entry;
-	struct acmp_ep       *ep;
-	struct acmp_dest     *dest;
-	struct ibv_ah        *ah;
-	void                 *context;
-	void                 (*resp_handler)(struct acmp_send_msg *req,
-	                                     struct ibv_wc *wc, struct acm_mad *resp);
+	struct list_node entry;
+	struct acmp_ep *ep;
+	struct acmp_dest *dest;
+	struct ibv_ah *ah;
+	void *context;
+	void (*resp_handler)(struct acmp_send_msg *req, struct ibv_wc *wc,
+			     struct acm_mad *resp);
 	struct acmp_send_queue *req_queue;
-	struct ibv_mr        *mr;
-	struct ibv_send_wr   wr;
-	struct ibv_sge       sge;
-	uint64_t             expires;
-	int                  tries;
-	uint8_t              data[ACM_SEND_SIZE];
+	struct ibv_mr *mr;
+	struct ibv_send_wr wr;
+	struct ibv_sge sge;
+	uint64_t expires;
+	int tries;
+	uint8_t data[ACM_SEND_SIZE];
 };
 
 struct acmp_request {
-	uint64_t	id;
+	uint64_t id;
 	struct list_node entry;
-	struct acm_msg	msg;
-	struct acmp_ep	*ep;
+	struct acm_msg msg;
+	struct acmp_ep *ep;
 };
 
 static int acmp_open_dev(const struct acm_device *device, void **dev_context);
@@ -294,18 +283,17 @@ static int acmp_compare_dest(const void *dest1, const void *dest2)
 	return memcmp(dest1, dest2, ACM_MAX_ADDRESS);
 }
 
-static void
-acmp_set_dest_addr(struct acmp_dest *dest, uint8_t addr_type,
-		   const uint8_t *addr, size_t size)
+static void acmp_set_dest_addr(struct acmp_dest *dest, uint8_t addr_type,
+			       const uint8_t *addr, size_t size)
 {
 	memcpy(dest->address, addr, size);
 	dest->addr_type = addr_type;
-	acm_format_name(0, dest->name, sizeof dest->name, addr_type, addr, size);
+	acm_format_name(0, dest->name, sizeof dest->name, addr_type, addr,
+			size);
 }
 
-static void
-acmp_init_dest(struct acmp_dest *dest, uint8_t addr_type,
-	       const uint8_t *addr, size_t size)
+static void acmp_init_dest(struct acmp_dest *dest, uint8_t addr_type,
+			   const uint8_t *addr, size_t size)
 {
 	list_head_init(&dest->req_queue);
 	atomic_init(&dest->refcnt);
@@ -316,8 +304,7 @@ acmp_init_dest(struct acmp_dest *dest, uint8_t addr_type,
 	dest->state = ACMP_INIT;
 }
 
-static struct acmp_dest *
-acmp_alloc_dest(uint8_t addr_type, const uint8_t *addr)
+static struct acmp_dest *acmp_alloc_dest(uint8_t addr_type, const uint8_t *addr)
 {
 	struct acmp_dest *dest;
 
@@ -333,27 +320,26 @@ acmp_alloc_dest(uint8_t addr_type, const uint8_t *addr)
 }
 
 /* Caller must hold ep lock. */
-static struct acmp_dest *
-acmp_get_dest(struct acmp_ep *ep, uint8_t addr_type, const uint8_t *addr)
+static struct acmp_dest *acmp_get_dest(struct acmp_ep *ep, uint8_t addr_type,
+				       const uint8_t *addr)
 {
 	struct acmp_dest *dest, **tdest;
 
 	tdest = tfind(addr, &ep->dest_map[addr_type - 1], acmp_compare_dest);
 	if (tdest) {
 		dest = *tdest;
-		(void) atomic_inc(&dest->refcnt);
+		(void)atomic_inc(&dest->refcnt);
 		acm_log(2, "%s\n", dest->name);
 	} else {
 		dest = NULL;
-		acm_format_name(2, log_data, sizeof log_data,
-				addr_type, addr, ACM_MAX_ADDRESS);
+		acm_format_name(2, log_data, sizeof log_data, addr_type, addr,
+				ACM_MAX_ADDRESS);
 		acm_log(2, "%s not found\n", log_data);
 	}
 	return dest;
 }
 
-static void
-acmp_put_dest(struct acmp_dest *dest)
+static void acmp_put_dest(struct acmp_dest *dest)
 {
 	acm_log(2, "%s\n", dest->name);
 	if (atomic_dec(&dest->refcnt) == 0) {
@@ -362,8 +348,7 @@ acmp_put_dest(struct acmp_dest *dest)
 }
 
 /* Caller must hold ep lock. */
-static void
-acmp_remove_dest(struct acmp_ep *ep, struct acmp_dest *dest)
+static void acmp_remove_dest(struct acmp_ep *ep, struct acmp_dest *dest)
 {
 	acm_log(2, "%s\n", dest->name);
 	if (!tdelete(dest->address, &ep->dest_map[dest->addr_type - 1],
@@ -379,8 +364,8 @@ acmp_acquire_dest(struct acmp_ep *ep, uint8_t addr_type, const uint8_t *addr)
 	struct acmp_dest *dest;
 	int64_t rec_expr_minutes;
 
-	acm_format_name(2, log_data, sizeof log_data,
-			addr_type, addr, ACM_MAX_ADDRESS);
+	acm_format_name(2, log_data, sizeof log_data, addr_type, addr,
+			ACM_MAX_ADDRESS);
 	acm_log(2, "%s\n", log_data);
 	pthread_mutex_lock(&ep->lock);
 	dest = acmp_get_dest(ep, addr_type, addr);
@@ -392,7 +377,9 @@ acmp_acquire_dest(struct acmp_ep *ep, uint8_t addr_type, const uint8_t *addr)
 			acmp_remove_dest(ep, dest);
 			dest = NULL;
 		} else {
-			acm_log(2, "Record valid for the next %" PRId64 " minute(s)\n",
+			acm_log(2,
+				"Record valid for the next %" PRId64
+				" minute(s)\n",
 				rec_expr_minutes);
 		}
 	}
@@ -400,8 +387,9 @@ acmp_acquire_dest(struct acmp_ep *ep, uint8_t addr_type, const uint8_t *addr)
 		dest = acmp_alloc_dest(addr_type, addr);
 		if (dest) {
 			dest->ep = ep;
-			tsearch(dest, &ep->dest_map[addr_type - 1], acmp_compare_dest);
-			(void) atomic_inc(&dest->refcnt);
+			tsearch(dest, &ep->dest_map[addr_type - 1],
+				acmp_compare_dest);
+			(void)atomic_inc(&dest->refcnt);
 		}
 	}
 	pthread_mutex_unlock(&ep->lock);
@@ -435,7 +423,7 @@ acmp_alloc_send(struct acmp_ep *ep, struct acmp_dest *dest, size_t size)
 {
 	struct acmp_send_msg *msg;
 
-	msg = (struct acmp_send_msg *) calloc(1, sizeof *msg);
+	msg = (struct acmp_send_msg *)calloc(1, sizeof *msg);
 	if (!msg) {
 		acm_log(0, "ERROR - unable to allocate send buffer\n");
 		return NULL;
@@ -449,7 +437,8 @@ acmp_alloc_send(struct acmp_ep *ep, struct acmp_dest *dest, size_t size)
 	}
 
 	if (!dest->ah) {
-		msg->ah = ibv_create_ah(ep->port->dev->pd, &dest->av);
+		msg->ah = ibv_create_ah(ep->port->dev->pd, &dest->av, NULL,
+					NULL, NULL);
 		if (!msg->ah) {
 			acm_log(0, "ERROR - unable to create ah\n");
 			goto err2;
@@ -460,7 +449,7 @@ acmp_alloc_send(struct acmp_ep *ep, struct acmp_dest *dest, size_t size)
 	}
 
 	acm_log(2, "get dest %s\n", dest->name);
-	(void) atomic_inc(&dest->refcnt);
+	(void)atomic_inc(&dest->refcnt);
 	msg->dest = dest;
 
 	msg->wr.next = NULL;
@@ -468,13 +457,13 @@ acmp_alloc_send(struct acmp_ep *ep, struct acmp_dest *dest, size_t size)
 	msg->wr.num_sge = 1;
 	msg->wr.opcode = IBV_WR_SEND;
 	msg->wr.send_flags = IBV_SEND_SIGNALED;
-	msg->wr.wr_id = (uintptr_t) msg;
+	msg->wr.wr_id = (uintptr_t)msg;
 	msg->wr.wr.ud.remote_qpn = dest->remote_qpn;
 	msg->wr.wr.ud.remote_qkey = ACM_QKEY;
 
 	msg->sge.length = size;
 	msg->sge.lkey = msg->mr->lkey;
-	msg->sge.addr = (uintptr_t) msg->data;
+	msg->sge.addr = (uintptr_t)msg->data;
 	acm_log(2, "%p\n", msg);
 	return msg;
 
@@ -485,10 +474,10 @@ err1:
 	return NULL;
 }
 
-static void
-acmp_init_send_req(struct acmp_send_msg *msg, void *context,
-	void (*resp_handler)(struct acmp_send_msg *req,
-		struct ibv_wc *wc, struct acm_mad *resp))
+static void acmp_init_send_req(struct acmp_send_msg *msg, void *context,
+			       void (*resp_handler)(struct acmp_send_msg *req,
+						    struct ibv_wc *wc,
+						    struct acm_mad *resp))
 {
 	acm_log(2, "%p\n", msg);
 	msg->tries = retries + 1;
@@ -506,7 +495,8 @@ static void acmp_free_send(struct acmp_send_msg *msg)
 	free(msg);
 }
 
-static void acmp_post_send(struct acmp_send_queue *queue, struct acmp_send_msg *msg)
+static void acmp_post_send(struct acmp_send_queue *queue,
+			   struct acmp_send_msg *msg)
 {
 	struct acmp_ep *ep = msg->ep;
 	struct ibv_send_wr *bad_wr;
@@ -543,7 +533,8 @@ static void acmp_post_recv(struct acmp_ep *ep, uint64_t address)
 }
 
 /* Caller must hold ep lock */
-static void acmp_send_available(struct acmp_ep *ep, struct acmp_send_queue *queue)
+static void acmp_send_available(struct acmp_ep *ep,
+				struct acmp_send_queue *queue)
 {
 	struct acmp_send_msg *msg;
 	struct ibv_send_wr *bad_wr;
@@ -566,7 +557,8 @@ static void acmp_complete_send(struct acmp_send_msg *msg)
 	list_del(&msg->entry);
 	if (msg->tries) {
 		acm_log(2, "waiting for response\n");
-		msg->expires = time_stamp_ms() + ep->port->subnet_timeout + timeout;
+		msg->expires =
+			time_stamp_ms() + ep->port->subnet_timeout + timeout;
 		list_add_tail(&ep->wait_queue, &msg->entry);
 		if (atomic_inc(&wait_cnt) == 1)
 			event_signal(&timeout_event);
@@ -578,28 +570,29 @@ static void acmp_complete_send(struct acmp_send_msg *msg)
 	pthread_mutex_unlock(&ep->lock);
 }
 
-static struct acmp_send_msg *acmp_get_request(struct acmp_ep *ep, __be64 tid, int *free)
+static struct acmp_send_msg *acmp_get_request(struct acmp_ep *ep, __be64 tid,
+					      int *free)
 {
 	struct acmp_send_msg *msg, *next, *req = NULL;
 	struct acm_mad *mad;
 
 	acm_log(2, "\n");
 	pthread_mutex_lock(&ep->lock);
-	list_for_each_safe(&ep->wait_queue, msg, next, entry) {
-		mad = (struct acm_mad *) msg->data;
+	list_for_each_safe (&ep->wait_queue, msg, next, entry) {
+		mad = (struct acm_mad *)msg->data;
 		if (mad->tid == tid) {
 			acm_log(2, "match found in wait queue\n");
 			req = msg;
 			list_del(&msg->entry);
-			(void) atomic_dec(&wait_cnt);
+			(void)atomic_dec(&wait_cnt);
 			acmp_send_available(ep, msg->req_queue);
 			*free = 1;
 			goto unlock;
 		}
 	}
 
-	list_for_each(&ep->active_queue, msg, entry) {
-		mad = (struct acm_mad *) msg->data;
+	list_for_each (&ep->active_queue, msg, entry) {
+		mad = (struct acm_mad *)msg->data;
 		if (mad->tid == tid && msg->tries) {
 			acm_log(2, "match found in active queue\n");
 			req = msg;
@@ -638,16 +631,16 @@ static int acmp_best_mc_index(struct acmp_ep *ep, struct acm_resolve_rec *rec)
 	return -1;
 }
 
-static void
-acmp_record_mc_av(struct acmp_port *port, struct ib_mc_member_rec *mc_rec,
-	struct acmp_dest *dest)
+static void acmp_record_mc_av(struct acmp_port *port,
+			      struct ib_mc_member_rec *mc_rec,
+			      struct acmp_dest *dest)
 {
 	uint32_t sl_flow_hop;
 
 	sl_flow_hop = be32toh(mc_rec->sl_flow_hop);
 
 	dest->av.dlid = be16toh(mc_rec->mlid);
-	dest->av.sl = (uint8_t) (sl_flow_hop >> 28);
+	dest->av.sl = (uint8_t)(sl_flow_hop >> 28);
 	dest->av.src_path_bits = port->sa_dest.av.src_path_bits;
 	dest->av.static_rate = mc_rec->rate & 0x3F;
 	dest->av.port_num = port->port_num;
@@ -655,9 +648,9 @@ acmp_record_mc_av(struct acmp_port *port, struct ib_mc_member_rec *mc_rec,
 	dest->av.is_global = 1;
 	dest->av.grh.dgid = mc_rec->mgid;
 	dest->av.grh.flow_label = (sl_flow_hop >> 8) & 0xFFFFF;
-	dest->av.grh.sgid_index = acm_gid_index((struct acm_port *) port->port,
-						&mc_rec->port_gid);
-	dest->av.grh.hop_limit = (uint8_t) sl_flow_hop;
+	dest->av.grh.sgid_index =
+		acm_gid_index((struct acm_port *)port->port, &mc_rec->port_gid);
+	dest->av.grh.hop_limit = (uint8_t)sl_flow_hop;
 	dest->av.grh.traffic_class = mc_rec->tclass;
 
 	dest->path.dgid = mc_rec->mgid;
@@ -668,15 +661,14 @@ acmp_record_mc_av(struct acmp_port *port, struct ib_mc_member_rec *mc_rec,
 	dest->path.tclass = mc_rec->tclass;
 	dest->path.reversible_numpath = IBV_PATH_RECORD_REVERSIBLE | 1;
 	dest->path.pkey = mc_rec->pkey;
-	dest->path.qosclass_sl = htobe16((uint16_t) (sl_flow_hop >> 28));
+	dest->path.qosclass_sl = htobe16((uint16_t)(sl_flow_hop >> 28));
 	dest->path.mtu = mc_rec->mtu;
 	dest->path.rate = mc_rec->rate;
 	dest->path.packetlifetime = mc_rec->packet_lifetime;
 }
 
 /* Always send the GRH to transfer GID data to remote side */
-static void
-acmp_init_path_av(struct acmp_port *port, struct acmp_dest *dest)
+static void acmp_init_path_av(struct acmp_port *port, struct acmp_dest *dest)
 {
 	uint32_t flow_hop;
 
@@ -692,11 +684,11 @@ acmp_init_path_av(struct acmp_port *port, struct acmp_dest *dest)
 	pthread_mutex_lock(&port->lock);
 	if (port->port)
 		dest->av.grh.sgid_index = acm_gid_index(
-		   (struct acm_port *) port->port, &dest->path.sgid);
+			(struct acm_port *)port->port, &dest->path.sgid);
 	else
 		dest->av.grh.sgid_index = 0;
 	pthread_mutex_unlock(&port->lock);
-	dest->av.grh.hop_limit = (uint8_t) flow_hop;
+	dest->av.grh.hop_limit = (uint8_t)flow_hop;
 	dest->av.grh.traffic_class = dest->path.tclass;
 }
 
@@ -708,12 +700,13 @@ static void acmp_process_join_resp(struct acm_sa_mad *sa_mad)
 	int index, ret;
 	struct acmp_ep *ep = sa_mad->context;
 
-	mad = (struct ib_sa_mad *) &sa_mad->sa_mad;
+	mad = (struct ib_sa_mad *)&sa_mad->sa_mad;
 	acm_log(1, "response status: 0x%x, mad status: 0x%x\n",
 		sa_mad->umad.status, mad->status);
 	pthread_mutex_lock(&ep->lock);
 	if (sa_mad->umad.status) {
-		acm_log(0, "ERROR - send join failed 0x%x\n", sa_mad->umad.status);
+		acm_log(0, "ERROR - send join failed 0x%x\n",
+			sa_mad->umad.status);
 		goto out;
 	}
 	if (mad->status) {
@@ -721,7 +714,7 @@ static void acmp_process_join_resp(struct acm_sa_mad *sa_mad)
 		goto out;
 	}
 
-	mc_rec = (struct ib_mc_member_rec *) mad->data;
+	mc_rec = (struct ib_mc_member_rec *)mad->data;
 	index = acmp_mc_index(ep, &mc_rec->mgid);
 	if (index < 0) {
 		acm_log(0, "ERROR - MGID in join response not found\n");
@@ -734,14 +727,16 @@ static void acmp_process_join_resp(struct acm_sa_mad *sa_mad)
 	acmp_record_mc_av(ep->port, mc_rec, dest);
 
 	if (index == 0) {
-		dest->ah = ibv_create_ah(ep->port->dev->pd, &dest->av);
+		dest->ah = ibv_create_ah(ep->port->dev->pd, &dest->av, NULL,
+					 NULL, NULL);
 		if (!dest->ah) {
 			acm_log(0, "ERROR - unable to create ah\n");
 			goto out;
 		}
 		ret = ibv_attach_mcast(ep->qp, &dest->mgid, dest->av.dlid);
 		if (ret) {
-			acm_log(0, "ERROR - unable to attach QP to multicast group\n");
+			acm_log(0,
+				"ERROR - unable to attach QP to multicast group\n");
 			ibv_destroy_ah(dest->ah);
 			dest->ah = NULL;
 			goto out;
@@ -757,14 +752,14 @@ out:
 	pthread_mutex_unlock(&ep->lock);
 }
 
-static uint8_t
-acmp_record_acm_route(struct acmp_ep *ep, struct acmp_dest *dest)
+static uint8_t acmp_record_acm_route(struct acmp_ep *ep, struct acmp_dest *dest)
 {
 	int i;
 
 	acm_log(2, "\n");
 	for (i = 0; i < MAX_EP_MC; i++) {
-		if (!memcmp(&dest->mgid, &ep->mc_dest[i].mgid, sizeof dest->mgid))
+		if (!memcmp(&dest->mgid, &ep->mc_dest[i].mgid,
+			    sizeof dest->mgid))
 			break;
 	}
 	if (i == MAX_EP_MC) {
@@ -775,8 +770,8 @@ acmp_record_acm_route(struct acmp_ep *ep, struct acmp_dest *dest)
 	dest->path = ep->mc_dest[i].path;
 	dest->path.dgid = dest->av.grh.dgid;
 	dest->path.dlid = htobe16(dest->av.dlid);
-	dest->addr_timeout = time_stamp_min() + (unsigned) addr_timeout;
-	dest->route_timeout = time_stamp_min() + (unsigned) route_timeout;
+	dest->addr_timeout = time_stamp_min() + (unsigned)addr_timeout;
+	dest->route_timeout = time_stamp_min() + (unsigned)route_timeout;
 	dest->state = ACMP_READY;
 	return ACM_STATUS_SUCCESS;
 }
@@ -788,7 +783,7 @@ static void acmp_init_path_query(struct ib_sa_mad *mad)
 	mad->mgmt_class = IB_MGMT_CLASS_SA;
 	mad->class_version = 2;
 	mad->method = IB_METHOD_GET;
-	mad->tid = htobe64((uint64_t) atomic_inc(&g_tid));
+	mad->tid = htobe64((uint64_t)atomic_inc(&g_tid));
 	mad->attr_id = IB_SA_ATTR_PATH_REC;
 }
 
@@ -809,7 +804,7 @@ static uint8_t acmp_resolve_path_sa(struct acmp_ep *ep, struct acmp_dest *dest,
 		goto err;
 	}
 
-	mad = (struct ib_sa_mad *) &sa_mad->sa_mad;
+	mad = (struct ib_sa_mad *)&sa_mad->sa_mad;
 	acmp_init_path_query(mad);
 
 	memcpy(mad->data, &dest->path, sizeof(dest->path));
@@ -831,9 +826,9 @@ err:
 	return ret;
 }
 
-static uint8_t
-acmp_record_acm_addr(struct acmp_ep *ep, struct acmp_dest *dest, struct ibv_wc *wc,
-	struct acm_resolve_rec *rec)
+static uint8_t acmp_record_acm_addr(struct acmp_ep *ep, struct acmp_dest *dest,
+				    struct ibv_wc *wc,
+				    struct acm_resolve_rec *rec)
 {
 	int index;
 
@@ -849,7 +844,7 @@ acmp_record_acm_addr(struct acmp_ep *ep, struct acmp_dest *dest, struct ibv_wc *
 	dest->av = ep->mc_dest[index].av;
 	dest->av.dlid = wc->slid;
 	dest->av.src_path_bits = wc->dlid_path_bits;
-	dest->av.grh.dgid = ((struct ibv_grh *) (uintptr_t) wc->wr_id)->sgid;
+	dest->av.grh.dgid = ((struct ibv_grh *)(uintptr_t)wc->wr_id)->sgid;
 
 	dest->mgid = ep->mc_dest[index].mgid;
 	dest->path.sgid = ep->mc_dest[index].path.sgid;
@@ -862,9 +857,8 @@ acmp_record_acm_addr(struct acmp_ep *ep, struct acmp_dest *dest, struct ibv_wc *
 	return ACM_STATUS_SUCCESS;
 }
 
-static void
-acmp_record_path_addr(struct acmp_ep *ep, struct acmp_dest *dest,
-	struct ibv_path_record *path)
+static void acmp_record_path_addr(struct acmp_ep *ep, struct acmp_dest *dest,
+				  struct ibv_path_record *path)
 {
 	acm_log(2, "%s\n", dest->name);
 	dest->path.pkey = htobe16(ep->pkey);
@@ -892,7 +886,7 @@ static uint8_t acmp_validate_addr_req(struct acm_mad *mad)
 		return ACM_STATUS_EINVAL;
 	}
 
-	rec = (struct acm_resolve_rec *) mad->data;
+	rec = (struct acm_resolve_rec *)mad->data;
 	if (!rec->src_type || rec->src_type >= ACM_ADDRESS_RESERVED) {
 		acm_log(0, "ERROR - unknown src type 0x%x\n", rec->src_type);
 		return ACM_STATUS_EINVAL;
@@ -901,22 +895,21 @@ static uint8_t acmp_validate_addr_req(struct acm_mad *mad)
 	return ACM_STATUS_SUCCESS;
 }
 
-static void
-acmp_send_addr_resp(struct acmp_ep *ep, struct acmp_dest *dest)
+static void acmp_send_addr_resp(struct acmp_ep *ep, struct acmp_dest *dest)
 {
 	struct acm_resolve_rec *rec;
 	struct acmp_send_msg *msg;
 	struct acm_mad *mad;
 
 	acm_log(2, "%s\n", dest->name);
-	msg = acmp_alloc_send(ep, dest, sizeof (*mad));
+	msg = acmp_alloc_send(ep, dest, sizeof(*mad));
 	if (!msg) {
 		acm_log(0, "ERROR - failed to allocate message\n");
 		return;
 	}
 
-	mad = (struct acm_mad *) msg->data;
-	rec = (struct acm_resolve_rec *) mad->data;
+	mad = (struct acm_mad *)msg->data;
+	rec = (struct acm_resolve_rec *)mad->data;
 
 	mad->base_version = 1;
 	mad->mgmt_class = ACM_MGMT_CLASS;
@@ -931,9 +924,8 @@ acmp_send_addr_resp(struct acmp_ep *ep, struct acmp_dest *dest)
 	acmp_post_send(&ep->resp_queue, msg);
 }
 
-static int
-acmp_resolve_response(uint64_t id, struct acm_msg *req_msg,
-		      struct acmp_dest *dest, uint8_t status)
+static int acmp_resolve_response(uint64_t id, struct acm_msg *req_msg,
+				 struct acmp_dest *dest, uint8_t status)
 {
 	struct acm_msg msg;
 
@@ -954,23 +946,23 @@ acmp_resolve_response(uint64_t id, struct acm_msg *req_msg,
 	if (status == ACM_STATUS_SUCCESS) {
 		msg.hdr.length += ACM_MSG_EP_LENGTH;
 		msg.resolve_data[0].flags = IBV_PATH_FLAG_GMP |
-			IBV_PATH_FLAG_PRIMARY | IBV_PATH_FLAG_BIDIRECTIONAL;
+					    IBV_PATH_FLAG_PRIMARY |
+					    IBV_PATH_FLAG_BIDIRECTIONAL;
 		msg.resolve_data[0].type = ACM_EP_INFO_PATH;
 		msg.resolve_data[0].info.path = dest->path;
 
 		if (req_msg->hdr.src_out) {
 			msg.hdr.length += ACM_MSG_EP_LENGTH;
 			memcpy(&msg.resolve_data[1],
-				&req_msg->resolve_data[req_msg->hdr.src_index],
-				ACM_MSG_EP_LENGTH);
+			       &req_msg->resolve_data[req_msg->hdr.src_index],
+			       ACM_MSG_EP_LENGTH);
 		}
 	}
 
 	return acm_resolve_response(id, &msg);
 }
 
-static void
-acmp_complete_queued_req(struct acmp_dest *dest, uint8_t status)
+static void acmp_complete_queued_req(struct acmp_dest *dest, uint8_t status)
 {
 	struct acmp_request *req;
 
@@ -988,15 +980,14 @@ acmp_complete_queued_req(struct acmp_dest *dest, uint8_t status)
 	pthread_mutex_unlock(&dest->lock);
 }
 
-static void
-acmp_dest_sa_resp(struct acm_sa_mad *mad)
+static void acmp_dest_sa_resp(struct acm_sa_mad *mad)
 {
-	struct acmp_dest *dest = (struct acmp_dest *) mad->context;
-	struct ib_sa_mad *sa_mad = (struct ib_sa_mad *) &mad->sa_mad;
+	struct acmp_dest *dest = (struct acmp_dest *)mad->context;
+	struct ib_sa_mad *sa_mad = (struct ib_sa_mad *)&mad->sa_mad;
 	uint8_t status;
 
 	if (!mad->umad.status) {
-		status = (uint8_t) (be16toh(sa_mad->status) >> 8);
+		status = (uint8_t)(be16toh(sa_mad->status) >> 8);
 	} else {
 		status = ACM_STATUS_ETIMEDOUT;
 	}
@@ -1012,8 +1003,9 @@ acmp_dest_sa_resp(struct acm_sa_mad *mad)
 	if (!status) {
 		memcpy(&dest->path, sa_mad->data, sizeof(dest->path));
 		acmp_init_path_av(dest->ep->port, dest);
-		dest->addr_timeout = time_stamp_min() + (unsigned) addr_timeout;
-		dest->route_timeout = time_stamp_min() + (unsigned) route_timeout;
+		dest->addr_timeout = time_stamp_min() + (unsigned)addr_timeout;
+		dest->route_timeout =
+			time_stamp_min() + (unsigned)route_timeout;
 		acm_log(2, "timeout addr %" PRIu64 " route %" PRIu64 "\n",
 			dest->addr_timeout, dest->route_timeout);
 		dest->state = ACMP_READY;
@@ -1027,10 +1019,9 @@ out:
 	acm_free_sa_mad(mad);
 }
 
-static void
-acmp_resolve_sa_resp(struct acm_sa_mad *mad)
+static void acmp_resolve_sa_resp(struct acm_sa_mad *mad)
 {
-	struct acmp_dest *dest = (struct acmp_dest *) mad->context;
+	struct acmp_dest *dest = (struct acmp_dest *)mad->context;
 	int send_resp;
 
 	acm_log(2, "\n");
@@ -1044,8 +1035,8 @@ acmp_resolve_sa_resp(struct acm_sa_mad *mad)
 		acmp_send_addr_resp(dest->ep, dest);
 }
 
-static struct acmp_addr *
-acmp_addr_lookup(struct acmp_ep *ep, uint8_t *addr, uint16_t type)
+static struct acmp_addr *acmp_addr_lookup(struct acmp_ep *ep, uint8_t *addr,
+					  uint16_t type)
 {
 	struct acmp_addr *ret = NULL;
 	int i;
@@ -1056,8 +1047,8 @@ acmp_addr_lookup(struct acmp_ep *ep, uint8_t *addr, uint16_t type)
 			continue;
 
 		if ((type == ACM_ADDRESS_NAME &&
-		    !strncasecmp((char *) ep->addr_info[i].info.name,
-			      (char *) addr, ACM_MAX_ADDRESS)) ||
+		     !strncasecmp((char *)ep->addr_info[i].info.name,
+				  (char *)addr, ACM_MAX_ADDRESS)) ||
 		    !memcmp(ep->addr_info[i].info.addr, addr,
 			    ACM_MAX_ADDRESS)) {
 			ret = ep->addr_info + i;
@@ -1069,8 +1060,8 @@ acmp_addr_lookup(struct acmp_ep *ep, uint8_t *addr, uint16_t type)
 	return ret;
 }
 
-static void
-acmp_process_addr_req(struct acmp_ep *ep, struct ibv_wc *wc, struct acm_mad *mad)
+static void acmp_process_addr_req(struct acmp_ep *ep, struct ibv_wc *wc,
+				  struct acm_mad *mad)
 {
 	struct acm_resolve_rec *rec;
 	struct acmp_dest *dest;
@@ -1083,7 +1074,7 @@ acmp_process_addr_req(struct acmp_ep *ep, struct ibv_wc *wc, struct acm_mad *mad
 		return;
 	}
 
-	rec = (struct acm_resolve_rec *) mad->data;
+	rec = (struct acm_resolve_rec *)mad->data;
 	dest = acmp_acquire_dest(ep, rec->src_type, rec->src);
 	if (!dest) {
 		acm_log(0, "ERROR - unable to add source\n");
@@ -1115,7 +1106,8 @@ acmp_process_addr_req(struct acmp_ep *ep, struct ibv_wc *wc, struct acm_mad *mad
 			break;
 		}
 		if (addr || !list_empty(&dest->req_queue)) {
-			status = acmp_resolve_path_sa(ep, dest, acmp_resolve_sa_resp);
+			status = acmp_resolve_path_sa(ep, dest,
+						      acmp_resolve_sa_resp);
 			if (status)
 				break;
 		}
@@ -1134,16 +1126,16 @@ acmp_process_addr_req(struct acmp_ep *ep, struct ibv_wc *wc, struct acm_mad *mad
 	acmp_put_dest(dest);
 }
 
-static void
-acmp_process_addr_resp(struct acmp_send_msg *msg, struct ibv_wc *wc, struct acm_mad *mad)
+static void acmp_process_addr_resp(struct acmp_send_msg *msg, struct ibv_wc *wc,
+				   struct acm_mad *mad)
 {
 	struct acm_resolve_rec *resp_rec;
-	struct acmp_dest *dest = (struct acmp_dest *) msg->context;
+	struct acmp_dest *dest = (struct acmp_dest *)msg->context;
 	uint8_t status;
 
 	if (mad) {
 		status = acm_class_status(mad->status);
-		resp_rec = (struct acm_resolve_rec *) mad->data;
+		resp_rec = (struct acm_resolve_rec *)mad->data;
 	} else {
 		status = ACM_STATUS_ETIMEDOUT;
 		resp_rec = NULL;
@@ -1162,7 +1154,8 @@ acmp_process_addr_resp(struct acmp_send_msg *msg, struct ibv_wc *wc, struct acm_
 			if (route_prot == ACMP_ROUTE_PROT_ACM) {
 				status = acmp_record_acm_route(msg->ep, dest);
 			} else {
-				status = acmp_resolve_path_sa(msg->ep, dest, acmp_dest_sa_resp);
+				status = acmp_resolve_path_sa(
+					msg->ep, dest, acmp_dest_sa_resp);
 				if (!status) {
 					pthread_mutex_unlock(&dest->lock);
 					goto put;
@@ -1179,7 +1172,8 @@ put:
 	acmp_put_dest(dest);
 }
 
-static void acmp_process_acm_recv(struct acmp_ep *ep, struct ibv_wc *wc, struct acm_mad *mad)
+static void acmp_process_acm_recv(struct acmp_ep *ep, struct ibv_wc *wc,
+				  struct acm_mad *mad)
 {
 	struct acmp_send_msg *req;
 	struct acm_resolve_rec *rec;
@@ -1187,8 +1181,8 @@ static void acmp_process_acm_recv(struct acmp_ep *ep, struct ibv_wc *wc, struct 
 
 	acm_log(2, "\n");
 	if (mad->base_version != 1 || mad->class_version != 1) {
-		acm_log(0, "ERROR - invalid version %d %d\n",
-			mad->base_version, mad->class_version);
+		acm_log(0, "ERROR - invalid version %d %d\n", mad->base_version,
+			mad->class_version);
 		return;
 	}
 
@@ -1197,18 +1191,19 @@ static void acmp_process_acm_recv(struct acmp_ep *ep, struct ibv_wc *wc, struct 
 		return;
 	}
 
-	rec = (struct acm_resolve_rec *) mad->data;
-	acm_format_name(2, log_data, sizeof log_data,
-			rec->src_type, rec->src, sizeof rec->src);
+	rec = (struct acm_resolve_rec *)mad->data;
+	acm_format_name(2, log_data, sizeof log_data, rec->src_type, rec->src,
+			sizeof rec->src);
 	acm_log(2, "src  %s\n", log_data);
-	acm_format_name(2, log_data, sizeof log_data,
-			rec->dest_type, rec->dest, sizeof rec->dest);
+	acm_format_name(2, log_data, sizeof log_data, rec->dest_type, rec->dest,
+			sizeof rec->dest);
 	acm_log(2, "dest %s\n", log_data);
 	if (mad->method & IB_METHOD_RESP) {
 		acm_log(2, "received response\n");
 		req = acmp_get_request(ep, mad->tid, &free);
 		if (!req) {
-			acm_log(1, "notice - response did not match active request\n");
+			acm_log(1,
+				"notice - response did not match active request\n");
 			return;
 		}
 		acm_log(2, "found matching request\n");
@@ -1221,17 +1216,16 @@ static void acmp_process_acm_recv(struct acmp_ep *ep, struct ibv_wc *wc, struct 
 	}
 }
 
-static void
-acmp_sa_resp(struct acm_sa_mad *mad)
+static void acmp_sa_resp(struct acm_sa_mad *mad)
 {
-	struct acmp_request *req = (struct acmp_request *) mad->context;
-	struct ib_sa_mad *sa_mad = (struct ib_sa_mad *) &mad->sa_mad;
+	struct acmp_request *req = (struct acmp_request *)mad->context;
+	struct ib_sa_mad *sa_mad = (struct ib_sa_mad *)&mad->sa_mad;
 
 	req->msg.hdr.opcode |= ACM_OP_ACK;
 	if (!mad->umad.status) {
 		struct acm_ep_addr_data *resolve_data = req->msg.resolve_data;
 
-		req->msg.hdr.status = (uint8_t) (be16toh(sa_mad->status) >> 8);
+		req->msg.hdr.status = (uint8_t)(be16toh(sa_mad->status) >> 8);
 		memcpy(&resolve_data->info.path, sa_mad->data,
 		       sizeof(struct ibv_path_record));
 	} else {
@@ -1246,15 +1240,17 @@ acmp_sa_resp(struct acm_sa_mad *mad)
 	acmp_free_req(req);
 }
 
-static void acmp_process_sa_recv(struct acmp_ep *ep, struct ibv_wc *wc, struct acm_mad *mad)
+static void acmp_process_sa_recv(struct acmp_ep *ep, struct ibv_wc *wc,
+				 struct acm_mad *mad)
 {
-	struct ib_sa_mad *sa_mad = (struct ib_sa_mad *) mad;
+	struct ib_sa_mad *sa_mad = (struct ib_sa_mad *)mad;
 	struct acmp_send_msg *req;
 	int free;
 
 	acm_log(2, "\n");
 	if (mad->base_version != 1 || mad->class_version != 2 ||
-	    !(mad->method & IB_METHOD_RESP) || sa_mad->attr_id != IB_SA_ATTR_PATH_REC) {
+	    !(mad->method & IB_METHOD_RESP) ||
+	    sa_mad->attr_id != IB_SA_ATTR_PATH_REC) {
 		acm_log(0, "ERROR - unexpected SA MAD %d %d\n",
 			mad->base_version, mad->class_version);
 		return;
@@ -1276,7 +1272,7 @@ static void acmp_process_recv(struct acmp_ep *ep, struct ibv_wc *wc)
 	struct acm_mad *mad;
 
 	acm_log(2, "base endpoint name %s\n", ep->id_string);
-	mad = (struct acm_mad *) (uintptr_t) (wc->wr_id + sizeof(struct ibv_grh));
+	mad = (struct acm_mad *)(uintptr_t)(wc->wr_id + sizeof(struct ibv_grh));
 	switch (mad->mgmt_class) {
 	case IB_MGMT_CLASS_SA:
 		acmp_process_sa_recv(ep, wc, mad);
@@ -1285,7 +1281,8 @@ static void acmp_process_recv(struct acmp_ep *ep, struct ibv_wc *wc)
 		acmp_process_acm_recv(ep, wc, mad);
 		break;
 	default:
-		acm_log(0, "ERROR - invalid mgmt class 0x%x\n", mad->mgmt_class);
+		acm_log(0, "ERROR - invalid mgmt class 0x%x\n",
+			mad->mgmt_class);
 		break;
 	}
 
@@ -1295,7 +1292,8 @@ static void acmp_process_recv(struct acmp_ep *ep, struct ibv_wc *wc)
 static void acmp_process_comp(struct acmp_ep *ep, struct ibv_wc *wc)
 {
 	if (wc->status) {
-		acm_log(0, "ERROR - work completion error\n"
+		acm_log(0,
+			"ERROR - work completion error\n"
 			"\topcode %d, completion status %d\n",
 			wc->opcode, wc->status);
 		return;
@@ -1304,12 +1302,13 @@ static void acmp_process_comp(struct acmp_ep *ep, struct ibv_wc *wc)
 	if (wc->opcode & IBV_WC_RECV)
 		acmp_process_recv(ep, wc);
 	else
-		acmp_complete_send((struct acmp_send_msg *) (uintptr_t) wc->wr_id);
+		acmp_complete_send(
+			(struct acmp_send_msg *)(uintptr_t)wc->wr_id);
 }
 
 static void *acmp_comp_handler(void *context)
 {
-	struct acmp_device *dev = (struct acmp_device *) context;
+	struct acmp_device *dev = (struct acmp_device *)context;
 	struct acmp_ep *ep;
 	struct ibv_cq *cq;
 	struct ibv_wc wc;
@@ -1330,7 +1329,7 @@ static void *acmp_comp_handler(void *context)
 	}
 	while (1) {
 		pthread_testcancel();
-		ibv_get_cq_event(dev->channel, &cq, (void *) &ep);
+		ibv_get_cq_event(dev->channel, &cq, (void *)&ep);
 
 		cnt = 0;
 		while (ibv_poll_cq(cq, 1, &wc) > 0) {
@@ -1351,14 +1350,14 @@ static void *acmp_comp_handler(void *context)
 }
 
 static void acmp_format_mgid(union ibv_gid *mgid, uint16_t pkey, uint8_t tos,
-	uint8_t rate, uint8_t mtu)
+			     uint8_t rate, uint8_t mtu)
 {
 	mgid->raw[0] = 0xFF;
 	mgid->raw[1] = 0x10 | 0x05;
 	mgid->raw[2] = 0x40;
 	mgid->raw[3] = 0x01;
-	mgid->raw[4] = (uint8_t) (pkey >> 8);
-	mgid->raw[5] = (uint8_t) pkey;
+	mgid->raw[4] = (uint8_t)(pkey >> 8);
+	mgid->raw[5] = (uint8_t)pkey;
 	mgid->raw[6] = tos;
 	mgid->raw[7] = rate;
 	mgid->raw[8] = mtu;
@@ -1372,7 +1371,8 @@ static void acmp_format_mgid(union ibv_gid *mgid, uint16_t pkey, uint8_t tos,
 }
 
 static void acmp_init_join(struct ib_sa_mad *mad, union ibv_gid *port_gid,
-	uint16_t pkey, uint8_t tos, uint8_t tclass, uint8_t sl, uint8_t rate, uint8_t mtu)
+			   uint16_t pkey, uint8_t tos, uint8_t tclass,
+			   uint8_t sl, uint8_t rate, uint8_t mtu)
 {
 	struct ib_mc_member_rec *mc_rec;
 
@@ -1381,30 +1381,36 @@ static void acmp_init_join(struct ib_sa_mad *mad, union ibv_gid *port_gid,
 	mad->mgmt_class = IB_MGMT_CLASS_SA;
 	mad->class_version = 2;
 	mad->method = IB_METHOD_SET;
-	mad->tid = htobe64((uint64_t) atomic_inc(&g_tid));
+	mad->tid = htobe64((uint64_t)atomic_inc(&g_tid));
 	mad->attr_id = IB_SA_ATTR_MC_MEMBER_REC;
-	mad->comp_mask =
-		IB_COMP_MASK_MC_MGID | IB_COMP_MASK_MC_PORT_GID |
-		IB_COMP_MASK_MC_QKEY | IB_COMP_MASK_MC_MTU_SEL| IB_COMP_MASK_MC_MTU |
-		IB_COMP_MASK_MC_TCLASS | IB_COMP_MASK_MC_PKEY | IB_COMP_MASK_MC_RATE_SEL |
-		IB_COMP_MASK_MC_RATE | IB_COMP_MASK_MC_SL | IB_COMP_MASK_MC_FLOW |
-		IB_COMP_MASK_MC_SCOPE | IB_COMP_MASK_MC_JOIN_STATE;
+	mad->comp_mask = IB_COMP_MASK_MC_MGID | IB_COMP_MASK_MC_PORT_GID |
+			 IB_COMP_MASK_MC_QKEY | IB_COMP_MASK_MC_MTU_SEL |
+			 IB_COMP_MASK_MC_MTU | IB_COMP_MASK_MC_TCLASS |
+			 IB_COMP_MASK_MC_PKEY | IB_COMP_MASK_MC_RATE_SEL |
+			 IB_COMP_MASK_MC_RATE | IB_COMP_MASK_MC_SL |
+			 IB_COMP_MASK_MC_FLOW | IB_COMP_MASK_MC_SCOPE |
+			 IB_COMP_MASK_MC_JOIN_STATE;
 
-	mc_rec = (struct ib_mc_member_rec *) mad->data;
-	acmp_format_mgid(&mc_rec->mgid, pkey | IB_PKEY_FULL_MEMBER, tos, rate, mtu);
+	mc_rec = (struct ib_mc_member_rec *)mad->data;
+	acmp_format_mgid(&mc_rec->mgid, pkey | IB_PKEY_FULL_MEMBER, tos, rate,
+			 mtu);
 	mc_rec->port_gid = *port_gid;
 	mc_rec->qkey = htobe32(ACM_QKEY);
-	mc_rec->mtu = umad_sa_set_rate_mtu_or_life(UMAD_SA_SELECTOR_EXACTLY, mtu);
+	mc_rec->mtu =
+		umad_sa_set_rate_mtu_or_life(UMAD_SA_SELECTOR_EXACTLY, mtu);
 	mc_rec->tclass = tclass;
 	mc_rec->pkey = htobe16(pkey);
-	mc_rec->rate = umad_sa_set_rate_mtu_or_life(UMAD_SA_SELECTOR_EXACTLY, rate);
+	mc_rec->rate =
+		umad_sa_set_rate_mtu_or_life(UMAD_SA_SELECTOR_EXACTLY, rate);
 	mc_rec->sl_flow_hop = umad_sa_mcm_set_sl_flow_hop(sl, 0, 0);
-	mc_rec->scope_state = umad_sa_mcm_set_scope_state(UMAD_SA_MCM_ADDR_SCOPE_SITE_LOCAL,
-							  UMAD_SA_MCM_JOIN_STATE_FULL_MEMBER);
+	mc_rec->scope_state =
+		umad_sa_mcm_set_scope_state(UMAD_SA_MCM_ADDR_SCOPE_SITE_LOCAL,
+					    UMAD_SA_MCM_JOIN_STATE_FULL_MEMBER);
 }
 
 static void acmp_join_group(struct acmp_ep *ep, union ibv_gid *port_gid,
-	uint8_t tos, uint8_t tclass, uint8_t sl, uint8_t rate, uint8_t mtu)
+			    uint8_t tos, uint8_t tclass, uint8_t sl,
+			    uint8_t rate, uint8_t mtu)
 {
 	struct ib_sa_mad *mad;
 	struct ib_mc_member_rec *mc_rec;
@@ -1418,13 +1424,13 @@ static void acmp_join_group(struct acmp_ep *ep, union ibv_gid *port_gid,
 	}
 
 	acm_log(0, "%s %d pkey 0x%x, sl 0x%x, rate 0x%x, mtu 0x%x\n",
-		ep->port->dev->verbs->device->name,
-		ep->port->port_num, ep->pkey, sl, rate, mtu);
-	mad = (struct ib_sa_mad *) &sa_mad->sa_mad;
+		ep->port->dev->verbs->device->name, ep->port->port_num,
+		ep->pkey, sl, rate, mtu);
+	mad = (struct ib_sa_mad *)&sa_mad->sa_mad;
 	acmp_init_join(mad, port_gid, ep->pkey, tos, tclass, sl, rate, mtu);
-	mc_rec = (struct ib_mc_member_rec *) mad->data;
+	mc_rec = (struct ib_mc_member_rec *)mad->data;
 	acmp_set_dest_addr(&ep->mc_dest[ep->mc_cnt++], ACM_ADDRESS_GID,
-		mc_rec->mgid.raw, sizeof(mc_rec->mgid));
+			   mc_rec->mgid.raw, sizeof(mc_rec->mgid));
 	ep->mc_dest[ep->mc_cnt - 1].state = ACMP_INIT;
 
 	if (acm_send_sa_mad(sa_mad)) {
@@ -1467,7 +1473,7 @@ static int acmp_port_join(void *port_context)
 	acm_log(1, "device %s port %d\n", port->dev->verbs->device->name,
 		port->port_num);
 
-	list_for_each(&port->ep_list, ep, entry) {
+	list_for_each (&port->ep_list, ep, entry) {
 		if (!ep->endpoint) {
 			/* Stale endpoint */
 			continue;
@@ -1503,11 +1509,11 @@ static void acmp_process_timeouts(void)
 	struct acm_mad *mad;
 
 	while ((msg = list_pop(&timeout_list, struct acmp_send_msg, entry))) {
-		mad = (struct acm_mad *) &msg->data[0];
-		rec = (struct acm_resolve_rec *) mad->data;
+		mad = (struct acm_mad *)&msg->data[0];
+		rec = (struct acm_resolve_rec *)mad->data;
 
-		acm_format_name(0, log_data, sizeof log_data,
-				rec->dest_type, rec->dest, sizeof rec->dest);
+		acm_format_name(0, log_data, sizeof log_data, rec->dest_type,
+				rec->dest, sizeof rec->dest);
 		acm_log(0, "notice - dest %s\n", log_data);
 
 		msg->resp_handler(msg, NULL, NULL);
@@ -1520,10 +1526,10 @@ static void acmp_process_wait_queue(struct acmp_ep *ep, uint64_t *next_expire)
 	struct acmp_send_msg *msg, *next;
 	struct ibv_send_wr *bad_wr;
 
-	list_for_each_safe(&ep->wait_queue, msg, next, entry) {
+	list_for_each_safe (&ep->wait_queue, msg, next, entry) {
 		if (msg->expires <= time_stamp_ms()) {
 			list_del(&msg->entry);
-			(void) atomic_dec(&wait_cnt);
+			(void)atomic_dec(&wait_cnt);
 			if (--msg->tries) {
 				acm_log(1, "notice - retrying request\n");
 				list_add_tail(&ep->active_queue, &msg->entry);
@@ -1571,18 +1577,19 @@ static void *acmp_retry_handler(void *context)
 
 		next_expire = -1;
 		pthread_mutex_lock(&acmp_dev_lock);
-		list_for_each(&acmp_dev_list, dev, entry) {
+		list_for_each (&acmp_dev_list, dev, entry) {
 			pthread_mutex_unlock(&acmp_dev_lock);
 
 			for (i = 0; i < dev->port_cnt; i++) {
 				port = &dev->port[i];
 
 				pthread_mutex_lock(&port->lock);
-				list_for_each(&port->ep_list, ep, entry) {
+				list_for_each (&port->ep_list, ep, entry) {
 					pthread_mutex_unlock(&port->lock);
 					pthread_mutex_lock(&ep->lock);
 					if (!list_empty(&ep->wait_queue))
-						acmp_process_wait_queue(ep, &next_expire);
+						acmp_process_wait_queue(
+							ep, &next_expire);
 					pthread_mutex_unlock(&ep->lock);
 					pthread_mutex_lock(&port->lock);
 				}
@@ -1594,7 +1601,7 @@ static void *acmp_retry_handler(void *context)
 
 		acmp_process_timeouts();
 		if (next_expire != -1) {
-			wait = (int) (next_expire - time_stamp_ms());
+			wait = (int)(next_expire - time_stamp_ms());
 			if (wait > 0 && atomic_get(&wait_cnt)) {
 				pthread_testcancel();
 				event_wait(&timeout_event, wait);
@@ -1607,8 +1614,7 @@ static void *acmp_retry_handler(void *context)
 }
 
 /* rwlock must be held read-locked */
-static int
-__acmp_query(struct acmp_ep *ep, struct acm_msg *msg, uint64_t id)
+static int __acmp_query(struct acmp_ep *ep, struct acm_msg *msg, uint64_t id)
 {
 	struct acmp_request *req;
 	struct ib_sa_mad *mad;
@@ -1634,11 +1640,11 @@ __acmp_query(struct acmp_ep *ep, struct acm_msg *msg, uint64_t id)
 		goto free_req;
 	}
 
-	mad = (struct ib_sa_mad *) &sa_mad->sa_mad;
+	mad = (struct ib_sa_mad *)&sa_mad->sa_mad;
 	acmp_init_path_query(mad);
 
 	memcpy(mad->data, &msg->resolve_data[0].info.path,
-		sizeof(struct ibv_path_record));
+	       sizeof(struct ibv_path_record));
 	mad->comp_mask = acm_path_comp_mask(&msg->resolve_data[0].info.path);
 
 	acm_increment_counter(ACM_CNTR_ROUTE_QUERY);
@@ -1664,8 +1670,7 @@ resp:
 	return acm_query_response(id, msg);
 }
 
-static int
-acmp_query(void *addr_context, struct acm_msg *msg, uint64_t id)
+static int acmp_query(void *addr_context, struct acm_msg *msg, uint64_t id)
 {
 	struct acmp_addr_ctx *addr_ctx = addr_context;
 	struct acmp_addr *address;
@@ -1679,9 +1684,8 @@ acmp_query(void *addr_context, struct acm_msg *msg, uint64_t id)
 	return ret;
 }
 
-static uint8_t
-acmp_send_resolve(struct acmp_ep *ep, struct acmp_dest *dest,
-	struct acm_ep_addr_data *saddr)
+static uint8_t acmp_send_resolve(struct acmp_ep *ep, struct acmp_dest *dest,
+				 struct acm_ep_addr_data *saddr)
 {
 	struct acmp_send_msg *msg;
 	struct acm_mad *mad;
@@ -1695,26 +1699,26 @@ acmp_send_resolve(struct acmp_ep *ep, struct acmp_dest *dest,
 		return ACM_STATUS_ENOMEM;
 	}
 
-	acmp_init_send_req(msg, (void *) dest, acmp_process_addr_resp);
-	(void) atomic_inc(&dest->refcnt);
+	acmp_init_send_req(msg, (void *)dest, acmp_process_addr_resp);
+	(void)atomic_inc(&dest->refcnt);
 
-	mad = (struct acm_mad *) msg->data;
+	mad = (struct acm_mad *)msg->data;
 	mad->base_version = 1;
 	mad->mgmt_class = ACM_MGMT_CLASS;
 	mad->class_version = 1;
 	mad->method = IB_METHOD_GET;
 	mad->control = ACM_CTRL_RESOLVE;
-	mad->tid = htobe64((uint64_t) atomic_inc(&g_tid));
+	mad->tid = htobe64((uint64_t)atomic_inc(&g_tid));
 
-	rec = (struct acm_resolve_rec *) mad->data;
-	rec->src_type = (uint8_t) saddr->type;
+	rec = (struct acm_resolve_rec *)mad->data;
+	rec->src_type = (uint8_t)saddr->type;
 	rec->src_length = ACM_MAX_ADDRESS;
 	memcpy(rec->src, saddr->info.addr, ACM_MAX_ADDRESS);
 	rec->dest_type = dest->addr_type;
 	rec->dest_length = ACM_MAX_ADDRESS;
 	memcpy(rec->dest, dest->address, ACM_MAX_ADDRESS);
 
-	rec->gid_cnt = (uint8_t) ep->mc_cnt;
+	rec->gid_cnt = (uint8_t)ep->mc_cnt;
 	for (i = 0; i < ep->mc_cnt; i++)
 		memcpy(&rec->gid[i], ep->mc_dest[i].address, 16);
 
@@ -1725,7 +1729,8 @@ acmp_send_resolve(struct acmp_ep *ep, struct acmp_dest *dest,
 }
 
 /* Caller must hold dest lock */
-static uint8_t acmp_queue_req(struct acmp_dest *dest, uint64_t id, struct acm_msg *msg)
+static uint8_t acmp_queue_req(struct acmp_dest *dest, uint64_t id,
+			      struct acm_msg *msg)
 {
 	struct acmp_request *req;
 
@@ -1756,12 +1761,12 @@ static int acmp_dest_timeout(struct acmp_dest *dest)
 	return 0;
 }
 
-static int
-acmp_check_addr_match(struct ifaddrs *iap, struct acm_ep_addr_data *saddr,
-		      unsigned int d_family)
+static int acmp_check_addr_match(struct ifaddrs *iap,
+				 struct acm_ep_addr_data *saddr,
+				 unsigned int d_family)
 {
-	char sip[INET6_ADDRSTRLEN] = {0};
-	char dip[INET6_ADDRSTRLEN] = {0};
+	char sip[INET6_ADDRSTRLEN] = { 0 };
+	char dip[INET6_ADDRSTRLEN] = { 0 };
 	const char *tmp;
 	size_t sock_size;
 	unsigned int s_family;
@@ -1769,31 +1774,27 @@ acmp_check_addr_match(struct ifaddrs *iap, struct acm_ep_addr_data *saddr,
 
 	s_family = iap->ifa_addr->sa_family;
 
-	if (!(iap->ifa_flags & IFF_UP) ||
-	    (s_family != d_family))
+	if (!(iap->ifa_flags & IFF_UP) || (s_family != d_family))
 		return -1;
 
 	sock_size = (s_family == AF_INET) ? sizeof(struct sockaddr_in) :
-		sizeof(struct sockaddr_in6);
+					    sizeof(struct sockaddr_in6);
 
-	ret = getnameinfo(iap->ifa_addr, sock_size,
-			  sip, sizeof(sip),
-			  NULL, 0, NI_NUMERICHOST);
+	ret = getnameinfo(iap->ifa_addr, sock_size, sip, sizeof(sip), NULL, 0,
+			  NI_NUMERICHOST);
 
 	if (ret)
 		return ret;
 
-	tmp = inet_ntop(d_family, (void *)saddr->info.addr, dip,
-			sizeof(dip));
+	tmp = inet_ntop(d_family, (void *)saddr->info.addr, dip, sizeof(dip));
 	if (!tmp)
 		return -1;
 	ret = memcmp(sip, dip, strlen(dip));
 	return ret;
 }
 
-static void
-acmp_acquire_sgid(struct acm_ep_addr_data *saddr,
-		  struct acmp_dest *dest)
+static void acmp_acquire_sgid(struct acm_ep_addr_data *saddr,
+			      struct acmp_dest *dest)
 {
 	struct ifaddrs *addrs, *iap;
 	unsigned int d_family;
@@ -1814,8 +1815,7 @@ acmp_acquire_sgid(struct acm_ep_addr_data *saddr,
 	for (iap = addrs; iap != NULL; iap = iap->ifa_next) {
 		ret = acmp_check_addr_match(iap, saddr, d_family);
 		if (!ret) {
-			ret = acm_if_get_sgid(iap->ifa_name,
-					      &dest->path.sgid);
+			ret = acm_if_get_sgid(iap->ifa_name, &dest->path.sgid);
 			if (!ret)
 				break;
 		}
@@ -1823,8 +1823,8 @@ acmp_acquire_sgid(struct acm_ep_addr_data *saddr,
 	freeifaddrs(addrs);
 }
 
-static int
-acmp_resolve_dest(struct acmp_ep *ep, struct acm_msg *msg, uint64_t id)
+static int acmp_resolve_dest(struct acmp_ep *ep, struct acm_msg *msg,
+			     uint64_t id)
 {
 	struct acmp_dest *dest;
 	struct acm_ep_addr_data *saddr, *daddr;
@@ -1833,13 +1833,14 @@ acmp_resolve_dest(struct acmp_ep *ep, struct acm_msg *msg, uint64_t id)
 
 	saddr = &msg->resolve_data[msg->hdr.src_index];
 	daddr = &msg->resolve_data[msg->hdr.dst_index];
-	acm_format_name(2, log_data, sizeof log_data,
-			daddr->type, daddr->info.addr, sizeof daddr->info.addr);
+	acm_format_name(2, log_data, sizeof log_data, daddr->type,
+			daddr->info.addr, sizeof daddr->info.addr);
 	acm_log(2, "dest %s\n", log_data);
 
 	dest = acmp_acquire_dest(ep, daddr->type, daddr->info.addr);
 	if (!dest) {
-		acm_log(0, "ERROR - unable to allocate destination in request\n");
+		acm_log(0,
+			"ERROR - unable to allocate destination in request\n");
 		atomic_inc(&ep->counters[ACM_CNTR_ERROR]);
 		return acmp_resolve_response(id, msg, NULL, ACM_STATUS_ENOMEM);
 	}
@@ -1874,9 +1875,10 @@ test:
 		dest->state = ACMP_QUERY_ADDR;
 		/* fall through */
 	default:
-queue:
+	queue:
 		if (daddr->flags & ACM_FLAGS_NODELAY) {
-			acm_log(2, "lookup initiated, but client wants no delay\n");
+			acm_log(2,
+				"lookup initiated, but client wants no delay\n");
 			status = ACM_STATUS_ENODATA;
 			break;
 		}
@@ -1895,8 +1897,8 @@ put:
 	return ret;
 }
 
-static int
-acmp_resolve_path(struct acmp_ep *ep, struct acm_msg *msg, uint64_t id)
+static int acmp_resolve_path(struct acmp_ep *ep, struct acm_msg *msg,
+			     uint64_t id)
 {
 	struct acmp_dest *dest;
 	struct ibv_path_record *path;
@@ -1908,14 +1910,15 @@ acmp_resolve_path(struct acmp_ep *ep, struct acm_msg *msg, uint64_t id)
 	addr = msg->resolve_data[1].info.addr;
 	memset(addr, 0, ACM_MAX_ADDRESS);
 	if (path->dlid) {
-		* ((__be16 *) addr) = path->dlid;
+		*((__be16 *)addr) = path->dlid;
 		dest = acmp_acquire_dest(ep, ACM_ADDRESS_LID, addr);
 	} else {
 		memcpy(addr, &path->dgid, sizeof path->dgid);
 		dest = acmp_acquire_dest(ep, ACM_ADDRESS_GID, addr);
 	}
 	if (!dest) {
-		acm_log(0, "ERROR - unable to allocate destination in request\n");
+		acm_log(0,
+			"ERROR - unable to allocate destination in request\n");
 		atomic_inc(&ep->counters[ACM_CNTR_ERROR]);
 		return acmp_resolve_response(id, msg, NULL, ACM_STATUS_ENOMEM);
 	}
@@ -1944,7 +1947,8 @@ test:
 		/* fall through */
 	default:
 		if (msg->resolve_data[0].flags & ACM_FLAGS_NODELAY) {
-			acm_log(2, "lookup initiated, but client wants no delay\n");
+			acm_log(2,
+				"lookup initiated, but client wants no delay\n");
 			status = ACM_STATUS_ENODATA;
 			break;
 		}
@@ -1963,11 +1967,11 @@ put:
 	return ret;
 }
 
-static int
-acmp_resolve(void *addr_context, struct acm_msg *msg, uint64_t id)
+static int acmp_resolve(void *addr_context, struct acm_msg *msg, uint64_t id)
 {
 	struct acmp_addr_ctx *addr_ctx = addr_context;
-	struct acmp_addr *address = addr_ctx->ep->addr_info + addr_ctx->addr_inx;
+	struct acmp_addr *address =
+		addr_ctx->ep->addr_info + addr_ctx->addr_inx;
 	struct acmp_ep *ep = address->ep;
 
 	if (ep->state != ACMP_READY) {
@@ -1988,7 +1992,7 @@ static void acmp_query_perf(void *ep_context, uint64_t *values, uint8_t *cnt)
 	int i;
 
 	for (i = 0; i < ACM_MAX_COUNTER; i++)
-		values[i] = htobe64((uint64_t) atomic_get(&ep->counters[i]));
+		values[i] = htobe64((uint64_t)atomic_get(&ep->counters[i]));
 	*cnt = ACM_MAX_COUNTER;
 }
 
@@ -2052,14 +2056,15 @@ static int acmp_post_recvs(struct acmp_ep *ep)
 	}
 
 	ep->mr = ibv_reg_mr(ep->port->dev->pd, ep->recv_bufs, size,
-		IBV_ACCESS_LOCAL_WRITE);
+			    IBV_ACCESS_LOCAL_WRITE);
 	if (!ep->mr) {
 		acm_log(0, "ERROR - unable to register receive buffer\n");
 		goto err;
 	}
 
 	for (i = 0; i < recv_depth; i++) {
-		acmp_post_recv(ep, (uintptr_t) (ep->recv_bufs + ACM_RECV_SIZE * i));
+		acmp_post_recv(ep,
+			       (uintptr_t)(ep->recv_bufs + ACM_RECV_SIZE * i));
 	}
 	return 0;
 
@@ -2080,7 +2085,7 @@ static void acmp_parse_osm_fullv1_lid2guid(FILE *f, __be64 *lid2guid)
 		if (s[0] == '#')
 			continue;
 		if (!(p = strtok_r(s, " \n", &ptr)))
-			continue;	/* ignore blank lines */
+			continue; /* ignore blank lines */
 
 		if (strncmp(p, "Switch", sizeof("Switch") - 1) &&
 		    strncmp(p, "Channel", sizeof("Channel") - 1) &&
@@ -2097,7 +2102,7 @@ static void acmp_parse_osm_fullv1_lid2guid(FILE *f, __be64 *lid2guid)
 		if (!p_guid)
 			continue;
 
-		guid = (uint64_t) strtoull(p_guid, NULL, 16);
+		guid = (uint64_t)strtoull(p_guid, NULL, 16);
 
 		ptr = strstr(ptr, "base LID");
 		if (!ptr)
@@ -2107,7 +2112,7 @@ static void acmp_parse_osm_fullv1_lid2guid(FILE *f, __be64 *lid2guid)
 		if (!p_lid)
 			continue;
 
-		lid = (uint16_t) strtoul(p_lid, NULL, 0);
+		lid = (uint16_t)strtoul(p_lid, NULL, 0);
 		if (lid >= IB_LID_MCAST_START)
 			continue;
 		if (lid2guid[lid])
@@ -2118,7 +2123,8 @@ static void acmp_parse_osm_fullv1_lid2guid(FILE *f, __be64 *lid2guid)
 }
 
 /* Parse 'opensm full v1' file to populate PR cache */
-static int acmp_parse_osm_fullv1_paths(FILE *f, __be64 *lid2guid, struct acmp_ep *ep)
+static int acmp_parse_osm_fullv1_paths(FILE *f, __be64 *lid2guid,
+				       struct acmp_ep *ep)
 {
 	union ibv_gid sgid, dgid;
 	struct ibv_port_attr attr = {};
@@ -2140,7 +2146,7 @@ static int acmp_parse_osm_fullv1_paths(FILE *f, __be64 *lid2guid, struct acmp_ep
 		if (s[0] == '#')
 			continue;
 		if (!(p = strtok_r(s, " \n", &ptr)))
-			continue;	/* ignore blank lines */
+			continue; /* ignore blank lines */
 
 		if (strncmp(p, "Switch", sizeof("Switch") - 1) &&
 		    strncmp(p, "Channel", sizeof("Channel") - 1) &&
@@ -2157,7 +2163,7 @@ static int acmp_parse_osm_fullv1_paths(FILE *f, __be64 *lid2guid, struct acmp_ep
 		if (!p_guid)
 			continue;
 
-		guid = (uint64_t) strtoull(p_guid, NULL, 16);
+		guid = (uint64_t)strtoull(p_guid, NULL, 16);
 		if (guid != be64toh(sgid.global.interface_id))
 			continue;
 
@@ -2169,7 +2175,7 @@ static int acmp_parse_osm_fullv1_paths(FILE *f, __be64 *lid2guid, struct acmp_ep
 		if (!p_lid)
 			continue;
 
-		lid = (uint16_t) strtoul(p_lid, NULL, 0);
+		lid = (uint16_t)strtoul(p_lid, NULL, 0);
 		if (lid != ep->port->lid)
 			continue;
 
@@ -2182,7 +2188,7 @@ static int acmp_parse_osm_fullv1_paths(FILE *f, __be64 *lid2guid, struct acmp_ep
 		if (s[0] == '#')
 			continue;
 		if (!(p = strtok_r(s, " \n", &ptr)))
-			continue;	/* ignore blank lines */
+			continue; /* ignore blank lines */
 
 		if (!strncmp(p, "Switch", sizeof("Switch") - 1) ||
 		    !strncmp(p, "Channel", sizeof("Channel") - 1) ||
@@ -2210,7 +2216,9 @@ static int acmp_parse_osm_fullv1_paths(FILE *f, __be64 *lid2guid, struct acmp_ep
 		rate = atoi(p);
 
 		if (!lid2guid[dlid]) {
-			acm_log(0, "ERROR - dlid %u not found in lid2guid table\n", dlid);
+			acm_log(0,
+				"ERROR - dlid %u not found in lid2guid table\n",
+				dlid);
 			continue;
 		}
 
@@ -2236,19 +2244,22 @@ static int acmp_parse_osm_fullv1_paths(FILE *f, __be64 *lid2guid, struct acmp_ep
 			dest->path.slid = htobe16(ep->port->lid);
 			dest->path.dgid = dgid;
 			dest->path.dlid = net_dlid;
-			dest->path.reversible_numpath = IBV_PATH_RECORD_REVERSIBLE;
+			dest->path.reversible_numpath =
+				IBV_PATH_RECORD_REVERSIBLE;
 			dest->path.pkey = htobe16(ep->pkey);
-			dest->path.mtu = (uint8_t) mtu;
-			dest->path.rate = (uint8_t) rate;
-			dest->path.qosclass_sl = htobe16((uint16_t) sl & 0xF);
+			dest->path.mtu = (uint8_t)mtu;
+			dest->path.rate = (uint8_t)rate;
+			dest->path.qosclass_sl = htobe16((uint16_t)sl & 0xF);
 			if (dlid == ep->port->lid) {
 				dest->path.packetlifetime = 0;
 				dest->addr_timeout = (uint64_t)~0ULL;
 				dest->route_timeout = (uint64_t)~0ULL;
 			} else {
 				dest->path.packetlifetime = attr.subnet_timeout;
-				dest->addr_timeout = time_stamp_min() + (unsigned) addr_timeout;
-				dest->route_timeout = time_stamp_min() + (unsigned) route_timeout;
+				dest->addr_timeout = time_stamp_min() +
+						     (unsigned)addr_timeout;
+				dest->route_timeout = time_stamp_min() +
+						      (unsigned)route_timeout;
 			}
 			dest->remote_qpn = 1;
 			dest->state = ACMP_READY;
@@ -2298,7 +2309,7 @@ static void acmp_parse_hosts_file(struct acmp_ep *ep)
 	if (!(f = fopen(addr_data_file, "r"))) {
 		acm_log(0, "ERROR - couldn't open %s\n", addr_data_file);
 		return;
-        }
+	}
 
 	while (fgets(s, sizeof s, f)) {
 		if (s[0] == '#')
@@ -2339,20 +2350,22 @@ static void acmp_parse_hosts_file(struct acmp_ep *ep)
 			acmp_put_dest(gid_dest);
 		} else {
 			memcpy(&dest->path.dgid, &ib_addr, 16);
-			//ibv_query_gid(ep->port->dev->verbs, ep->port->port_num,
+			//ep->port->dev->verbs, ep->port->port_num,
 			//		0, &dest->path.sgid);
 			dest->path.slid = htobe16(ep->port->lid);
-			dest->path.reversible_numpath = IBV_PATH_RECORD_REVERSIBLE;
+			dest->path.reversible_numpath =
+				IBV_PATH_RECORD_REVERSIBLE;
 			dest->path.pkey = htobe16(ep->pkey);
 			dest->state = ACMP_ADDR_RESOLVED;
 		}
 
 		dest->remote_qpn = 1;
-		dest->addr_timeout = time_stamp_min() + (unsigned) addr_timeout;
-		dest->route_timeout = time_stamp_min() + (unsigned) route_timeout;
+		dest->addr_timeout = time_stamp_min() + (unsigned)addr_timeout;
+		dest->route_timeout =
+			time_stamp_min() + (unsigned)route_timeout;
 		acmp_put_dest(dest);
-		acm_log(1, "added host %s address type %d IB GID %s\n",
-			addr, addr_type, gid);
+		acm_log(1, "added host %s address type %d IB GID %s\n", addr,
+			addr_type, gid);
 	}
 
 	fclose(f);
@@ -2392,13 +2405,15 @@ static int __acmp_add_addr(const struct acm_address *addr, struct acmp_ep *ep,
 	int i;
 
 	for (i = 0; (i < ep->nmbr_ep_addrs) &&
-	     (ep->addr_info[i].type != ACM_ADDRESS_INVALID); i++)
+		    (ep->addr_info[i].type != ACM_ADDRESS_INVALID);
+	     i++)
 		;
 
 	if (i == ep->nmbr_ep_addrs) {
 		struct acmp_addr *new_info;
 
-		new_info = realloc(ep->addr_info, (i + 1) * sizeof(*ep->addr_info));
+		new_info = realloc(ep->addr_info,
+				   (i + 1) * sizeof(*ep->addr_info));
 		if (!new_info) {
 			acm_log(0, "ERROR - no more space for local address\n");
 			return -1;
@@ -2435,17 +2450,17 @@ static int __acmp_add_addr(const struct acm_address *addr, struct acmp_ep *ep,
 		return -1;
 	}
 
-	acm_get_gid((struct acm_port *) ep->port->port, 0, &dest->path.sgid);
+	acm_get_gid((struct acm_port *)ep->port->port, 0, &dest->path.sgid);
 	dest->path.dgid = dest->path.sgid;
 	dest->path.dlid = dest->path.slid = htobe16(ep->port->lid);
 	dest->path.reversible_numpath = IBV_PATH_RECORD_REVERSIBLE;
 	dest->path.pkey = htobe16(ep->pkey);
-	dest->path.mtu = (uint8_t) ep->port->mtu;
-	dest->path.rate = (uint8_t) ep->port->rate;
+	dest->path.mtu = (uint8_t)ep->port->mtu;
+	dest->path.rate = (uint8_t)ep->port->rate;
 
 	dest->remote_qpn = ep->qp->qp_num;
-	dest->addr_timeout = (uint64_t) ~0ULL;
-	dest->route_timeout = (uint64_t) ~0ULL;
+	dest->addr_timeout = (uint64_t)~0ULL;
+	dest->route_timeout = (uint64_t)~0ULL;
 	dest->state = ACMP_READY;
 	acmp_put_dest(dest);
 	*addr_context = addr_ctx;
@@ -2472,7 +2487,8 @@ static int acmp_add_addr(const struct acm_address *addr, void *ep_context,
 static void acmp_remove_addr(void *addr_context)
 {
 	struct acmp_addr_ctx *addr_ctx = addr_context;
-	struct acmp_addr *address = addr_ctx->ep->addr_info + addr_ctx->addr_inx;
+	struct acmp_addr *address =
+		addr_ctx->ep->addr_info + addr_ctx->addr_inx;
 	struct acmp_device *dev;
 	struct acmp_dest *dest;
 	struct acmp_ep *ep;
@@ -2486,18 +2502,20 @@ static void acmp_remove_addr(void *addr_context)
 	 */
 
 	pthread_mutex_lock(&acmp_dev_lock);
-	list_for_each(&acmp_dev_list, dev, entry) {
+	list_for_each (&acmp_dev_list, dev, entry) {
 		pthread_mutex_unlock(&acmp_dev_lock);
 
 		for (i = 0; i < dev->port_cnt; i++) {
 			struct acmp_port *port = &dev->port[i];
 
 			pthread_mutex_lock(&port->lock);
-			list_for_each(&port->ep_list, ep, entry) {
+			list_for_each (&port->ep_list, ep, entry) {
 				pthread_mutex_unlock(&port->lock);
-				dest = acmp_get_dest(ep, address->type, address->addr.info.addr);
+				dest = acmp_get_dest(ep, address->type,
+						     address->addr.info.addr);
 				if (dest) {
-					acm_log(2, "Found a dest addr, deleting it\n");
+					acm_log(2,
+						"Found a dest addr, deleting it\n");
 					pthread_mutex_lock(&ep->lock);
 					acmp_remove_dest(ep, dest);
 					pthread_mutex_unlock(&ep->lock);
@@ -2522,7 +2540,7 @@ static struct acmp_port *acmp_get_port(struct acm_endpoint *endpoint)
 		be64toh(endpoint->port->dev->dev_guid),
 		endpoint->port->port_num, endpoint->pkey);
 
-	list_for_each(&acmp_dev_list, dev, entry) {
+	list_for_each (&acmp_dev_list, dev, entry) {
 		if (dev->guid == endpoint->port->dev->dev_guid)
 			return &dev->port[endpoint->port->port_num - 1];
 	}
@@ -2530,8 +2548,8 @@ static struct acmp_port *acmp_get_port(struct acm_endpoint *endpoint)
 	return NULL;
 }
 
-static struct acmp_ep *
-acmp_get_ep(struct acmp_port *port, struct acm_endpoint *endpoint)
+static struct acmp_ep *acmp_get_ep(struct acmp_port *port,
+				   struct acm_endpoint *endpoint)
 {
 	struct acmp_ep *ep;
 
@@ -2539,7 +2557,7 @@ acmp_get_ep(struct acmp_port *port, struct acm_endpoint *endpoint)
 		be64toh(endpoint->port->dev->dev_guid),
 		endpoint->port->port_num, endpoint->pkey);
 
-	list_for_each(&port->ep_list, ep, entry) {
+	list_for_each (&port->ep_list, ep, entry) {
 		if (ep->pkey == endpoint->pkey)
 			return ep;
 	}
@@ -2564,18 +2582,16 @@ static uint16_t acmp_get_pkey_index(struct acm_endpoint *endpoint)
 
 static void acmp_close_endpoint(void *ep_context)
 {
-
 	struct acmp_ep *ep = ep_context;
 
-	acm_log(1, "%s %d pkey 0x%04x\n",
-		ep->port->dev->verbs->device->name,
+	acm_log(1, "%s %d pkey 0x%04x\n", ep->port->dev->verbs->device->name,
 		ep->port->port_num, ep->pkey);
 
 	ep->endpoint = NULL;
 }
 
-static struct acmp_ep *
-acmp_alloc_ep(struct acmp_port *port, struct acm_endpoint *endpoint)
+static struct acmp_ep *acmp_alloc_ep(struct acmp_port *port,
+				     struct acm_endpoint *endpoint)
 {
 	struct acmp_ep *ep;
 	int i;
@@ -2620,28 +2636,28 @@ static int acmp_open_endpoint(const struct acm_endpoint *endpoint,
 	struct ibv_qp_attr attr;
 	int ret, sq_size;
 
-	ep = acmp_get_ep(port,  (struct acm_endpoint *) endpoint);
+	ep = acmp_get_ep(port, (struct acm_endpoint *)endpoint);
 	if (ep) {
-		acm_log(2, "endpoint for pkey 0x%x already exists\n", endpoint->pkey);
+		acm_log(2, "endpoint for pkey 0x%x already exists\n",
+			endpoint->pkey);
 		pthread_mutex_lock(&ep->lock);
-		ep->endpoint =  (struct acm_endpoint *) endpoint;
+		ep->endpoint = (struct acm_endpoint *)endpoint;
 		pthread_mutex_unlock(&ep->lock);
-		*ep_context = (void *) ep;
+		*ep_context = (void *)ep;
 		return 0;
 	}
 
 	acm_log(2, "creating endpoint for pkey 0x%x\n", endpoint->pkey);
-	ep = acmp_alloc_ep(port, (struct acm_endpoint *) endpoint);
+	ep = acmp_alloc_ep(port, (struct acm_endpoint *)endpoint);
 	if (!ep)
 		return -1;
 
-	sprintf(ep->id_string, "%s-%d-0x%x",
-		port->dev->verbs->device->name,
+	sprintf(ep->id_string, "%s-%d-0x%x", port->dev->verbs->device->name,
 		port->port_num, endpoint->pkey);
 
 	sq_size = resolve_depth + send_depth;
-	ep->cq = ibv_create_cq(port->dev->verbs, sq_size + recv_depth,
-		ep, port->dev->channel, 0);
+	ep->cq = ibv_create_cq(port->dev->verbs, sq_size + recv_depth, ep,
+			       port->dev->channel, 0);
 	if (!ep->cq) {
 		acm_log(0, "ERROR - failed to create CQ\n");
 		goto err0;
@@ -2671,10 +2687,11 @@ static int acmp_open_endpoint(const struct acm_endpoint *endpoint,
 
 	attr.qp_state = IBV_QPS_INIT;
 	attr.port_num = port->port_num;
-	attr.pkey_index = acmp_get_pkey_index((struct acm_endpoint *) endpoint);
+	attr.pkey_index = acmp_get_pkey_index((struct acm_endpoint *)endpoint);
 	attr.qkey = ACM_QKEY;
-	ret = ibv_modify_qp(ep->qp, &attr, IBV_QP_STATE | IBV_QP_PKEY_INDEX |
-		IBV_QP_PORT | IBV_QP_QKEY);
+	ret = ibv_modify_qp(ep->qp, &attr,
+			    IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT |
+				    IBV_QP_QKEY);
 	if (ret) {
 		acm_log(0, "ERROR - failed to modify QP to init\n");
 		goto err2;
@@ -2704,7 +2721,7 @@ static int acmp_open_endpoint(const struct acm_endpoint *endpoint,
 	pthread_mutex_unlock(&port->lock);
 	acmp_ep_preload(ep);
 	acmp_ep_join(ep);
-	*ep_context = (void *) ep;
+	*ep_context = (void *)ep;
 	return 0;
 
 err2:
@@ -2746,13 +2763,14 @@ static void acmp_port_up(struct acmp_port *port)
 	port->sa_dest.av.port_num = port->port_num;
 	port->sa_dest.remote_qpn = 1;
 	sm_lid = htobe16(attr.sm_lid);
-	acmp_set_dest_addr(&port->sa_dest, ACM_ADDRESS_LID,
-			   (uint8_t *) &sm_lid, sizeof(sm_lid));
+	acmp_set_dest_addr(&port->sa_dest, ACM_ADDRESS_LID, (uint8_t *)&sm_lid,
+			   sizeof(sm_lid));
 
 	instance = atomic_inc(&port->sa_dest.refcnt) - 1;
 	port->sa_dest.state = ACMP_READY;
 	for (i = 0; i < attr.pkey_tbl_len; i++) {
-		ret = ibv_query_pkey(port->dev->verbs, port->port_num, i, &pkey_be);
+		ret = ibv_query_pkey(port->dev->verbs, port->port_num, i,
+				     &pkey_be);
 		if (ret)
 			continue;
 		pkey = be16toh(pkey_be);
@@ -2769,7 +2787,8 @@ static void acmp_port_up(struct acmp_port *port)
 	}
 
 	port->state = IBV_PORT_ACTIVE;
-	acm_log(1, "%s %d %d is up\n", port->dev->verbs->device->name, port->port_num, instance);
+	acm_log(1, "%s %d %d is up\n", port->dev->verbs->device->name,
+		port->port_num, instance);
 }
 
 static void acmp_port_down(struct acmp_port *port)
@@ -2792,7 +2811,8 @@ static void acmp_port_down(struct acmp_port *port)
 		port->sa_dest.state = ACMP_INIT;
 		pthread_mutex_unlock(&port->sa_dest.lock);
 	}
-	acm_log(1, "%s %d %d is down\n", port->dev->verbs->device->name, port->port_num, instance);
+	acm_log(1, "%s %d %d is down\n", port->dev->verbs->device->name,
+		port->port_num, instance);
 }
 
 static int acmp_open_port(const struct acm_port *cport, void *dev_context,
@@ -2850,7 +2870,7 @@ static int acmp_open_dev(const struct acm_device *device, void **dev_context)
 	acm_log(1, "dev_guid 0x%" PRIx64 " %s\n", be64toh(device->dev_guid),
 		device->verbs->device->name);
 
-	list_for_each(&acmp_dev_list, dev, entry) {
+	list_for_each (&acmp_dev_list, dev, entry) {
 		if (dev->guid == device->dev_guid) {
 			acm_log(2, "dev_guid 0x%" PRIx64 " already exits\n",
 				be64toh(device->dev_guid));
@@ -2881,7 +2901,7 @@ static int acmp_open_dev(const struct acm_device *device, void **dev_context)
 	}
 
 	size = sizeof(*dev) + sizeof(struct acmp_port) * attr.phys_port_cnt;
-	dev = (struct acmp_device *) calloc(1, size);
+	dev = (struct acmp_device *)calloc(1, size);
 	if (!dev)
 		goto err;
 
@@ -2905,8 +2925,10 @@ static int acmp_open_dev(const struct acm_device *device, void **dev_context)
 		acmp_init_port(&dev->port[i], dev, i + 1);
 	}
 
-	if (pthread_create(&dev->comp_thread_id, NULL, acmp_comp_handler, dev)) {
-		acm_log(0, "Error -- failed to create the comp thread for dev %s",
+	if (pthread_create(&dev->comp_thread_id, NULL, acmp_comp_handler,
+			   dev)) {
+		acm_log(0,
+			"Error -- failed to create the comp thread for dev %s",
 			dev->verbs->device->name);
 		goto err3;
 	}
@@ -3049,4 +3071,3 @@ int provider_query(struct acm_provider **provider, uint32_t *version)
 
 	return 0;
 }
-

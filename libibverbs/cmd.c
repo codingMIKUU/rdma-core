@@ -829,6 +829,8 @@ int ibv_cmd_create_ah(struct ibv_pd *pd, struct ibv_ah *ah,
 	cmd.attr.grh.hop_limit     = attr->grh.hop_limit;
 	cmd.attr.grh.traffic_class = attr->grh.traffic_class;
 	cmd.attr.grh.reserved      = 0;
+	cmd.attr.reserved 		   = attr->check_xrc;//use reserved for xrc check
+	cmd.attr.dqpn              = attr->dqpn;	//use dqpn for xrc tgt kernel qp 
 	memcpy(cmd.attr.grh.dgid, attr->grh.dgid.raw, 16);
 
 	ret = execute_cmd_write(pd->context, IB_USER_VERBS_CMD_CREATE_AH, &cmd,
@@ -838,6 +840,7 @@ int ibv_cmd_create_ah(struct ibv_pd *pd, struct ibv_ah *ah,
 
 	ah->handle  = resp->ah_handle;
 	ah->context = pd->context;
+	ah->srmc_flags = resp->srmc_flags;
 
 	return 0;
 }

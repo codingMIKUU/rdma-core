@@ -801,6 +801,7 @@ static inline void post_send_db(struct mlx5_qp *qp, struct mlx5_bf *bf,
 		mlx5_spin_unlock(&bf->lock);
 }
 
+
 static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 				  struct ibv_send_wr **bad_wr)
 {
@@ -810,6 +811,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	struct mlx5_wqe_ctrl_seg *ctrl = NULL;
 	struct mlx5_wqe_data_seg *dpseg;
 	struct mlx5_sg_copy_ptr sg_copy_ptr = {.index = 0, .offset = 0};
+	struct ibv_send_wr_q *wrq;
 	int nreq;
 	int inl = 0;
 	int err = 0;
@@ -847,12 +849,27 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			goto out;
 		}
 
-		if (unlikely(wr->num_sge > qp->sq.qp_state_max_gs)) {
+		if (!ibqp->qp_type==IBV_QPT_SRM&&unlikely(wr->num_sge > qp->sq.qp_state_max_gs)) {
 			mlx5_dbg(fp, MLX5_DBG_QP_SEND, "max gs exceeded %d (max = %d)\n",
 				 wr->num_sge, qp->sq.max_gs);
 			err = ENOMEM;
 			*bad_wr = wr;
 			goto out;
+		}
+		if(ibqp->qp_type == IBV_QPT_SRM){
+			idx =qp->sq.cur_post&(qp->sq.wqe_cnt - 1);
+			seg = (qp->sq_start + sizeof(struct ibv_send_wr_q)*idx);
+			wrq = (struct ibv_send_wr_q *)seg;
+			wrq->opcode = wr->opcode;
+			wrq->send_flags = wr->send_flags;
+			wrq->imm_data = wr->imm_data;
+			memcpy(&wrq->wr,&wr->wr,sizeof(wr->wr));
+			memcpy(&wrq->qp_type,&wr->qp_type,sizeof(wr->qp_type));
+			memcpy(&wrq->sge,&wr->sg_list[0],sizeof(struct ibv_sge));
+			wrq->wr_id = 1;
+			qp->sq.cur_post++;
+			qp->sq.wqe_head[idx] = qp->sq.head + nreq;//don't know why
+			continue;
 		}
 
 		if (wr->send_flags & IBV_SEND_FENCE)
@@ -1133,7 +1150,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		qp->sq.wrid[idx] = wr->wr_id;
 		qp->sq.wqe_head[idx] = qp->sq.head + nreq;
 		qp->sq.cur_post += DIV_ROUND_UP(size * 16, MLX5_SEND_WQE_BB);
-
+ 
 #ifdef MLX5_DEBUG
 		if (mlx5_debug_mask & MLX5_DBG_QP_SEND)
 			dump_wqe(to_mctx(ibqp->context), idx, size, qp);
@@ -1147,9 +1164,10 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	}
 
 out:
-	qp->fm_cache = next_fence;
-	post_send_db(qp, bf, nreq, inl, size, ctrl);
-
+	if(ibqp->qp_type!=IBV_QPT_SRM){
+		qp->fm_cache = next_fence;
+		post_send_db(qp, bf, nreq, inl, size, ctrl);
+	}
 	mlx5_spin_unlock(&qp->sq.lock);
 
 	return err;

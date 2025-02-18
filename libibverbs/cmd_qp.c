@@ -105,6 +105,7 @@ static int ibv_icmd_create_qp(struct ibv_context *context,
 	case IBV_QPT_UC:
 	case IBV_QPT_RAW_PACKET:
 	case IBV_QPT_XRC_SEND:
+	case IBV_QPT_SRM:
 	case IBV_QPT_DRIVER:
 		if (!(attr_ex->comp_mask & IBV_QP_INIT_ATTR_PD)) {
 			errno = EINVAL;
@@ -136,7 +137,7 @@ static int ibv_icmd_create_qp(struct ibv_context *context,
 				 attr_ex->send_cq->handle);
 			send_cq_handle = attr_ex->send_cq->handle;
 
-			if (attr_ex->qp_type != IBV_QPT_XRC_SEND) {
+			if (attr_ex->qp_type != IBV_QPT_XRC_SEND && attr_ex->qp_type != IBV_QPT_SRM) {
 				fill_attr_in_obj(cmdb, UVERBS_ATTR_CREATE_QP_RECV_CQ_HANDLE,
 						 attr_ex->recv_cq->handle);
 				recv_cq_handle = attr_ex->recv_cq->handle;
@@ -144,7 +145,7 @@ static int ibv_icmd_create_qp(struct ibv_context *context,
 		}
 
 		/* compatible with kernel code from the 'write' mode */
-		if (attr_ex->qp_type == IBV_QPT_XRC_SEND) {
+		if (attr_ex->qp_type == IBV_QPT_XRC_SEND || attr_ex->qp_type == IBV_QPT_SRM) {
 			attr_ex->cap.max_recv_wr = 0;
 			attr_ex->cap.max_recv_sge = 0;
 		}

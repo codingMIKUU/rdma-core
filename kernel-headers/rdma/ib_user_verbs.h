@@ -543,6 +543,7 @@ struct ib_uverbs_ah_attr {
 	__u8  is_global;
 	__u8  port_num;
 	__u8  reserved;
+	__u32 dqpn;
 };
 
 struct ib_uverbs_qp_attr {
@@ -890,6 +891,7 @@ struct ib_uverbs_create_ah {
 
 struct ib_uverbs_create_ah_resp {
 	__u32 ah_handle;
+	__u32 srmc_flags;
 	__u32 driver_data[];
 };
 
