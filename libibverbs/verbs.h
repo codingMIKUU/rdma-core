@@ -69,10 +69,10 @@ union ibv_gid {
 		__be64	interface_id;
 	} global;
 };
-struct ibv_qp_info {
+struct __attribute__((packed)) ibv_qp_info {
     uint32_t qpn;
     union ibv_gid gid;
-	char rconn_server[64];
+	char rconn_server[4];
 };
 enum ibv_gid_type {
 	IBV_GID_TYPE_IB,
@@ -1748,7 +1748,7 @@ struct ibv_ah {
 	struct ibv_context     *context;
 	struct ibv_pd	       *pd;  		
 	uint32_t		handle;
-	uint32_t 		srmc_flags;
+	int 		srmc_flags;
 };
 
 enum ibv_flow_flags {

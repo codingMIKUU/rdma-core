@@ -754,7 +754,12 @@ LATEST_SYMVER_FUNC(ibv_create_ah, 1_1, "IBVERBS_1.1",
 	if (ah) {
 		ah->context = pd->context;
 		ah->pd      = pd;
-		if(local_qp_info!=NULL && ah->srmc_flags){
+		printf("用户态驱动收到的srmc_flags: %u\n", ah->srmc_flags);
+		if (ah->srmc_flags == (uint32_t)-1) {
+			printf("报错srmc_flags: %u\n", ah->srmc_flags);
+            return NULL;
+        }
+		if(local_qp_info!=NULL && ah->srmc_flags>=0){
 			//XRC QP doesn't exists
 			struct ibv_qp_init_attr_ex create_attr;
     		memset(&create_attr, 0, sizeof(struct ibv_qp_init_attr_ex));
@@ -896,8 +901,6 @@ LATEST_SYMVER_FUNC(ibv_create_ah, 1_1, "IBVERBS_1.1",
 				
 		}
 			
-
-
 
 
 			

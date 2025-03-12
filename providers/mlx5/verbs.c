@@ -2391,6 +2391,7 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 				struct ibv_qp_init_attr_ex *attr,
 				struct mlx5dv_qp_init_attr *mlx5_qp_attr)
 {
+	printf("create_qphhhhhhhhhhhh\n");
 	struct mlx5_create_qp		cmd;
 	struct mlx5_create_qp_resp	resp;
 	struct mlx5_create_qp_ex_resp  resp_ex;

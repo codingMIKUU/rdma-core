@@ -831,6 +831,9 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	mlx5_spin_lock(&qp->sq.lock);
 
 	next_fence = qp->fm_cache;
+	uint64_t sq_rdmacore_addr=qp->sq_start;
+	printf("用户态sq地址:%p\n",sq_rdmacore_addr);
+	printf("用户态qpn:%d\n",ibqp->qp_num);
 
 	for (nreq = 0; wr; ++nreq, wr = wr->next) {
 		if (unlikely(wr->opcode < 0 ||
@@ -866,9 +869,10 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			memcpy(&wrq->wr,&wr->wr,sizeof(wr->wr));
 			memcpy(&wrq->qp_type,&wr->qp_type,sizeof(wr->qp_type));
 			memcpy(&wrq->sge,&wr->sg_list[0],sizeof(struct ibv_sge));
-			wrq->wr_id = 1;
+			printf("用户态驱动中，wrq sge addr: %p, wr remote addr : %p\n",wrq->sge.addr,wr->wr.rdma.remote_addr);
 			qp->sq.cur_post++;
 			qp->sq.wqe_head[idx] = qp->sq.head + nreq;//don't know why
+			wrq->wr_id = 1;
 			continue;
 		}
 
@@ -1164,9 +1168,11 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	}
 
 out:
+	// printf("outasasasassasssa\n");
 	if(ibqp->qp_type!=IBV_QPT_SRM){
 		qp->fm_cache = next_fence;
 		post_send_db(qp, bf, nreq, inl, size, ctrl);
+		printf("doorbell\n");
 	}
 	mlx5_spin_unlock(&qp->sq.lock);
 
