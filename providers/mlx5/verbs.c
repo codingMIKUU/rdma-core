@@ -1536,8 +1536,6 @@ static int _sq_overhead(struct mlx5_qp *qp,
 			size += sizeof(struct mlx5_wqe_eth_seg) +
 				sizeof(struct mlx5_wqe_eth_pad);
 		break;
-
-	case IBV_QPT_SRM:
 	case IBV_QPT_XRC_RECV:
 	case IBV_QPT_XRC_SEND:
 		size += sizeof(struct mlx5_wqe_xrc_seg);
@@ -1571,7 +1569,6 @@ static int sq_overhead(struct mlx5_qp *qp, struct ibv_qp_init_attr_ex *attr,
 		case IBV_QPT_RC:
 		case IBV_QPT_UC:
 		case IBV_QPT_DRIVER:
-		case IBV_QPT_SRM:
 		case IBV_QPT_XRC_RECV:
 		case IBV_QPT_XRC_SEND:
 			ops = IBV_QP_EX_WITH_SEND |
@@ -1625,6 +1622,7 @@ static int mlx5_calc_send_wqe(struct mlx5_context *ctx,
 	}
 
 	size = sq_overhead(qp, attr, mlx5_qp_attr);
+	//printf("sq_overhead:%d\n",size);
 	if (size < 0)
 		return size;
 
@@ -1726,7 +1724,7 @@ static int mlx5_calc_sq_size(struct mlx5_context *ctx,
 		qp->sq.wqe_shift = STATIC_ILOG_32(MLX5_SEND_WQE_BB) - 1;
 	qp->sq.max_gs = attr->cap.max_send_sge;
 	qp->sq.max_post = wq_size / wqe_size;
-
+	//printf("qp type:%d, wqe_size %d,max_gs:%d,max_post:%d\n",attr->qp_type,wqe_size,qp->sq.max_gs,qp->sq.max_post);
 	return wq_size;
 }
 
@@ -2391,7 +2389,6 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 				struct ibv_qp_init_attr_ex *attr,
 				struct mlx5dv_qp_init_attr *mlx5_qp_attr)
 {
-	printf("create_qphhhhhhhhhhhh\n");
 	struct mlx5_create_qp		cmd;
 	struct mlx5_create_qp_resp	resp;
 	struct mlx5_create_qp_ex_resp  resp_ex;

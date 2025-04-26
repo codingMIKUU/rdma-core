@@ -73,6 +73,7 @@ struct __attribute__((packed)) ibv_qp_info {
     uint32_t qpn;
     union ibv_gid gid;
 	char rconn_server[4];
+	struct ibv_qp* qp;
 };
 enum ibv_gid_type {
 	IBV_GID_TYPE_IB,
