@@ -26,6 +26,6 @@ if [ "x$NINJA" == "x" ]; then
     $CMAKE -DCMAKE_BUILD_TYPE=Debug -DIN_PLACE=1 ${EXTRA_CMAKE_FLAGS:-} ..
     make
 else
-    $CMAKE -DCMAKE_BUILD_TYPE=Debug -DIN_PLACE=1 -GNinja ${EXTRA_CMAKE_FLAGS:-} ..
+    $CMAKE -DIN_PLACE=1 -GNinja ${EXTRA_CMAKE_FLAGS:-} ..
     $NINJA
 fi

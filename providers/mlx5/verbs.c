@@ -2461,6 +2461,7 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 			mlx5_dbg(fp, MLX5_DBG_QP, "DC QP must be of type IBV_QPT_DRIVER\n");
 			errno = EINVAL;
 			goto err;
+			
 		}
 		if (mlx5_qp_attr->comp_mask &
 		    MLX5DV_QP_INIT_ATTR_MASK_QP_CREATE_FLAGS) {
