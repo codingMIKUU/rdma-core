@@ -1538,6 +1538,7 @@ static int _sq_overhead(struct mlx5_qp *qp,
 		break;
 	case IBV_QPT_XRC_RECV:
 	case IBV_QPT_XRC_SEND:
+	case IBV_QPT_SRM:
 		size += sizeof(struct mlx5_wqe_xrc_seg);
 		break;
 
@@ -1571,6 +1572,7 @@ static int sq_overhead(struct mlx5_qp *qp, struct ibv_qp_init_attr_ex *attr,
 		case IBV_QPT_DRIVER:
 		case IBV_QPT_XRC_RECV:
 		case IBV_QPT_XRC_SEND:
+		case IBV_QPT_SRM:
 			ops = IBV_QP_EX_WITH_SEND |
 			      IBV_QP_EX_WITH_SEND_WITH_INV |
 			      IBV_QP_EX_WITH_SEND_WITH_IMM |
@@ -1616,10 +1618,6 @@ static int mlx5_calc_send_wqe(struct mlx5_context *ctx,
 	int inl_size = 0;
 	int max_gather;
 	int tot_size;
-
-	if(attr->qp_type == IBV_QPT_SRM){
-		return sizeof(struct ibv_send_wr_q);
-	}
 
 	size = sq_overhead(qp, attr, mlx5_qp_attr);
 	//printf("sq_overhead:%d\n",size);
@@ -1710,18 +1708,12 @@ static int mlx5_calc_sq_size(struct mlx5_context *ctx,
 	}
 
 	wq_size = roundup_pow_of_two(attr->cap.max_send_wr * wqe_size);
-	if(attr->qp_type == IBV_QPT_SRM){
-		qp->sq.wqe_cnt = wq_size/wqe_size;
-	}else
-		qp->sq.wqe_cnt = wq_size / MLX5_SEND_WQE_BB;
+	qp->sq.wqe_cnt = wq_size / MLX5_SEND_WQE_BB;
 	if (qp->sq.wqe_cnt > ctx->max_send_wqebb) {
 		mlx5_dbg(fp, MLX5_DBG_QP, "\n");
 		return -EINVAL;
 	}
-	if(attr->qp_type == IBV_QPT_SRM)
-		qp->sq.wqe_shift = STATIC_ILOG_32(128) - 1;
-	else 
-		qp->sq.wqe_shift = STATIC_ILOG_32(MLX5_SEND_WQE_BB) - 1;
+	qp->sq.wqe_shift = STATIC_ILOG_32(MLX5_SEND_WQE_BB) - 1;
 	qp->sq.max_gs = attr->cap.max_send_sge;
 	qp->sq.max_post = wq_size / wqe_size;
 	//printf("qp type:%d, wqe_size %d,max_gs:%d,max_post:%d\n",attr->qp_type,wqe_size,qp->sq.max_gs,qp->sq.max_post);

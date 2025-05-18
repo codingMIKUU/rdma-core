@@ -895,23 +895,23 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			*bad_wr = wr;
 			goto out;
 		}
-		if(ibqp->qp_type == IBV_QPT_SRM){
-			idx =qp->sq.cur_post&(qp->sq.wqe_cnt - 1);
-			seg = (qp->sq_start + sizeof(struct ibv_send_wr_q)*idx);
-			wrq = (struct ibv_send_wr_q *)seg;
-			wrq->opcode = wr->opcode;
-			wrq->send_flags = wr->send_flags;
-			wrq->imm_data = wr->imm_data;
-			memcpy(&wrq->wr,&wr->wr,sizeof(wr->wr));
-			memcpy(&wrq->qp_type,&wr->qp_type,sizeof(wr->qp_type));
-			memcpy(&wrq->sge,&wr->sg_list[0],sizeof(struct ibv_sge));
-			//printf("用户态驱动中，wrq sge addr: %p, wr remote addr : %p\n",wrq->sge.addr,wr->wr.rdma.remote_addr);
-			qp->sq.cur_post++;
-			qp->sq.wqe_head[idx] = qp->sq.head + nreq;//don't know why
-			qp->sq.head++;
-			wrq->wr_id = 1;
-			continue;
-		}
+		// if(ibqp->qp_type == IBV_QPT_SRM){
+		// 	idx =qp->sq.cur_post&(qp->sq.wqe_cnt - 1);
+		// 	seg = (qp->sq_start + sizeof(struct ibv_send_wr_q)*idx);
+		// 	wrq = (struct ibv_send_wr_q *)seg;
+		// 	wrq->opcode = wr->opcode;
+		// 	wrq->send_flags = wr->send_flags;
+		// 	wrq->imm_data = wr->imm_data;
+		// 	memcpy(&wrq->wr,&wr->wr,sizeof(wr->wr));
+		// 	memcpy(&wrq->qp_type,&wr->qp_type,sizeof(wr->qp_type));
+		// 	memcpy(&wrq->sge,&wr->sg_list[0],sizeof(struct ibv_sge));
+		// 	//printf("用户态驱动中，wrq sge addr: %p, wr remote addr : %p\n",wrq->sge.addr,wr->wr.rdma.remote_addr);
+		// 	qp->sq.cur_post++;
+		// 	qp->sq.wqe_head[idx] = qp->sq.head + nreq;//don't know why
+		// 	qp->sq.head++;
+		// 	wrq->wr_id = 1;
+		// 	continue;
+		// }
 
 		if (wr->send_flags & IBV_SEND_FENCE)
 			fence = MLX5_WQE_CTRL_FENCE;
@@ -933,6 +933,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		qp->sq.wr_data[idx] = 0;
 
 		switch (ibqp->qp_type) {
+		case IBV_QPT_SRM:
 		case IBV_QPT_XRC_SEND:
 			if (unlikely(wr->opcode != IBV_WR_BIND_MW &&
 				     wr->opcode != IBV_WR_LOCAL_INV)) {
@@ -1177,6 +1178,13 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 					size += sizeof(struct mlx5_wqe_data_seg) / 16;
 				}
 			}
+			if(ibqp->qp_type==IBV_QPT_SRM){
+				// if(ctrl->imm){
+				// 	printf("error: ctrl->imm is not 0\n");
+				// }
+				__atomic_thread_fence(__ATOMIC_RELEASE);
+				__atomic_store_n(&ctrl->imm, *(uint32_t*)(wr->qp_type.srm.remote_gid.raw+12), __ATOMIC_SEQ_CST); // 使用原子操作存储imm值
+			}
 		}
 
 		mlx5_opcode = mlx5_ib_opcode[wr->opcode];
@@ -1205,12 +1213,16 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	}
 
 out:
+	qp->fm_cache = next_fence;
 	// printf("outasasasassasssa\n");
 	if(ibqp->qp_type!=IBV_QPT_SRM){
-		qp->fm_cache = next_fence;
+		
 		post_send_db(qp, bf, nreq, inl, size, ctrl);
 		// if(ibqp->qp_type == IBV_QPT_XRC_SEND)
 		// 	print_wqe_info(ctrl,size);
+	}
+	else{
+		qp->sq.head += nreq;
 	}
 	mlx5_spin_unlock(&qp->sq.lock);
 
