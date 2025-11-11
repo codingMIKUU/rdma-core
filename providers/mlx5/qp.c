@@ -864,6 +864,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	uint32_t max_tso = 0;
 	union ibv_gid *gid = &wr->qp_type.srm.remote_gid;
 	FILE *fp = to_mctx(ibqp->context)->dbg_fp; /* The compiler ignores in non-debug mode */
+	uint32_t imm;
 
 	mlx5_spin_lock(&qp->sq.lock);
 
@@ -889,7 +890,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			goto out;
 		}
 
-		if (!ibqp->qp_type==IBV_QPT_SRM&&unlikely(wr->num_sge > qp->sq.qp_state_max_gs)) {
+		if (ibqp->qp_type!=IBV_QPT_SRM&&unlikely(wr->num_sge > qp->sq.qp_state_max_gs)) {
 			mlx5_dbg(fp, MLX5_DBG_QP_SEND, "max gs exceeded %d (max = %d)\n",
 				 wr->num_sge, qp->sq.max_gs);
 			err = ENOMEM;
@@ -919,8 +920,18 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		else
 			fence = next_fence;
 		next_fence = 0;
-		idx = qp->sq.cur_post & (qp->sq.wqe_cnt - 1);
-		ctrl = seg = mlx5_get_send_wqe(qp, idx);
+		//FCScale下srm qp的特点：wqe下标发送顺序以及填写顺序并不是按顺序发送，因此要遍历一下看看那块wqe是无效的
+		while(1){
+			idx = qp->sq.cur_post & (qp->sq.wqe_cnt - 1);
+			ctrl = seg = mlx5_get_send_wqe(qp, idx);
+			imm = __atomic_load_n(&ctrl->imm,__ATOMIC_SEQ_CST);
+			if(ibqp->qp_type!=IBV_QPT_SRM || imm == 0){
+				break;
+			}
+			qp->sq.cur_post++;
+		}
+		 
+
 		*(uint32_t *)(seg + 8) = 0;
 		ctrl->imm = send_ieth(wr);
 		ctrl->fm_ce_se = qp->sq_signal_bits | fence |
@@ -1210,6 +1221,10 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			// }
 			// __atomic_thread_fence(__ATOMIC_RELEASE);
 			// __atomic_store_n(&ctrl->imm, *(uint32_t*)(wr->qp_type.srm.remote_gid.raw+12), __ATOMIC_SEQ_CST); // 使用原子操作存储imm值
+			
+			
+			//将wr_id用于返回wqe idx
+			wr->wr_id = idx;
 			break;
 		}
 	}
@@ -1228,6 +1243,8 @@ out:
 		__sync_synchronize();
 		//udma_to_device_barrier();
 		__atomic_store_n(&ctrl->imm, *(uint32_t*)(gid->raw+12), __ATOMIC_SEQ_CST); // 使用原子操作存储imm值
+
+
 	}
 	mlx5_spin_unlock(&qp->sq.lock);
 
