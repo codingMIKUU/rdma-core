@@ -3,7 +3,8 @@
         {
             "name": "Linux",
             "includePath": [
-                "${workspaceFolder}/**/**"
+                "/root/zxm/rdma-core/build/include",
+                "${workspaceFolder}/**/**/**/**"
             ],
             "defines": []
         }

@@ -83,6 +83,10 @@ enum {
 #define MLX5_MAX_LOG2_CONTIG_BLOCK_SIZE 23
 #define MLX5_MIN_LOG2_CONTIG_BLOCK_SIZE 12
 
+
+//fcscale
+#define MAX_XRC_QP_PER_QP 8192
+
 enum {
 	MLX5_DBG_QP		= 1 << 0,
 	MLX5_DBG_CQ		= 1 << 1,
@@ -596,6 +600,8 @@ struct mlx5_wq {
 	unsigned			tail;
 	unsigned			cur_post;
 	int				max_gs;
+
+	
 	/*
 	 * Equal to max_gs when qp is in RTS state for sq, or in INIT state for
 	 * rq, equal to -1 otherwise, used to verify qp_state in data path.
@@ -605,6 +611,9 @@ struct mlx5_wq {
 	int				offset;
 	void			       *qend;
 	uint32_t			*wr_data;
+
+
+	uint32_t		srm_entries_cap; /* SRM entries capacity */
 };
 
 struct mlx5_devx_uar {
@@ -636,6 +645,10 @@ struct mlx5_bf {
 	uint32_t			uar_handle;
 	uint32_t			length;
 	uint32_t			page_id;
+
+	__u32 index_uar_in_page;
+	__u32 index_in_uar;
+	__u32 db_bf_reg_size;
 };
 
 struct mlx5_dm {
@@ -721,6 +734,13 @@ struct mlx5_qp {
 	uint32_t			get_ece;
 
 	uint8_t				need_mmo_enable:1;
+
+
+	/*
+	 * Field for fcscale 
+	*/
+	struct ibv_qp **xrc_qp_arr;
+	int xrc_qp_arr_cnt;
 };
 
 struct mlx5_ah {
@@ -956,6 +976,14 @@ struct mlx5_devx_eq {
 	size_t size;
 	int eqn;
 };
+
+struct srm_qp_entry{
+	
+	uint32_t qp_idx;
+	uint32_t valid;
+	uint64_t ctrl;
+	uint64_t bytes;
+}__attribute__((__aligned__(64)));
 
 struct ibv_flow *
 _mlx5dv_create_flow(struct mlx5dv_flow_matcher *flow_matcher,

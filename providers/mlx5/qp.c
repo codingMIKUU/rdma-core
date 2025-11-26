@@ -169,6 +169,10 @@ void *mlx5_get_send_wqe(struct mlx5_qp *qp, int n)
 	return qp->sq_start + (n << MLX5_SEND_WQE_SHIFT);
 }
 
+struct srm_qp_entry* mlx5_get_srm_qp_entry(struct mlx5_qp *qp, int n){
+	return qp->sq_start + (n * sizeof(struct srm_qp_entry));
+}
+
 void mlx5_init_rwq_indices(struct mlx5_rwq *rwq)
 {
 	rwq->rq.head	 = 0;
@@ -801,6 +805,31 @@ static inline void post_send_db(struct mlx5_qp *qp, struct mlx5_bf *bf,
 		mlx5_spin_unlock(&bf->lock);
 }
 
+
+//dosen't write bf reg
+static inline void fc_post_send_db(struct mlx5_qp *qp, struct mlx5_bf *bf,
+				int nreq, int inl, int size, void *ctrl){
+
+	struct mlx5_context *ctx;
+	if (unlikely(!nreq))
+		return;
+
+	qp->sq.head += nreq;
+
+	/*
+	 * Make sure that descriptors are written before
+	 * updating doorbell record and ringing the doorbell
+	 */
+	udma_to_device_barrier();
+	qp->db[MLX5_SND_DBR] = htobe32(qp->sq.cur_post & 0xffff);
+
+	/* Make sure that the doorbell write happens before the memcpy
+	 * to WC memory below
+	 */
+
+	mmio_wc_start();
+}
+
 void print_wqe_info(void *seg, size_t size) {
     int exp_sz;
 
@@ -882,9 +911,10 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			goto out;
 		}
 
-		if (!ibqp->qp_type == IBV_QPT_SRM && unlikely(mlx5_wq_overflow(&qp->sq, nreq,
+		if (unlikely(mlx5_wq_overflow(&qp->sq, nreq,
 					      to_mcq(qp->ibv_qp->send_cq)))) {
 			mlx5_dbg(fp, MLX5_DBG_QP_SEND, "work queue overflow\n");
+			printf("work queue overflow, head:%u,tail:%u,max_post:%u\n",qp->sq.head,qp->sq.tail,qp->sq.max_post);
 			err = ENOMEM;
 			*bad_wr = wr;
 			goto out;
@@ -920,17 +950,8 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		else
 			fence = next_fence;
 		next_fence = 0;
-		//FCScale下srm qp的特点：wqe下标发送顺序以及填写顺序并不是按顺序发送，因此要遍历一下看看那块wqe是无效的
-		while(1){
-			idx = qp->sq.cur_post & (qp->sq.wqe_cnt - 1);
-			ctrl = seg = mlx5_get_send_wqe(qp, idx);
-			imm = __atomic_load_n(&ctrl->imm,__ATOMIC_SEQ_CST);
-			if(ibqp->qp_type!=IBV_QPT_SRM || imm == 0){
-				break;
-			}
-			qp->sq.cur_post++;
-		}
-		 
+		idx = qp->sq.cur_post & (qp->sq.wqe_cnt - 1);
+		ctrl = seg = mlx5_get_send_wqe(qp, idx);		 
 
 		*(uint32_t *)(seg + 8) = 0;
 		ctrl->imm = send_ieth(wr);
@@ -1204,6 +1225,11 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		qp->sq.wrid[idx] = wr->wr_id;
 		qp->sq.wqe_head[idx] = qp->sq.head + nreq;
 		qp->sq.cur_post += DIV_ROUND_UP(size * 16, MLX5_SEND_WQE_BB);
+
+		if(ibqp->qp_type == IBV_QPT_XRC_SEND){
+			wr->wr_id = *(__be64 *)ctrl;
+		}
+		
  
 #ifdef MLX5_DEBUG
 		if (mlx5_debug_mask & MLX5_DBG_QP_SEND)
@@ -1215,37 +1241,21 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 				ibqp->qp_num,
 				(char *)ibv_wr_opcode_str(wr->opcode),
 				wr->num_sge);
-		if(ibqp->qp_type==IBV_QPT_SRM){
-			// if(ctrl->imm){
-			// 	printf("error: ctrl->imm is not 0\n");
-			// }
-			// __atomic_thread_fence(__ATOMIC_RELEASE);
-			// __atomic_store_n(&ctrl->imm, *(uint32_t*)(wr->qp_type.srm.remote_gid.raw+12), __ATOMIC_SEQ_CST); // 使用原子操作存储imm值
-			
-			
-			//将wr_id用于返回wqe idx
-			wr->wr_id = idx;
-			break;
-		}
 	}
 
 out:
 	qp->fm_cache = next_fence;
 	// printf("outasasasassasssa\n");
-	if(ibqp->qp_type!=IBV_QPT_SRM){
+	if(ibqp->qp_type!=IBV_QPT_XRC_SEND){
 		
 		post_send_db(qp, bf, nreq, inl, size, ctrl);
 		// if(ibqp->qp_type == IBV_QPT_XRC_SEND)
 		// 	print_wqe_info(ctrl,size);
 	}
 	else if(!err){
-		qp->sq.head ++;
-		__sync_synchronize();
-		//udma_to_device_barrier();
-		__atomic_store_n(&ctrl->imm, *(uint32_t*)(gid->raw+12), __ATOMIC_SEQ_CST); // 使用原子操作存储imm值
-
-
+		fc_post_send_db(qp, bf, nreq, inl, size, ctrl);
 	}
+
 	mlx5_spin_unlock(&qp->sq.lock);
 
 	return err;
@@ -1269,7 +1279,38 @@ int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	}
 #endif
 
-	return _mlx5_post_send(ibqp, wr, bad_wr);
+	if(ibqp->qp_type == IBV_QPT_SRM){
+		struct mlx5_qp *mqp = to_mqp(ibqp);
+		int qp_idx = *((uint16_t*)&wr->qp_type.srm.remote_gid.raw[14]);
+		int ret = _mlx5_post_send(mqp->xrc_qp_arr[qp_idx],wr,bad_wr);
+
+		
+		while(1){
+			uint32_t idx = mqp->sq.cur_post & (mqp->sq.srm_entries_cap - 1);
+			struct srm_qp_entry *entry = mlx5_get_srm_qp_entry(mqp, idx);
+			uint32_t valid = __atomic_load_n(&entry->valid,__ATOMIC_SEQ_CST);
+			if(valid == 0){
+				__atomic_store_n(&entry->qp_idx, qp_idx,__ATOMIC_SEQ_CST);	
+				__atomic_store_n(&entry->ctrl,wr->wr_id,__ATOMIC_SEQ_CST);
+				__atomic_store_n(&entry->bytes,wr->sg_list[0].length,__ATOMIC_SEQ_CST);
+				__atomic_store_n(&entry->valid,1,__ATOMIC_SEQ_CST);
+				//printf("DEBUG: valid is 0, cur_post:%u\n",mqp->sq.cur_post);
+				mqp->sq.cur_post++;
+				break;
+			}
+			else{
+				mqp->sq.cur_post++;
+				printf("DEBUG: valid is 1\n");
+			}
+		
+		}
+		
+		return ret;
+	}
+	else{
+		return _mlx5_post_send(ibqp, wr, bad_wr);
+	} 
+	
 }
 
 enum {

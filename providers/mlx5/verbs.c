@@ -31,6 +31,10 @@
  * SOFTWARE.
  */
 
+
+ /* TODO LIST
+ * */
+
 #include <config.h>
 
 #include <stdlib.h>
@@ -312,6 +316,10 @@ static void mlx5_insert_dyn_uuars(struct mlx5_context *ctx,
 		index_in_uar = j % num_db_bf_per_uar;
 		bf->reg = bf_uar->uar + (index_uar_in_page * MLX5_ADAPTER_PAGE_SIZE) +
 					 MLX5_BF_OFFSET + (index_in_uar * db_bf_reg_size);
+
+		bf->index_uar_in_page = index_uar_in_page;
+		bf->index_in_uar = index_in_uar;
+		bf->db_bf_reg_size = db_bf_reg_size;
 		bf->buf_size = bf_uar->nc_mode ? 0 : ctx->bf_reg_size / 2;
 		/* set to non zero is BF entry, will be detected as part of post_send */
 		bf->uuarn = bf_uar->nc_mode ? 0 : 1;
@@ -2680,23 +2688,44 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 	}
 
 	mparent_domain = to_mparent_domain(attr->pd);
-	if (mparent_domain && mparent_domain->mtd)
+	if (mparent_domain && mparent_domain->mtd){
 		bf = mparent_domain->mtd->bf;
+		//printf("Using BF from parent domain\n");
+	}
 
 	if (!bf && !(ctx->flags & MLX5_CTX_FLAGS_NO_KERN_DYN_UAR)) {
 		bf = mlx5_get_qp_uar(context);
 		if (!bf)
 			goto err_free_uidx;
+		//printf("Using dynamically allocated UAR\n");
 	}
 
 	if (bf) {
 		if (bf->dyn_alloc_uar) {
 			cmd.bfreg_index = bf->page_id;
 			cmd.flags |= MLX5_QP_FLAG_UAR_PAGE_INDEX;
+			//printf("Using BF from UAR\n");
 		} else {
 			cmd.bfreg_index = bf->bfreg_dyn_index;
 			cmd.flags |= MLX5_QP_FLAG_BFREG_INDEX;
+			//printf("Using BF from BFREG\n");
 		}
+		//printf("BF type :%d\n", bf->nc_mode);
+		/* Fill BF information for kernel */
+		cmd.bf_buf_size = bf->buf_size;
+		cmd.bf_offset = bf->offset;
+		cmd.index_uar_in_page = bf->index_uar_in_page;
+		cmd.index_in_uar = bf->index_in_uar;
+		cmd.db_bf_reg_size = bf->db_bf_reg_size;	
+	}
+	else{
+		//printf("Using statically allocated UAR\n");
+		/* Clear BF information when no BF is used */
+		cmd.bf_buf_size = 0;
+		cmd.bf_offset = 0;
+		cmd.index_uar_in_page = 0;
+		cmd.index_in_uar = 0;
+		cmd.db_bf_reg_size = 0;
 	}
 
 	if (ctx->flags & MLX5_CTX_FLAGS_ECE_SUPPORTED)
@@ -3072,7 +3101,7 @@ static int qp_enable_mmo(struct ibv_qp *qp)
 	return ret ? mlx5_get_cmd_status_err(ret, out) : 0;
 }
 
-int mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
+int __mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 		   int attr_mask)
 {
 	struct ibv_modify_qp cmd = {};
@@ -3191,6 +3220,87 @@ int mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 		set_qp_operational_state(mqp, attr->qp_state);
 
 	return ret;
+}
+
+int mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
+	int attr_mask){
+	if(qp->qp_type == IBV_QPT_SRM || qp->qp_type == IBV_QPT_XRC_RECV){
+		struct mlx5_qp *mqp = to_mqp(qp);
+		struct ibv_qp_attr xrc_qp_attr ;
+
+		for(int i = 0;i<mqp->xrc_qp_arr_cnt;i++){
+			if(mqp->xrc_qp_arr[i] == NULL){
+				if(qp->qp_type == IBV_QPT_XRC_RECV)
+					return __mlx5_modify_qp(qp, attr, attr_mask);
+				return EINVAL;
+			}
+			memset(&xrc_qp_attr,0,sizeof(xrc_qp_attr));
+			if(attr->qp_state == IBV_QPS_INIT){
+				xrc_qp_attr.qp_state = IBV_QPS_INIT;
+				xrc_qp_attr.pkey_index = 0;
+				xrc_qp_attr.port_num = attr->port_num;
+				xrc_qp_attr.qp_access_flags = attr->qp_access_flags;
+				if (__mlx5_modify_qp(mqp->xrc_qp_arr[i], &xrc_qp_attr,attr_mask)) {
+					printf("Failed to modify xrc qp to INIT state:%d\n",i);
+					return EINVAL;
+				}
+				
+			}
+			else if(attr->qp_state == IBV_QPS_RTR){
+				xrc_qp_attr.qp_state = IBV_QPS_RTR;
+				xrc_qp_attr.path_mtu = attr->path_mtu;
+				xrc_qp_attr.dest_qp_num = attr->dest_qp_num + i;
+				xrc_qp_attr.rq_psn = attr->rq_psn;
+
+				xrc_qp_attr.ah_attr.is_global =attr->ah_attr.is_global;
+				xrc_qp_attr.ah_attr.dlid = attr->ah_attr.dlid;
+				xrc_qp_attr.ah_attr.sl = attr->ah_attr.sl;
+				xrc_qp_attr.ah_attr.src_path_bits = attr->ah_attr.src_path_bits;
+				xrc_qp_attr.ah_attr.port_num = attr->ah_attr.port_num;
+
+
+				xrc_qp_attr.ah_attr.grh.dgid.global.interface_id = attr->ah_attr.grh.dgid.global.interface_id;
+				xrc_qp_attr.ah_attr.grh.dgid.global.subnet_prefix = attr->ah_attr.grh.dgid.global.subnet_prefix;
+				xrc_qp_attr.ah_attr.grh.sgid_index = attr->ah_attr.grh.sgid_index;
+				xrc_qp_attr.ah_attr.grh.hop_limit = attr->ah_attr.grh.hop_limit;
+				
+				xrc_qp_attr.max_dest_rd_atomic = attr->max_dest_rd_atomic;
+				xrc_qp_attr.min_rnr_timer = attr->min_rnr_timer;
+
+
+				if (__mlx5_modify_qp(mqp->xrc_qp_arr[i],&xrc_qp_attr,attr_mask)) {
+					printf("Failed to modify xrc qp to RTR state:%d\n",i);
+					return EINVAL;
+				}
+				
+			}
+			else if(attr->qp_state == IBV_QPS_RTS){ 
+				xrc_qp_attr.qp_state = IBV_QPS_RTS;
+				xrc_qp_attr.sq_psn = attr->sq_psn;
+
+				xrc_qp_attr.timeout = attr->timeout;
+				xrc_qp_attr.retry_cnt =  attr->retry_cnt;
+				xrc_qp_attr.rnr_retry = attr->rnr_retry;
+				xrc_qp_attr.max_rd_atomic = attr->max_rd_atomic;
+				xrc_qp_attr.max_dest_rd_atomic = attr->max_dest_rd_atomic;
+				
+				if(__mlx5_modify_qp(mqp->xrc_qp_arr[i],&xrc_qp_attr,attr_mask)){
+					printf("Failed to modify qp to RTS state\n");
+					return EINVAL;
+				}
+			}
+			else{
+				printf("Unsupported qp state for SRM QP\n");
+				return EINVAL;
+			}
+		}
+		return 0;
+
+	}
+	else{
+		return __mlx5_modify_qp(qp, attr, attr_mask);
+	}
+
 }
 
 int mlx5_modify_qp_rate_limit(struct ibv_qp *qp,
@@ -3454,7 +3564,83 @@ int mlx5_detach_mcast(struct ibv_qp *qp, const union ibv_gid *gid, uint16_t lid)
 struct ibv_qp *mlx5_create_qp_ex(struct ibv_context *context,
 				 struct ibv_qp_init_attr_ex *attr)
 {
-	return create_qp(context, attr, NULL);
+	if(attr->qp_type == IBV_QPT_SRM){
+
+		
+		struct ibv_qp * qp ;
+		struct mlx5_qp *mqp;
+		if(attr->sender_side){
+			qp = create_qp(context, attr, NULL);//需要srm qp下传信息
+			if(!qp){
+				printf("failed to create srm qp\n");
+				return NULL;
+			}
+		}
+		
+
+
+		struct ibv_qp_init_attr_ex xrc_create_attr;
+		memset (&xrc_create_attr, 0, sizeof(xrc_create_attr));
+		if(attr->sender_side){
+			xrc_create_attr.qp_type = IBV_QPT_XRC_SEND;
+			xrc_create_attr.comp_mask = IBV_QP_INIT_ATTR_PD;
+			xrc_create_attr.pd = attr->pd;
+			xrc_create_attr.send_cq = attr->send_cq;
+			xrc_create_attr.cap.max_send_wr = 512;
+			xrc_create_attr.cap.max_send_sge = 1;
+			xrc_create_attr.cap.max_inline_data = 128;
+		}
+		else{
+			xrc_create_attr.qp_type = IBV_QPT_XRC_RECV;
+			xrc_create_attr.comp_mask = IBV_QP_INIT_ATTR_XRCD;
+			xrc_create_attr.xrcd = attr->xrcd;
+			xrc_create_attr.recv_cq = attr->send_cq;
+			xrc_create_attr.cap.max_recv_wr = 1;  // We don't do RECVs on conn QPs
+			xrc_create_attr.cap.max_recv_sge = 1;
+			xrc_create_attr.cap.max_inline_data = 128;
+		}
+
+
+		struct ibv_qp *xrc_qp[MAX_XRC_QP_PER_QP];
+		for(int i = 0;i<attr->rnode_num;i++){
+			xrc_qp[i] = create_qp(context,&xrc_create_attr,NULL);
+			if(!xrc_qp[i]){
+				printf("failed to create fcscale xrc_qp[%d]\n",i);
+				return NULL; 
+			}	
+			printf("DEBUG: created xrc_qp[%d] with max_post:%d, qp_num=%d\n",i,to_mqp(xrc_qp[i])->sq.max_post,xrc_qp[i]->qp_num);
+		}
+
+		if(!attr->sender_side){
+			qp = xrc_qp[0];//接收端srm qp没必要存在
+		}
+		mqp = to_mqp(qp);
+		mqp->sq.srm_entries_cap = mqp->sq.wqe_cnt << MLX5_SEND_WQE_SHIFT / sizeof(struct srm_qp_entry); // expected to be power of 2
+		printf("DEBUG: created srm qp with qp_num=%d,srm qp entries cap %u,\n",
+				qp->qp_num,mqp->sq.srm_entries_cap);
+
+		mqp->xrc_qp_arr = calloc(attr->rnode_num, sizeof(struct ibv_qp *));
+		mqp->xrc_qp_arr_cnt = attr->rnode_num;
+		if(!mqp->xrc_qp_arr){
+			printf("failed to alloc xrc_qp_arr\n");
+			return NULL;
+		}
+
+		for(int i = 0;i<attr->rnode_num;i++){
+			mqp->xrc_qp_arr[i] = xrc_qp[i];
+		}
+
+		if(attr->sender_side)
+			qp->qp_num = xrc_qp[0]->qp_num;
+		return qp;
+	}
+	else{
+		return create_qp(context, attr, NULL);
+	}
+
+
+
+	
 }
 
 static struct ibv_qp *_mlx5dv_create_qp(struct ibv_context *context,

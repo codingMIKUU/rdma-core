@@ -996,6 +996,10 @@ struct ibv_qp_init_attr_ex {
 	uint32_t		source_qpn;
 	/* See enum ibv_qp_create_send_ops_flags */
 	uint64_t send_ops_flags;
+
+	// following are for fcscale 
+	int sender_side;
+	uint32_t rnode_num;
 };
 
 enum ibv_qp_open_attr_mask {
@@ -3120,10 +3124,9 @@ ibv_create_qp_ex(struct ibv_context *context, struct ibv_qp_init_attr_ex *qp_ini
 	struct verbs_context *vctx;
 	uint32_t mask = qp_init_attr_ex->comp_mask;
 
-	if (mask == IBV_QP_INIT_ATTR_PD)
+	if (mask == IBV_QP_INIT_ATTR_PD && qp_init_attr_ex->qp_type != IBV_QPT_SRM)
 		return ibv_create_qp(qp_init_attr_ex->pd,
 				     (struct ibv_qp_init_attr *)qp_init_attr_ex);
-
 	vctx = verbs_get_ctx_op(context, create_qp_ex);
 	if (!vctx) {
 		errno = EOPNOTSUPP;
