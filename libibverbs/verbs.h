@@ -1212,6 +1212,7 @@ struct ibv_send_wr {
 			uint16_t		mss;
 		} tso;
 	};
+	//uint64_t* cycles;
 };
 
 struct ibv_send_wr_q{

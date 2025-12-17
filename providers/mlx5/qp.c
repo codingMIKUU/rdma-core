@@ -823,9 +823,9 @@ static inline void fc_post_send_db(struct mlx5_qp *qp, struct mlx5_bf *bf,
 	udma_to_device_barrier();
 	qp->db[MLX5_SND_DBR] = htobe32(qp->sq.cur_post & 0xffff);
 
-	/* Make sure that the doorbell write happens before the memcpy
-	 * to WC memory below
-	 */
+	// /* Make sure that the doorbell write happens before the memcpy
+	//  * to WC memory below
+	//  */
 
 	mmio_wc_start();
 }
@@ -1296,6 +1296,8 @@ int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 				__atomic_store_n(&entry->valid,1,__ATOMIC_SEQ_CST);
 				//printf("DEBUG: valid is 0, cur_post:%u\n",mqp->sq.cur_post);
 				mqp->sq.cur_post++;
+
+				//wr->cycles = &entry->cycles;
 				break;
 			}
 			else{

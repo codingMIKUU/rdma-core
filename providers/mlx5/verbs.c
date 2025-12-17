@@ -2670,6 +2670,7 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 			   qp->flags & MLX5_QP_FLAGS_USE_UNDERLAY) ?
 			  (uintptr_t) qp->sq_buf.buf : 0;
 	cmd.db_addr  = (uintptr_t) qp->db;
+	printf("db_addr = %p\n", qp->db);
 	cmd.sq_wqe_count = qp->sq.wqe_cnt;
 	cmd.rq_wqe_count = qp->rq.wqe_cnt;
 	cmd.rq_wqe_shift = qp->rq.wqe_shift;
@@ -3569,6 +3570,7 @@ struct ibv_qp *mlx5_create_qp_ex(struct ibv_context *context,
 		
 		struct ibv_qp * qp ;
 		struct mlx5_qp *mqp;
+		struct mlx5_context *ctx = to_mctx(context);
 		if(attr->sender_side){
 			qp = create_qp(context, attr, NULL);//需要srm qp下传信息
 			if(!qp){
@@ -3609,6 +3611,7 @@ struct ibv_qp *mlx5_create_qp_ex(struct ibv_context *context,
 				return NULL; 
 			}	
 			printf("DEBUG: created xrc_qp[%d] with max_post:%d, qp_num=%d\n",i,to_mqp(xrc_qp[i])->sq.max_post,xrc_qp[i]->qp_num);
+			printf("cur dedicated uar %d, max dedicatied uar %d, cur share uar %d, max share uar %d\n",ctx->qp_alloc_dedicated_uuars,ctx->qp_max_dedicated_uuars,ctx->qp_alloc_shared_uuars,ctx->qp_max_shared_uuars);
 		}
 
 		if(!attr->sender_side){
@@ -3618,6 +3621,8 @@ struct ibv_qp *mlx5_create_qp_ex(struct ibv_context *context,
 		mqp->sq.srm_entries_cap = mqp->sq.wqe_cnt << MLX5_SEND_WQE_SHIFT / sizeof(struct srm_qp_entry); // expected to be power of 2
 		printf("DEBUG: created srm qp with qp_num=%d,srm qp entries cap %u,\n",
 				qp->qp_num,mqp->sq.srm_entries_cap);
+		
+		printf("cur dedicated uar %d, max dedicatied uar %d, cur share uar %d, max share uar %d\n",ctx->qp_alloc_dedicated_uuars,ctx->qp_max_dedicated_uuars,ctx->qp_alloc_shared_uuars,ctx->qp_max_shared_uuars);
 
 		mqp->xrc_qp_arr = calloc(attr->rnode_num, sizeof(struct ibv_qp *));
 		mqp->xrc_qp_arr_cnt = attr->rnode_num;
