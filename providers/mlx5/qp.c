@@ -61,7 +61,11 @@ static const uint32_t mlx5_ib_opcode[] = {
 	[IBV_WR_TSO]			= MLX5_OPCODE_TSO,
 	[IBV_WR_DRIVER1]		= MLX5_OPCODE_UMR,
 };
-
+static inline uint64_t rdtsc() {
+  unsigned int lo, hi;
+  __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
+  return ((uint64_t)hi << 32) | lo;
+}
 static void *get_recv_wqe(struct mlx5_qp *qp, int n)
 {
 	return qp->buf.buf + qp->rq.offset + (n << qp->rq.wqe_shift);
@@ -754,10 +758,92 @@ static inline int mlx5_post_send_underlay(struct mlx5_qp *qp, struct ibv_send_wr
 	*total_size += (size / 16);
 	return 0;
 }
+uint64_t lk_cycles[5000000],db_cycles[5000000];
+int lk_idx,db_idx;
+static inline uint64_t avg(uint64_t *arr, int n){
+	uint64_t sum = 0;
+	for(int i = 0; i < n; i++){
+		sum += arr[i];
+	}
+	return sum / n;
+}
 
+static inline void post_send_db_ts_cycles(struct mlx5_qp *qp, struct mlx5_bf *bf,
+				int nreq, int inl, int size, void *ctrl)
+{
+	uint64_t st_cycles,ed_cycles;
+	st_cycles = rdtsc();
+	ed_cycles = rdtsc();
+	struct mlx5_context *ctx;
+
+	if (unlikely(!nreq))
+		return;
+
+	qp->sq.head += nreq;
+
+	/*
+	 * Make sure that descriptors are written before
+	 * updating doorbell record and ringing the doorbell
+	 */
+	udma_to_device_barrier();
+	qp->db[MLX5_SND_DBR] = htobe32(qp->sq.cur_post & 0xffff);
+
+	
+	
+	lk_cycles[lk_idx++] = ed_cycles - st_cycles;
+
+	st_cycles = rdtsc();
+
+	/* Make sure that the doorbell write happens before the memcpy
+	 * to WC memory below
+	 */
+	ctx = to_mctx(qp->ibv_qp->context);
+	if (bf->need_lock)
+		mmio_wc_spinlock(&bf->lock.lock);
+	else
+		mmio_wc_start();
+
+	ed_cycles = rdtsc();
+	db_cycles[db_idx++] = ed_cycles - st_cycles;
+
+	if (!ctx->shut_up_bf && nreq == 1 && bf->uuarn &&
+	    (inl || ctx->prefer_bf) && size > 1 &&
+	    size <= bf->buf_size / 16)
+		mlx5_bf_copy(bf->reg + bf->offset, ctrl,
+			     align(size * 16, 64), qp);
+	else
+		mmio_write64_be(bf->reg + bf->offset, *(__be64 *)ctrl);
+
+	/*
+	 * use mmio_flush_writes() to ensure write combining buffers are
+	 * flushed out of the running CPU. This must be carried inside
+	 * the spinlock. Otherwise, there is a potential race. In the
+	 * race, CPU A writes doorbell 1, which is waiting in the WC
+	 * buffer. CPU B writes doorbell 2, and it's write is flushed
+	 * earlier. Since the mmio_flush_writes is CPU local, this will
+	 * result in the HCA seeing doorbell 2, followed by doorbell 1.
+	 * Flush before toggling bf_offset to be latency oriented.
+	 */
+	mmio_flush_writes();
+	bf->offset ^= bf->buf_size;
+	if (bf->need_lock)
+		mlx5_spin_unlock(&bf->lock);
+
+
+
+	if(db_idx == 5000000){
+		uint64_t avg_lk = avg(lk_cycles, lk_idx);
+		uint64_t avg_db = avg(db_cycles, db_idx);
+		printf("Average lock1 cycles: %lu\t", avg_lk);
+		printf("Average lock2 cycles: %lu\n", avg_db);
+		db_idx = 0;
+		lk_idx = 0;
+	}
+}
 static inline void post_send_db(struct mlx5_qp *qp, struct mlx5_bf *bf,
 				int nreq, int inl, int size, void *ctrl)
 {
+	uint64_t st_cycles,ed_cycles;
 	struct mlx5_context *ctx;
 
 	if (unlikely(!nreq))
@@ -780,6 +866,7 @@ static inline void post_send_db(struct mlx5_qp *qp, struct mlx5_bf *bf,
 		mmio_wc_spinlock(&bf->lock.lock);
 	else
 		mmio_wc_start();
+
 
 	if (!ctx->shut_up_bf && nreq == 1 && bf->uuarn &&
 	    (inl || ctx->prefer_bf) && size > 1 &&
@@ -804,7 +891,6 @@ static inline void post_send_db(struct mlx5_qp *qp, struct mlx5_bf *bf,
 	if (bf->need_lock)
 		mlx5_spin_unlock(&bf->lock);
 }
-
 
 //dosen't write bf reg
 static inline void fc_post_send_db(struct mlx5_qp *qp, struct mlx5_bf *bf,
@@ -895,6 +981,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	FILE *fp = to_mctx(ibqp->context)->dbg_fp; /* The compiler ignores in non-debug mode */
 	uint32_t imm;
 
+	uint64_t wr_id;
 	mlx5_spin_lock(&qp->sq.lock);
 
 	next_fence = qp->fm_cache;
@@ -903,6 +990,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	// printf("用户态qpn:%d\n",ibqp->qp_num);
 
 	for (nreq = 0; wr; ++nreq, wr = wr->next) {
+		wr_id = wr->wr_id;//for debug
 		if (unlikely(wr->opcode < 0 ||
 		    wr->opcode >= sizeof mlx5_ib_opcode / sizeof mlx5_ib_opcode[0])) {
 			mlx5_dbg(fp, MLX5_DBG_QP_SEND, "bad opcode %d\n", wr->opcode);
@@ -1247,8 +1335,10 @@ out:
 	qp->fm_cache = next_fence;
 	// printf("outasasasassasssa\n");
 	if(ibqp->qp_type!=IBV_QPT_XRC_SEND){
-		
-		post_send_db(qp, bf, nreq, inl, size, ctrl);
+		if(wr_id == 114514)
+			post_send_db_ts_cycles(qp, bf, nreq, inl, size, ctrl);
+		else 
+			post_send_db(qp, bf, nreq, inl, size, ctrl);
 		// if(ibqp->qp_type == IBV_QPT_XRC_SEND)
 		// 	print_wqe_info(ctrl,size);
 	}
@@ -1285,27 +1375,25 @@ int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		int ret = _mlx5_post_send(mqp->xrc_qp_arr[qp_idx],wr,bad_wr);
 
 		
-		while(1){
-			uint32_t idx = mqp->sq.cur_post & (mqp->sq.srm_entries_cap - 1);
-			struct srm_qp_entry *entry = mlx5_get_srm_qp_entry(mqp, idx);
-			uint32_t valid = __atomic_load_n(&entry->valid,__ATOMIC_SEQ_CST);
-			if(valid == 0){
-				__atomic_store_n(&entry->qp_idx, qp_idx,__ATOMIC_SEQ_CST);	
-				__atomic_store_n(&entry->ctrl,wr->wr_id,__ATOMIC_SEQ_CST);
-				__atomic_store_n(&entry->bytes,wr->sg_list[0].length,__ATOMIC_SEQ_CST);
-				__atomic_store_n(&entry->valid,1,__ATOMIC_SEQ_CST);
-				//printf("DEBUG: valid is 0, cur_post:%u\n",mqp->sq.cur_post);
-				mqp->sq.cur_post++;
+		uint32_t idx = mqp->sq.cur_post & (mqp->sq.srm_entries_cap - 1);
+		struct srm_qp_entry *entry = mlx5_get_srm_qp_entry(mqp, idx);
+		uint32_t valid = __atomic_load_n(&entry->valid,__ATOMIC_ACQUIRE);
+		if(valid == 0){
+			entry->qp_idx = qp_idx;
+			entry->ctrl = wr->wr_id;
+			entry->bytes = wr->sg_list[0].length;
+			__atomic_store_n(&entry->valid,1,__ATOMIC_RELEASE);
+			//printf("DEBUG: valid is 0, cur_post:%u\n",mqp->sq.cur_post);
+			mqp->sq.cur_post++;
 
-				//wr->cycles = &entry->cycles;
-				break;
-			}
-			else{
-				mqp->sq.cur_post++;
-				printf("DEBUG: valid is 1\n");
-			}
-		
+			//wr->cycles = &entry->cycles;
 		}
+		else{
+			mqp->sq.cur_post++;
+			printf("DEBUG: valid is 1\n");
+		}
+	
+		
 		
 		return ret;
 	}

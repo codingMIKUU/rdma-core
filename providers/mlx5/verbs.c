@@ -2670,7 +2670,7 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 			   qp->flags & MLX5_QP_FLAGS_USE_UNDERLAY) ?
 			  (uintptr_t) qp->sq_buf.buf : 0;
 	cmd.db_addr  = (uintptr_t) qp->db;
-	printf("db_addr = %p\n", qp->db);
+	//printf("db_addr = %p\n", qp->db);
 	cmd.sq_wqe_count = qp->sq.wqe_cnt;
 	cmd.rq_wqe_count = qp->rq.wqe_cnt;
 	cmd.rq_wqe_shift = qp->rq.wqe_shift;
@@ -3588,7 +3588,7 @@ struct ibv_qp *mlx5_create_qp_ex(struct ibv_context *context,
 			xrc_create_attr.comp_mask = IBV_QP_INIT_ATTR_PD;
 			xrc_create_attr.pd = attr->pd;
 			xrc_create_attr.send_cq = attr->send_cq;
-			xrc_create_attr.cap.max_send_wr = 512;
+			xrc_create_attr.cap.max_send_wr = 128;//要和General中的KQP_WQE_LIMIT对应
 			xrc_create_attr.cap.max_send_sge = 1;
 			xrc_create_attr.cap.max_inline_data = 128;
 		}
