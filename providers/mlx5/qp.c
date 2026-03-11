@@ -760,6 +760,11 @@ static inline int mlx5_post_send_underlay(struct mlx5_qp *qp, struct ibv_send_wr
 }
 uint64_t lk_cycles[5000000],db_cycles[5000000];
 int lk_idx,db_idx;
+
+struct srm_aligned_u32 {
+	uint32_t val;
+} __attribute__((__aligned__(64)));
+
 static inline uint64_t avg(uint64_t *arr, int n){
 	uint64_t sum = 0;
 	for(int i = 0; i < n; i++){
@@ -1334,16 +1339,12 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 out:
 	qp->fm_cache = next_fence;
 	// printf("outasasasassasssa\n");
-	if(ibqp->qp_type!=IBV_QPT_XRC_SEND){
-		if(wr_id == 114514)
-			post_send_db_ts_cycles(qp, bf, nreq, inl, size, ctrl);
-		else 
-			post_send_db(qp, bf, nreq, inl, size, ctrl);
-		// if(ibqp->qp_type == IBV_QPT_XRC_SEND)
-		// 	print_wqe_info(ctrl,size);
-	}
-	else if(!err){
-		fc_post_send_db(qp, bf, nreq, inl, size, ctrl);
+	if (ibqp->qp_type == IBV_QPT_RC) {
+		if (!err)
+			fc_post_send_db(qp, bf, nreq, inl, size, ctrl);
+	} else if(!err){
+		
+		post_send_db(qp, bf, nreq, inl, size, ctrl);
 	}
 
 	mlx5_spin_unlock(&qp->sq.lock);
@@ -1354,6 +1355,7 @@ out:
 int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		   struct ibv_send_wr **bad_wr)
 {
+	int ret;
 #ifdef MW_DEBUG
 	if (wr->opcode == IBV_WR_BIND_MW) {
 		if (wr->bind_mw.mw->type == IBV_MW_TYPE_1)
@@ -1368,11 +1370,107 @@ int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			return EINVAL;
 	}
 #endif
+	if (ibqp->qp_type == IBV_QPT_RC) {
+		struct mlx5_qp *mqp = to_mqp(ibqp);
+		static __thread int rc_srm_dbg_cnt;
+
+		ret = _mlx5_post_send(ibqp, wr, bad_wr);
+		if (ret)
+			return ret;
+
+		if (mqp->srm_proxy_enabled && mqp->srm_proxy_qp) {
+			struct mlx5_qp *srm_mqp = to_mqp(mqp->srm_proxy_qp);
+			struct ibv_send_wr *cur = wr;
+			uint32_t num_level = mqp->srm_num_level ? mqp->srm_num_level : 2;
+			uint32_t num_sched = mqp->srm_num_sched ? mqp->srm_num_sched : 1;
+			uint32_t xrc_qp_num = mqp->srm_xrc_qp_num_per_srm ?
+				mqp->srm_xrc_qp_num_per_srm : 1;
+			uint32_t max_xrc_qp = mqp->srm_max_xrc_qp_per_srm ?
+				mqp->srm_max_xrc_qp_per_srm : 1024;
+			struct srm_aligned_u32 *wqe_table =
+				(struct srm_aligned_u32 *)ibqp->srm_wqe_table;
+			struct srm_aligned_u32 *level_table =
+				(struct srm_aligned_u32 *)ibqp->srm_level_table;
+			struct srm_xrc_table_entry *xrc_table =
+				(struct srm_xrc_table_entry *)ibqp->srm_xrc_table;
+
+			while (cur) {
+				uint32_t bytes =
+					(cur->num_sge > 0 && cur->sg_list) ?
+					cur->sg_list[0].length : 0;
+				uint32_t group_idx =
+					(num_level > 1 && bytes >= 10 * 1024) ? 1 : 0;
+				uint32_t sched_idx = 0;
+				uint32_t xrc_qp_idx = mqp->srm_proxy_db_idx % xrc_qp_num;
+				uint32_t table_stride = num_level * num_sched;
+				uint32_t wqe_idx = mqp->srm_proxy_qp_idx * table_stride +
+					group_idx * num_sched + sched_idx;
+				uint32_t level_idx = group_idx + sched_idx * num_level;
+				uint64_t xrc_idx =
+					((uint64_t)mqp->srm_proxy_qp_idx * table_stride +
+					 group_idx * num_sched + sched_idx) * max_xrc_qp +
+					(xrc_qp_idx % max_xrc_qp);
+
+				uint32_t idx = srm_mqp->sq.cur_post &
+					       (srm_mqp->sq.srm_entries_cap - 1);
+				struct srm_qp_entry *entry =
+					mlx5_get_srm_qp_entry(srm_mqp, idx);
+
+				/* Keep producer and kernel consumer strictly in sync. */
+				while (__atomic_load_n(&entry->valid, __ATOMIC_ACQUIRE) != 0)
+					;
+
+				entry->qp_idx = xrc_qp_idx;
+				entry->ctrl = cur->wr_id;
+				entry->bytes = bytes;
+				__atomic_store_n(&entry->valid, 1, __ATOMIC_RELEASE);
+
+				if (rc_srm_dbg_cnt < 16) {
+					fprintf(stderr,
+						"[mlx5-rc-post] qpn=%u thread_idx=%u db_idx=%u level=%u sched=%u entry_idx=%u xrc_qp_idx=%u wqe_idx=%u level_idx=%u wr_id=%llx bytes=%u\n",
+						ibqp->qp_num,
+						mqp->srm_proxy_qp_idx,
+						mqp->srm_proxy_db_idx,
+						group_idx,
+						sched_idx,
+						idx,
+						xrc_qp_idx,
+						wqe_idx,
+						level_idx,
+						(unsigned long long)cur->wr_id,
+						bytes);
+					rc_srm_dbg_cnt++;
+				}
+
+				/* Publish table counters only after entry is visible. */
+				if (wqe_table)
+					__atomic_fetch_add(&wqe_table[wqe_idx].val, 1,
+							   __ATOMIC_RELEASE);
+				if (level_table)
+					__atomic_fetch_add(&level_table[level_idx].val, 1,
+							   __ATOMIC_RELEASE);
+				if (xrc_table) {
+					__atomic_store_n(&xrc_table[xrc_idx].tot_bytes,
+							xrc_table[xrc_idx].tot_bytes + bytes,
+							__ATOMIC_RELEASE);
+					__atomic_store_n(&xrc_table[xrc_idx].ctrl,
+							cur->wr_id, __ATOMIC_RELEASE);
+				}
+
+				srm_mqp->sq.cur_post++;
+				cur = cur->next;
+			}
+		}
+
+		return 0;
+	}
 
 	if(ibqp->qp_type == IBV_QPT_SRM){
 		struct mlx5_qp *mqp = to_mqp(ibqp);
+		if (mqp->xrc_qp_arr_cnt == 0 || mqp->xrc_qp_arr == NULL)
+			return _mlx5_post_send(ibqp, wr, bad_wr);
 		int qp_idx = *((uint16_t*)&wr->qp_type.srm.remote_gid.raw[14]);
-		int ret = _mlx5_post_send(mqp->xrc_qp_arr[qp_idx],wr,bad_wr);
+		ret = _mlx5_post_send(mqp->xrc_qp_arr[qp_idx],wr,bad_wr);
 
 		
 		uint32_t idx = mqp->sq.cur_post & (mqp->sq.srm_entries_cap - 1);

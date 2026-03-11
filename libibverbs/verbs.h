@@ -916,6 +916,22 @@ enum ibv_qp_type {
 	IBV_QPT_DRIVER = 0xff,
 };
 
+/* Public SRM defaults so applications and providers use one source of truth. */
+#define SRM_BRIDGE_IOCTL_MAGIC 'B'
+#define SRM_ALLOC_APP_TABLE _IOWR(SRM_BRIDGE_IOCTL_MAGIC, 0x02, struct srm_app_table_alloc_req)
+
+#define SRM_BRIDGE_MMAP_WQE_OFFSET (0ULL)
+#define SRM_BRIDGE_MMAP_LEVEL_OFFSET (1ULL << 30)
+#define SRM_BRIDGE_MMAP_XRC_OFFSET (2ULL << 30)
+
+#define SRM_AUTO_APP_ID 0xffffffffU
+#define SRM_KERN_MAX_USER_THREADS 17
+#define SRM_KERN_MAX_APP 64
+#define SRM_MAX_USER_XRC_QP_PER_SRM 1024
+#define SRM_BRIDGE_DEV_PATH "/dev/mlx5_table_bridge"
+#define SRM_NUM_LEVEL 2
+#define SRM_NUM_SCHED 1
+
 struct ibv_qp_cap {
 	uint32_t		max_send_wr;
 	uint32_t		max_recv_wr;
@@ -1000,6 +1016,15 @@ struct ibv_qp_init_attr_ex {
 	// following are for fcscale 
 	int sender_side;
 	uint32_t rnode_num;
+	uint32_t srm_app_threads;
+	uint32_t srm_max_app;
+	uint32_t srm_num_level;
+	uint32_t srm_num_sched;
+	uint32_t srm_max_xrc_qp_per_srm;
+	uint32_t srm_xrc_qp_num_per_srm;
+	uint64_t srm_wqe_table_bytes;
+	uint64_t srm_level_table_bytes;
+	uint64_t srm_xrc_table_bytes;
 };
 
 enum ibv_qp_open_attr_mask {
@@ -1353,6 +1378,9 @@ struct ibv_qp {
 	pthread_mutex_t		mutex;
 	pthread_cond_t		cond;
 	uint32_t		events_completed;
+	void                       *srm_wqe_table;
+	void                       *srm_level_table;
+	void                       *srm_xrc_table;
 };
 
 struct ibv_qp_ex {
@@ -3125,7 +3153,7 @@ ibv_create_qp_ex(struct ibv_context *context, struct ibv_qp_init_attr_ex *qp_ini
 	struct verbs_context *vctx;
 	uint32_t mask = qp_init_attr_ex->comp_mask;
 
-	if (mask == IBV_QP_INIT_ATTR_PD && qp_init_attr_ex->qp_type != IBV_QPT_SRM)
+	if (mask == IBV_QP_INIT_ATTR_PD && qp_init_attr_ex->qp_type != IBV_QPT_RC)
 		return ibv_create_qp(qp_init_attr_ex->pd,
 				     (struct ibv_qp_init_attr *)qp_init_attr_ex);
 	vctx = verbs_get_ctx_op(context, create_qp_ex);

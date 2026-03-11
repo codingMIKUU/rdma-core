@@ -2478,6 +2478,7 @@ static int mlx5_set_context(struct mlx5_context *context,
 	pthread_mutex_init(&context->mkey_table_mutex, NULL);
 	pthread_mutex_init(&context->dyn_bfregs_mutex, NULL);
 	pthread_mutex_init(&context->crypto_login_mutex, NULL);
+	context->srm_table_attached = 0;
 	for (i = 0; i < MLX5_QP_TABLE_SIZE; ++i)
 		context->qp_table[i].refcnt = 0;
 
@@ -2704,6 +2705,8 @@ static void mlx5_free_context(struct ibv_context *ibctx)
 	struct mlx5_context *context = to_mctx(ibctx);
 	int page_size = to_mdev(ibctx->device)->page_size;
 	int i;
+
+	mlx5_srm_release_tables(context);
 
 	free(context->bfs);
 	for (i = 0; i < MLX5_MAX_UARS; ++i) {

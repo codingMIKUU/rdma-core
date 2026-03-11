@@ -427,8 +427,9 @@ struct mlx5_context {
 	pthread_mutex_t			crypto_login_mutex;
 	uint64_t			max_dc_rd_atom;
 	uint64_t			max_dc_init_rd_atom;
-	struct mlx5dv_reg		reg_c0;
+	struct mlx5dv_reg			reg_c0;
 	struct mlx5dv_ooo_recv_wrs_caps ooo_recv_wrs_caps;
+	uint8_t				srm_table_attached;
 };
 
 struct mlx5_hugetlb_mem {
@@ -741,6 +742,14 @@ struct mlx5_qp {
 	*/
 	struct ibv_qp **xrc_qp_arr;
 	int xrc_qp_arr_cnt;
+	struct ibv_qp *srm_proxy_qp;
+	uint32_t srm_proxy_qp_idx;
+	uint32_t srm_proxy_db_idx;
+	uint8_t srm_proxy_enabled;
+	uint32_t srm_num_level;
+	uint32_t srm_num_sched;
+	uint32_t srm_max_xrc_qp_per_srm;
+	uint32_t srm_xrc_qp_num_per_srm;
 };
 
 struct mlx5_ah {
@@ -985,6 +994,15 @@ struct srm_qp_entry{
 	uint64_t bytes;
 	//uint64_t cycles;
 }__attribute__((__aligned__(64)));
+
+struct srm_xrc_table_entry {
+	uint64_t ctrl;
+	uint64_t tot_bytes;
+	uint64_t tot_recv_cqes;
+	uint64_t cur_gbps;
+	uint64_t cur_lat_us;
+	uint64_t update_cnt;
+} __attribute__((__aligned__(64)));
 
 struct ibv_flow *
 _mlx5dv_create_flow(struct mlx5dv_flow_matcher *flow_matcher,
@@ -1338,6 +1356,7 @@ void mlx5_qp_fill_wr_complete_real(struct mlx5_qp *mqp);
 int mlx5_qp_fill_wr_pfns(struct mlx5_qp *mqp,
 			 const struct ibv_qp_init_attr_ex *attr,
 			 const struct mlx5dv_qp_init_attr *mlx5_attr);
+void mlx5_srm_release_tables(struct mlx5_context *ctx);
 void clean_dyn_uars(struct ibv_context *context);
 void mlx5_set_singleton_nc_uar(struct ibv_context *context);
 

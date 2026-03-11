@@ -49,6 +49,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <sys/ioctl.h>
 #include <ccan/array_size.h>
 
 #include <util/compiler.h>
@@ -72,6 +73,267 @@ static inline int is_xrc_tgt(int type)
 }
 static inline int is_srm(int type){
 	return type == IBV_QPT_SRM;
+}
+
+static struct ibv_qp *create_qp(struct ibv_context *context,
+				       struct ibv_qp_init_attr_ex *attr,
+				       struct mlx5dv_qp_init_attr *mlx5_qp_attr);
+
+#define SRM_BRIDGE_IOCTL_MAGIC 'B'
+#define SRM_ALLOC_APP_TABLE _IOWR(SRM_BRIDGE_IOCTL_MAGIC, 0x02, struct srm_app_table_alloc_req)
+
+#define SRM_BRIDGE_MMAP_WQE_OFFSET (0ULL)
+#define SRM_BRIDGE_MMAP_LEVEL_OFFSET (1ULL << 30)
+#define SRM_BRIDGE_MMAP_XRC_OFFSET (2ULL << 30)
+
+#define SRM_AUTO_APP_ID 0xffffffffU
+#define SRM_KERN_MAX_USER_THREADS 17
+#define SRM_KERN_MAX_APP 64
+#define SRM_NUM_LEVEL 2
+#define SRM_NUM_SCHED 1
+#define SRM_MAX_USER_XRC_QP_PER_SRM 1024
+#define SRM_BRIDGE_DEV_PATH "/dev/mlx5_table_bridge"
+
+struct srm_app_table_alloc_req {
+	uint32_t app_id;
+	uint32_t app_threads;
+	uint32_t xrc_qp_num_per_srm;
+	uint32_t flags;
+
+	uint64_t wqe_table_offset;
+	uint64_t level_table_offset;
+	uint64_t xrc_table_offset;
+
+	uint64_t wqe_table_span;
+	uint64_t level_table_span;
+	uint64_t xrc_table_span;
+};
+
+struct mlx5_srm_global_tables {
+	pthread_mutex_t mutex;
+	int bridge_fd;
+	void *wqe_map;
+	void *level_map;
+	void *xrc_map;
+	size_t wqe_map_len;
+	size_t level_map_len;
+	size_t xrc_map_len;
+	void *wqe_table;
+	void *level_table;
+	void *xrc_table;
+	uint32_t refcnt;
+	uint8_t table_ready;
+};
+
+static struct mlx5_srm_global_tables g_srm_tables = {
+	.mutex = PTHREAD_MUTEX_INITIALIZER,
+	.bridge_fd = -1,
+};
+
+static void mlx5_srm_cleanup_global_tables_locked(void)
+{
+	if (g_srm_tables.xrc_map)
+		munmap(g_srm_tables.xrc_map, g_srm_tables.xrc_map_len);
+	if (g_srm_tables.level_map)
+		munmap(g_srm_tables.level_map, g_srm_tables.level_map_len);
+	if (g_srm_tables.wqe_map)
+		munmap(g_srm_tables.wqe_map, g_srm_tables.wqe_map_len);
+	if (g_srm_tables.bridge_fd >= 0)
+		close(g_srm_tables.bridge_fd);
+
+	g_srm_tables.bridge_fd = -1;
+	g_srm_tables.wqe_map = NULL;
+	g_srm_tables.level_map = NULL;
+	g_srm_tables.xrc_map = NULL;
+	g_srm_tables.wqe_map_len = 0;
+	g_srm_tables.level_map_len = 0;
+	g_srm_tables.xrc_map_len = 0;
+	g_srm_tables.wqe_table = NULL;
+	g_srm_tables.level_table = NULL;
+	g_srm_tables.xrc_table = NULL;
+	g_srm_tables.table_ready = 0;
+}
+
+static int mlx5_srm_prepare_tables(struct mlx5_context *ctx,
+				   const struct ibv_qp_init_attr_ex *attr)
+{
+	struct srm_app_table_alloc_req req = {};
+	void *wqe_map;
+	void *level_map;
+	void *xrc_map;
+	uint32_t app_threads = attr->srm_app_threads ? attr->srm_app_threads :
+		SRM_KERN_MAX_USER_THREADS;
+	uint32_t max_app = attr->srm_max_app ? attr->srm_max_app :
+		SRM_KERN_MAX_APP;
+	uint32_t num_level = attr->srm_num_level ? attr->srm_num_level :
+		SRM_NUM_LEVEL;
+	uint32_t num_sched = attr->srm_num_sched ? attr->srm_num_sched :
+		SRM_NUM_SCHED;
+	uint32_t max_xrc = attr->srm_max_xrc_qp_per_srm ?
+		attr->srm_max_xrc_qp_per_srm : SRM_MAX_USER_XRC_QP_PER_SRM;
+	uint32_t xrc_qp_num_per_srm = attr->srm_xrc_qp_num_per_srm ?
+		attr->srm_xrc_qp_num_per_srm : attr->rnode_num;
+	size_t wqe_map_len = attr->srm_wqe_table_bytes ?
+		(size_t)attr->srm_wqe_table_bytes :
+		(sizeof(uint32_t) * app_threads * num_level * num_sched);
+	size_t level_map_len = attr->srm_level_table_bytes ?
+		(size_t)attr->srm_level_table_bytes :
+		(sizeof(uint32_t) * max_app * num_level * num_sched);
+	size_t xrc_map_len = attr->srm_xrc_table_bytes ?
+		(size_t)attr->srm_xrc_table_bytes :
+		(sizeof(struct srm_xrc_table_entry) * app_threads * num_level *
+		 num_sched * max_xrc);
+
+	pthread_mutex_lock(&g_srm_tables.mutex);
+	if (g_srm_tables.table_ready) {
+		if (!ctx->srm_table_attached) {
+			g_srm_tables.refcnt++;
+			ctx->srm_table_attached = 1;
+		}
+		pthread_mutex_unlock(&g_srm_tables.mutex);
+		return 0;
+	}
+
+	g_srm_tables.bridge_fd = open(SRM_BRIDGE_DEV_PATH, O_RDWR);
+	if (g_srm_tables.bridge_fd < 0) {
+		pthread_mutex_unlock(&g_srm_tables.mutex);
+		return -errno;
+	}
+
+	wqe_map = mmap(NULL, wqe_map_len, PROT_READ | PROT_WRITE,
+			       MAP_SHARED, g_srm_tables.bridge_fd, SRM_BRIDGE_MMAP_WQE_OFFSET);
+	if (wqe_map == MAP_FAILED) {
+		close(g_srm_tables.bridge_fd);
+		g_srm_tables.bridge_fd = -1;
+		pthread_mutex_unlock(&g_srm_tables.mutex);
+		return -errno;
+	}
+
+	level_map = mmap(NULL, level_map_len, PROT_READ | PROT_WRITE,
+				 MAP_SHARED, g_srm_tables.bridge_fd, SRM_BRIDGE_MMAP_LEVEL_OFFSET);
+	if (level_map == MAP_FAILED) {
+		munmap(wqe_map, wqe_map_len);
+		close(g_srm_tables.bridge_fd);
+		g_srm_tables.bridge_fd = -1;
+		pthread_mutex_unlock(&g_srm_tables.mutex);
+		return -errno;
+	}
+
+	xrc_map = mmap(NULL, xrc_map_len, PROT_READ | PROT_WRITE,
+		       MAP_SHARED, g_srm_tables.bridge_fd, SRM_BRIDGE_MMAP_XRC_OFFSET);
+	if (xrc_map == MAP_FAILED) {
+		munmap(level_map, level_map_len);
+		munmap(wqe_map, wqe_map_len);
+		close(g_srm_tables.bridge_fd);
+		g_srm_tables.bridge_fd = -1;
+		pthread_mutex_unlock(&g_srm_tables.mutex);
+		return -errno;
+	}
+
+	req.app_id = SRM_AUTO_APP_ID;
+	req.app_threads = app_threads;
+	req.xrc_qp_num_per_srm = xrc_qp_num_per_srm;
+	if (ioctl(g_srm_tables.bridge_fd, SRM_ALLOC_APP_TABLE, &req) < 0) {
+		munmap(xrc_map, xrc_map_len);
+		munmap(level_map, level_map_len);
+		munmap(wqe_map, wqe_map_len);
+		close(g_srm_tables.bridge_fd);
+		g_srm_tables.bridge_fd = -1;
+		pthread_mutex_unlock(&g_srm_tables.mutex);
+		return -errno;
+	}
+
+	g_srm_tables.wqe_map = wqe_map;
+	g_srm_tables.level_map = level_map;
+	g_srm_tables.xrc_map = xrc_map;
+	g_srm_tables.wqe_map_len = wqe_map_len;
+	g_srm_tables.level_map_len = level_map_len;
+	g_srm_tables.xrc_map_len = xrc_map_len;
+	g_srm_tables.wqe_table = (void *)((uint8_t *)wqe_map + req.wqe_table_offset);
+	g_srm_tables.level_table = (void *)((uint8_t *)level_map + req.level_table_offset);
+	g_srm_tables.xrc_table = (void *)((uint8_t *)xrc_map + req.xrc_table_offset);
+	g_srm_tables.table_ready = 1;
+	g_srm_tables.refcnt = 1;
+	ctx->srm_table_attached = 1;
+
+	pthread_mutex_unlock(&g_srm_tables.mutex);
+	return 0;
+}
+
+void mlx5_srm_release_tables(struct mlx5_context *ctx)
+{
+	pthread_mutex_lock(&g_srm_tables.mutex);
+	if (!ctx->srm_table_attached) {
+		pthread_mutex_unlock(&g_srm_tables.mutex);
+		return;
+	}
+
+	ctx->srm_table_attached = 0;
+	if (g_srm_tables.refcnt > 0)
+		g_srm_tables.refcnt--;
+	if (g_srm_tables.refcnt == 0 && g_srm_tables.table_ready)
+		mlx5_srm_cleanup_global_tables_locked();
+
+	pthread_mutex_unlock(&g_srm_tables.mutex);
+}
+
+static __thread struct ibv_context *tls_srm_ctx;
+static __thread struct ibv_qp *tls_hidden_srm_qp;
+static __thread uint32_t tls_srm_thread_idx;
+static __thread uint32_t tls_next_rc_db_idx;
+static pthread_mutex_t g_srm_thread_idx_mutex = PTHREAD_MUTEX_INITIALIZER;
+static struct ibv_context *g_srm_thread_idx_ctx;
+static uint32_t g_srm_next_thread_idx;
+
+static uint32_t mlx5_srm_assign_thread_idx(struct ibv_context *context)
+{
+	uint32_t idx;
+
+	pthread_mutex_lock(&g_srm_thread_idx_mutex);
+	if (g_srm_thread_idx_ctx != context) {
+		g_srm_thread_idx_ctx = context;
+		g_srm_next_thread_idx = 0;
+	}
+	idx = g_srm_next_thread_idx++;
+	pthread_mutex_unlock(&g_srm_thread_idx_mutex);
+
+	return idx;
+}
+
+static struct ibv_qp *mlx5_create_srm_bundle_qp(struct ibv_context *context,
+						 struct ibv_qp_init_attr_ex *attr)
+{
+	struct ibv_qp *qp;
+	struct mlx5_qp *mqp;
+	struct mlx5_context *ctx = to_mctx(context);
+
+
+	if (attr->sender_side) {
+		if (mlx5_srm_prepare_tables(ctx, attr) != 0) {
+			printf("failed to prepare srm tables\n");
+			return NULL;
+		}
+		qp = create_qp(context, attr, NULL);
+		if (!qp) {
+			printf("failed to create srm qp\n");
+			return NULL;
+		}
+		qp->srm_wqe_table = g_srm_tables.wqe_table;
+		qp->srm_level_table = g_srm_tables.level_table;
+		qp->srm_xrc_table = g_srm_tables.xrc_table;
+	} else {
+		qp = create_qp(context, attr, NULL);
+		if (!qp)
+			return NULL;
+	}
+
+	mqp = to_mqp(qp);
+	mqp->sq.srm_entries_cap =
+		mqp->sq.wqe_cnt << MLX5_SEND_WQE_SHIFT / sizeof(struct srm_qp_entry);
+	mqp->xrc_qp_arr = NULL;
+	mqp->xrc_qp_arr_cnt = 0;
+
+	return qp;
 }
 
 static int mlx5_read_clock(struct ibv_context *context, uint64_t *cycles)
@@ -2612,6 +2874,8 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 	}
 
 	cmd.flags = mlx5_create_flags;
+	if (attr->qp_type == IBV_QPT_RC && attr->sender_side)
+		cmd.flags |= MLX5_QP_FLAG_SRM_SENDER;
 	qp->wq_sig = qp_sig_enabled();
 	if (qp->wq_sig)
 		cmd.flags |= MLX5_QP_FLAG_SIGNATURE;
@@ -3227,6 +3491,8 @@ int mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 	int attr_mask){
 	if(qp->qp_type == IBV_QPT_SRM || qp->qp_type == IBV_QPT_XRC_RECV){
 		struct mlx5_qp *mqp = to_mqp(qp);
+		if (mqp->xrc_qp_arr_cnt == 0 || mqp->xrc_qp_arr == NULL)
+			return __mlx5_modify_qp(qp, attr, attr_mask);
 		struct ibv_qp_attr xrc_qp_attr ;
 
 		for(int i = 0;i<mqp->xrc_qp_arr_cnt;i++){
@@ -3565,83 +3831,69 @@ int mlx5_detach_mcast(struct ibv_qp *qp, const union ibv_gid *gid, uint16_t lid)
 struct ibv_qp *mlx5_create_qp_ex(struct ibv_context *context,
 				 struct ibv_qp_init_attr_ex *attr)
 {
-	if(attr->qp_type == IBV_QPT_SRM){
+	if (attr->qp_type == IBV_QPT_SRM)
+		return mlx5_create_srm_bundle_qp(context, attr);
 
-		
-		struct ibv_qp * qp ;
+	if (attr->qp_type == IBV_QPT_RC && attr->rnode_num > 0) {
+		struct ibv_qp *qp;
 		struct mlx5_qp *mqp;
-		struct mlx5_context *ctx = to_mctx(context);
-		if(attr->sender_side){
-			qp = create_qp(context, attr, NULL);//需要srm qp下传信息
-			if(!qp){
-				printf("failed to create srm qp\n");
+
+		if (attr->sender_side &&
+		    (tls_hidden_srm_qp == NULL || tls_srm_ctx != context)) {
+			struct ibv_qp_init_attr_ex srm_attr;
+			memcpy(&srm_attr, attr, sizeof(srm_attr));
+			srm_attr.qp_type = IBV_QPT_SRM;
+			srm_attr.cap.max_send_wr = 4096;
+			srm_attr.cap.max_recv_wr = 0;
+			srm_attr.pd = attr->pd;
+			srm_attr.send_cq = attr->send_cq;
+			srm_attr.recv_cq = 0;
+			srm_attr.cap.max_recv_sge = 0;
+			srm_attr.comp_mask = IBV_QP_INIT_ATTR_PD;
+			srm_attr.cap.max_send_sge = 1;
+
+
+			tls_hidden_srm_qp = mlx5_create_srm_bundle_qp(context, &srm_attr);
+			if (!tls_hidden_srm_qp)
 				return NULL;
-			}
-		}
-		
-
-
-		struct ibv_qp_init_attr_ex xrc_create_attr;
-		memset (&xrc_create_attr, 0, sizeof(xrc_create_attr));
-		if(attr->sender_side){
-			xrc_create_attr.qp_type = IBV_QPT_XRC_SEND;
-			xrc_create_attr.comp_mask = IBV_QP_INIT_ATTR_PD;
-			xrc_create_attr.pd = attr->pd;
-			xrc_create_attr.send_cq = attr->send_cq;
-			xrc_create_attr.cap.max_send_wr = 128;//要和General中的KQP_WQE_LIMIT对应
-			xrc_create_attr.cap.max_send_sge = 1;
-			xrc_create_attr.cap.max_inline_data = 128;
-		}
-		else{
-			xrc_create_attr.qp_type = IBV_QPT_XRC_RECV;
-			xrc_create_attr.comp_mask = IBV_QP_INIT_ATTR_XRCD;
-			xrc_create_attr.xrcd = attr->xrcd;
-			xrc_create_attr.recv_cq = attr->send_cq;
-			xrc_create_attr.cap.max_recv_wr = 1;  // We don't do RECVs on conn QPs
-			xrc_create_attr.cap.max_recv_sge = 1;
-			xrc_create_attr.cap.max_inline_data = 128;
+			tls_srm_ctx = context;
+			tls_srm_thread_idx = mlx5_srm_assign_thread_idx(context);
+			tls_next_rc_db_idx = 0;
 		}
 
-
-		struct ibv_qp *xrc_qp[MAX_XRC_QP_PER_QP];
-		for(int i = 0;i<attr->rnode_num;i++){
-			xrc_qp[i] = create_qp(context,&xrc_create_attr,NULL);
-			if(!xrc_qp[i]){
-				printf("failed to create fcscale xrc_qp[%d]\n",i);
-				return NULL; 
-			}	
-			printf("DEBUG: created xrc_qp[%d] with max_post:%d, qp_num=%d\n",i,to_mqp(xrc_qp[i])->sq.max_post,xrc_qp[i]->qp_num);
-			printf("cur dedicated uar %d, max dedicatied uar %d, cur share uar %d, max share uar %d\n",ctx->qp_alloc_dedicated_uuars,ctx->qp_max_dedicated_uuars,ctx->qp_alloc_shared_uuars,ctx->qp_max_shared_uuars);
-		}
-
-		if(!attr->sender_side){
-			qp = xrc_qp[0];//接收端srm qp没必要存在
-		}
-		mqp = to_mqp(qp);
-		mqp->sq.srm_entries_cap = mqp->sq.wqe_cnt << MLX5_SEND_WQE_SHIFT / sizeof(struct srm_qp_entry); // expected to be power of 2
-		printf("DEBUG: created srm qp with qp_num=%d,srm qp entries cap %u,\n",
-				qp->qp_num,mqp->sq.srm_entries_cap);
-		
-		printf("cur dedicated uar %d, max dedicatied uar %d, cur share uar %d, max share uar %d\n",ctx->qp_alloc_dedicated_uuars,ctx->qp_max_dedicated_uuars,ctx->qp_alloc_shared_uuars,ctx->qp_max_shared_uuars);
-
-		mqp->xrc_qp_arr = calloc(attr->rnode_num, sizeof(struct ibv_qp *));
-		mqp->xrc_qp_arr_cnt = attr->rnode_num;
-		if(!mqp->xrc_qp_arr){
-			printf("failed to alloc xrc_qp_arr\n");
+		qp = create_qp(context, attr, NULL);
+		if (!qp)
 			return NULL;
+		mqp = to_mqp(qp);
+		mqp->srm_proxy_qp = tls_hidden_srm_qp;
+		mqp->srm_proxy_qp_idx = tls_srm_thread_idx;
+		mqp->srm_proxy_db_idx = tls_next_rc_db_idx++;
+		mqp->srm_proxy_enabled = attr->sender_side ? 1 : 0;
+		mqp->srm_num_level = attr->srm_num_level ? attr->srm_num_level : 2;
+		mqp->srm_num_sched = attr->srm_num_sched ? attr->srm_num_sched : 1;
+		mqp->srm_max_xrc_qp_per_srm = attr->srm_max_xrc_qp_per_srm ?
+			attr->srm_max_xrc_qp_per_srm : 1024;
+		mqp->srm_xrc_qp_num_per_srm = attr->srm_xrc_qp_num_per_srm ?
+			attr->srm_xrc_qp_num_per_srm : attr->rnode_num;
+		qp->srm_wqe_table = g_srm_tables.wqe_table;
+		qp->srm_level_table = g_srm_tables.level_table;
+		qp->srm_xrc_table = g_srm_tables.xrc_table;
+		if (attr->sender_side) {
+			fprintf(stderr,
+				"[mlx5-rc-srm] qpn=%u thread_idx=%u db_idx=%u rnode_num=%u xrc_qp_num=%u num_level=%u num_sched=%u\n",
+				qp->qp_num,
+				mqp->srm_proxy_qp_idx,
+				mqp->srm_proxy_db_idx,
+				attr->rnode_num,
+				mqp->srm_xrc_qp_num_per_srm,
+				mqp->srm_num_level,
+				mqp->srm_num_sched);
 		}
-
-		for(int i = 0;i<attr->rnode_num;i++){
-			mqp->xrc_qp_arr[i] = xrc_qp[i];
-		}
-
-		if(attr->sender_side)
-			qp->qp_num = xrc_qp[0]->qp_num;
+		
 		return qp;
 	}
-	else{
-		return create_qp(context, attr, NULL);
-	}
+
+	return create_qp(context, attr, NULL);
 
 
 
