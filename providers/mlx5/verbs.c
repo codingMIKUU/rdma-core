@@ -79,20 +79,7 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 				       struct ibv_qp_init_attr_ex *attr,
 				       struct mlx5dv_qp_init_attr *mlx5_qp_attr);
 
-#define SRM_BRIDGE_IOCTL_MAGIC 'B'
-#define SRM_ALLOC_APP_TABLE _IOWR(SRM_BRIDGE_IOCTL_MAGIC, 0x02, struct srm_app_table_alloc_req)
 
-#define SRM_BRIDGE_MMAP_WQE_OFFSET (0ULL)
-#define SRM_BRIDGE_MMAP_LEVEL_OFFSET (1ULL << 30)
-#define SRM_BRIDGE_MMAP_XRC_OFFSET (2ULL << 30)
-
-#define SRM_AUTO_APP_ID 0xffffffffU
-#define SRM_KERN_MAX_USER_THREADS 17
-#define SRM_KERN_MAX_APP 64
-#define SRM_NUM_LEVEL 2
-#define SRM_NUM_SCHED 1
-#define SRM_MAX_USER_XRC_QP_PER_SRM 1024
-#define SRM_BRIDGE_DEV_PATH "/dev/mlx5_table_bridge"
 
 struct srm_app_table_alloc_req {
 	uint32_t app_id;
@@ -108,6 +95,7 @@ struct srm_app_table_alloc_req {
 	uint64_t level_table_span;
 	uint64_t xrc_table_span;
 };
+
 
 struct mlx5_srm_global_tables {
 	pthread_mutex_t mutex;
@@ -163,25 +151,15 @@ static int mlx5_srm_prepare_tables(struct mlx5_context *ctx,
 	void *xrc_map;
 	uint32_t app_threads = attr->srm_app_threads ? attr->srm_app_threads :
 		SRM_KERN_MAX_USER_THREADS;
-	uint32_t max_app = attr->srm_max_app ? attr->srm_max_app :
-		SRM_KERN_MAX_APP;
-	uint32_t num_level = attr->srm_num_level ? attr->srm_num_level :
-		SRM_NUM_LEVEL;
-	uint32_t num_sched = attr->srm_num_sched ? attr->srm_num_sched :
-		SRM_NUM_SCHED;
-	uint32_t max_xrc = attr->srm_max_xrc_qp_per_srm ?
-		attr->srm_max_xrc_qp_per_srm : SRM_MAX_USER_XRC_QP_PER_SRM;
-	uint32_t xrc_qp_num_per_srm = attr->srm_xrc_qp_num_per_srm ?
-		attr->srm_xrc_qp_num_per_srm : attr->rnode_num;
-	size_t wqe_map_len = attr->srm_wqe_table_bytes ?
-		(size_t)attr->srm_wqe_table_bytes :
-		(sizeof(uint32_t) * app_threads * num_level * num_sched);
-	size_t level_map_len = attr->srm_level_table_bytes ?
-		(size_t)attr->srm_level_table_bytes :
-		(sizeof(uint32_t) * max_app * num_level * num_sched);
-	size_t xrc_map_len = attr->srm_xrc_table_bytes ?
-		(size_t)attr->srm_xrc_table_bytes :
-		(sizeof(struct srm_xrc_table_entry) * app_threads * num_level *
+	uint32_t num_level = SRM_NUM_LEVEL;
+	uint32_t num_sched = SRM_NUM_SCHED;
+	uint32_t max_xrc = SRM_MAX_USER_XRC_QP_PER_SRM;
+	size_t wqe_map_len = 
+		(sizeof(struct srm_aligned_u32) * SRM_KERN_MAX_USER_THREADS* num_level * num_sched); //TODO:改类型
+	size_t level_map_len = 
+		(sizeof(struct srm_aligned_u32) * SRM_KERN_MAX_APP* num_level * num_sched);
+	size_t xrc_map_len = 
+		(sizeof(struct srm_xrc_table_entry) * SRM_KERN_MAX_USER_THREADS * num_level *
 		 num_sched * max_xrc);
 
 	pthread_mutex_lock(&g_srm_tables.mutex);
@@ -232,7 +210,7 @@ static int mlx5_srm_prepare_tables(struct mlx5_context *ctx,
 
 	req.app_id = SRM_AUTO_APP_ID;
 	req.app_threads = app_threads;
-	req.xrc_qp_num_per_srm = xrc_qp_num_per_srm;
+	req.xrc_qp_num_per_srm = attr->srm_xrc_qp_num_per_srm;
 	if (ioctl(g_srm_tables.bridge_fd, SRM_ALLOC_APP_TABLE, &req) < 0) {
 		munmap(xrc_map, xrc_map_len);
 		munmap(level_map, level_map_len);
@@ -278,22 +256,17 @@ void mlx5_srm_release_tables(struct mlx5_context *ctx)
 }
 
 static __thread struct ibv_context *tls_srm_ctx;
-static __thread struct ibv_qp *tls_hidden_srm_qp;
+static __thread struct ibv_qp *tls_hidden_srm_qp[SRM_NUM_SCHED*SRM_NUM_LEVEL];
 static __thread uint32_t tls_srm_thread_idx;
 static __thread uint32_t tls_next_rc_db_idx;
 static pthread_mutex_t g_srm_thread_idx_mutex = PTHREAD_MUTEX_INITIALIZER;
-static struct ibv_context *g_srm_thread_idx_ctx;
 static uint32_t g_srm_next_thread_idx;
 
-static uint32_t mlx5_srm_assign_thread_idx(struct ibv_context *context)
+static uint32_t mlx5_srm_assign_thread_idx()
 {
 	uint32_t idx;
 
 	pthread_mutex_lock(&g_srm_thread_idx_mutex);
-	if (g_srm_thread_idx_ctx != context) {
-		g_srm_thread_idx_ctx = context;
-		g_srm_next_thread_idx = 0;
-	}
 	idx = g_srm_next_thread_idx++;
 	pthread_mutex_unlock(&g_srm_thread_idx_mutex);
 
@@ -3839,7 +3812,7 @@ struct ibv_qp *mlx5_create_qp_ex(struct ibv_context *context,
 		struct mlx5_qp *mqp;
 
 		if (attr->sender_side &&
-		    (tls_hidden_srm_qp == NULL || tls_srm_ctx != context)) {
+		    (tls_hidden_srm_qp[0] == NULL || tls_srm_ctx != context)) {
 			struct ibv_qp_init_attr_ex srm_attr;
 			memcpy(&srm_attr, attr, sizeof(srm_attr));
 			srm_attr.qp_type = IBV_QPT_SRM;
@@ -3853,8 +3826,9 @@ struct ibv_qp *mlx5_create_qp_ex(struct ibv_context *context,
 			srm_attr.cap.max_send_sge = 1;
 
 
-			tls_hidden_srm_qp = mlx5_create_srm_bundle_qp(context, &srm_attr);
-			if (!tls_hidden_srm_qp)
+			for(int i = 0;i<SRM_NUM_SCHED*SRM_NUM_LEVEL;i++)
+				tls_hidden_srm_qp[i] = mlx5_create_srm_bundle_qp(context, &srm_attr);
+			if (!tls_hidden_srm_qp[0])
 				return NULL;
 			tls_srm_ctx = context;
 			tls_srm_thread_idx = mlx5_srm_assign_thread_idx(context);
@@ -3864,28 +3838,27 @@ struct ibv_qp *mlx5_create_qp_ex(struct ibv_context *context,
 		qp = create_qp(context, attr, NULL);
 		if (!qp)
 			return NULL;
-		mqp = to_mqp(qp);
-		mqp->srm_proxy_qp = tls_hidden_srm_qp;
-		mqp->srm_proxy_qp_idx = tls_srm_thread_idx;
-		mqp->srm_proxy_db_idx = tls_next_rc_db_idx++;
-		mqp->srm_proxy_enabled = attr->sender_side ? 1 : 0;
-		mqp->srm_num_level = attr->srm_num_level ? attr->srm_num_level : 2;
-		mqp->srm_num_sched = attr->srm_num_sched ? attr->srm_num_sched : 1;
-		mqp->srm_max_xrc_qp_per_srm = attr->srm_max_xrc_qp_per_srm ?
-			attr->srm_max_xrc_qp_per_srm : 1024;
-		mqp->srm_xrc_qp_num_per_srm = attr->srm_xrc_qp_num_per_srm ?
-			attr->srm_xrc_qp_num_per_srm : attr->rnode_num;
-		qp->srm_wqe_table = g_srm_tables.wqe_table;
-		qp->srm_level_table = g_srm_tables.level_table;
-		qp->srm_xrc_table = g_srm_tables.xrc_table;
 		if (attr->sender_side) {
+			mqp = to_mqp(qp);
+			mqp->srm_proxy_qp = (struct ibv_qp**)malloc(sizeof(struct ibv_qp *) * SRM_NUM_SCHED * SRM_NUM_LEVEL);
+			for(int i =0;i<SRM_NUM_SCHED*SRM_NUM_LEVEL;i++)
+				mqp->srm_proxy_qp[i] = tls_hidden_srm_qp[i];
+			mqp->srm_thread_idx = tls_srm_thread_idx;
+			mqp->srm_proxy_db_idx = tls_next_rc_db_idx++ % attr->srm_xrc_qp_num_per_srm;
+			mqp->srm_proxy_enabled = attr->sender_side ? 1 : 0;
+			mqp->srm_num_level = SRM_NUM_LEVEL;
+			mqp->srm_num_sched = SRM_NUM_SCHED;
+			mqp->srm_max_xrc_qp_per_srm = SRM_MAX_USER_XRC_QP_PER_SRM;
+			qp->srm_wqe_table = g_srm_tables.wqe_table;
+			qp->srm_level_table = g_srm_tables.level_table;
+			qp->srm_xrc_table = g_srm_tables.xrc_table;
+			
 			fprintf(stderr,
-				"[mlx5-rc-srm] qpn=%u thread_idx=%u db_idx=%u rnode_num=%u xrc_qp_num=%u num_level=%u num_sched=%u\n",
+				"[mlx5-rc-srm] qpn=%u thread_idx=%u db_idx=%u rnode_num=%u  num_level=%u num_sched=%u\n",
 				qp->qp_num,
-				mqp->srm_proxy_qp_idx,
+				mqp->srm_thread_idx,
 				mqp->srm_proxy_db_idx,
 				attr->rnode_num,
-				mqp->srm_xrc_qp_num_per_srm,
 				mqp->srm_num_level,
 				mqp->srm_num_sched);
 		}

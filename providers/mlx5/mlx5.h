@@ -742,14 +742,13 @@ struct mlx5_qp {
 	*/
 	struct ibv_qp **xrc_qp_arr;
 	int xrc_qp_arr_cnt;
-	struct ibv_qp *srm_proxy_qp;
-	uint32_t srm_proxy_qp_idx;
+	struct ibv_qp **srm_proxy_qp;
+	uint32_t srm_thread_idx;
 	uint32_t srm_proxy_db_idx;
 	uint8_t srm_proxy_enabled;
 	uint32_t srm_num_level;
 	uint32_t srm_num_sched;
 	uint32_t srm_max_xrc_qp_per_srm;
-	uint32_t srm_xrc_qp_num_per_srm;
 };
 
 struct mlx5_ah {
@@ -986,23 +985,27 @@ struct mlx5_devx_eq {
 	int eqn;
 };
 
-struct srm_qp_entry{
+// struct srm_qp_entry{
 	
-	uint32_t qp_idx;
-	uint32_t valid;
-	uint64_t ctrl;
-	uint64_t bytes;
-	//uint64_t cycles;
-}__attribute__((__aligned__(64)));
+// 	uint32_t qp_idx;
+// 	uint32_t valid;
+// 	uint64_t ctrl;
+// 	uint64_t bytes;
+// 	//uint64_t cycles;
+// }__attribute__((__aligned__(64)));
 
-struct srm_xrc_table_entry {
-	uint64_t ctrl;
-	uint64_t tot_bytes;
-	uint64_t tot_recv_cqes;
-	uint64_t cur_gbps;
-	uint64_t cur_lat_us;
-	uint64_t update_cnt;
-} __attribute__((__aligned__(64)));
+// struct srm_xrc_table_entry {
+// 	uint64_t ctrl;
+// 	uint64_t tot_bytes;
+// 	uint64_t tot_recv_cqes;
+// 	uint64_t cur_gbps;
+// 	uint64_t cur_lat_us;
+// 	uint64_t update_cnt;
+// } __attribute__((__aligned__(64)));
+
+// struct srm_aligned_u32 {
+// 	uint32_t val;
+// } __attribute__((__aligned__(64)));
 
 struct ibv_flow *
 _mlx5dv_create_flow(struct mlx5dv_flow_matcher *flow_matcher,

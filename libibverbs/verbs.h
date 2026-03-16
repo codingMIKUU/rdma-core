@@ -62,6 +62,7 @@ extern "C" {
 #endif
 
 
+
 union ibv_gid {
 	uint8_t			raw[16];
 	struct {
@@ -932,6 +933,28 @@ enum ibv_qp_type {
 #define SRM_NUM_LEVEL 2
 #define SRM_NUM_SCHED 1
 
+struct srm_qp_entry{
+	
+	uint32_t qp_idx;
+	uint32_t valid;
+	uint64_t ctrl;
+	uint64_t bytes;
+	//uint64_t cycles;
+}__attribute__((__aligned__(64)));
+
+struct srm_xrc_table_entry {
+	uint64_t ctrl;
+	uint64_t tot_bytes;
+	uint64_t tot_recv_cqes;
+	uint64_t cur_gbps;
+	uint64_t cur_lat_us;
+	uint64_t update_cnt;
+} __attribute__((__aligned__(64)));
+
+struct srm_aligned_u32 {
+	uint32_t val;
+} __attribute__((__aligned__(64)));
+
 struct ibv_qp_cap {
 	uint32_t		max_send_wr;
 	uint32_t		max_recv_wr;
@@ -1382,6 +1405,72 @@ struct ibv_qp {
 	void                       *srm_level_table;
 	void                       *srm_xrc_table;
 };
+
+static inline struct srm_xrc_table_entry *ibv_srm_xrc_entry(
+		struct ibv_qp *qp,
+		uint32_t local_thread_idx,
+		uint32_t level_sched_idx,
+		uint32_t xrc_qp_idx)
+{
+	struct srm_xrc_table_entry *xrc_table;
+	uint64_t idx;
+
+	if (qp == NULL || qp->srm_xrc_table == NULL)
+		return NULL;
+	if (level_sched_idx >= SRM_NUM_LEVEL * SRM_NUM_SCHED)
+		return NULL;
+	if (xrc_qp_idx >= SRM_MAX_USER_XRC_QP_PER_SRM)
+		return NULL;
+
+	xrc_table = (struct srm_xrc_table_entry *)qp->srm_xrc_table;
+	idx = ((uint64_t)local_thread_idx * SRM_NUM_LEVEL * SRM_NUM_SCHED +
+	       level_sched_idx) * SRM_MAX_USER_XRC_QP_PER_SRM + xrc_qp_idx;
+	return &xrc_table[idx];
+}
+
+static inline int ibv_srm_update_cur_gbps(struct ibv_qp *qp,
+		uint32_t local_thread_idx,
+		double cur_gbps)
+{
+	struct srm_xrc_table_entry *entry =
+		ibv_srm_xrc_entry(qp, local_thread_idx, 0, 0);
+
+	if (entry == NULL)
+		return EINVAL;
+
+	__atomic_store_n(&entry->cur_gbps, (uint64_t)cur_gbps, __ATOMIC_RELAXED);
+	__atomic_fetch_add(&entry->update_cnt, 1, __ATOMIC_RELEASE);
+	return 0;
+}
+
+static inline int ibv_srm_update_cur_lat_us(struct ibv_qp *qp,
+		uint32_t local_thread_idx,
+		double cur_lat_us)
+{
+	struct srm_xrc_table_entry *entry =
+		ibv_srm_xrc_entry(qp, local_thread_idx, 0, 0);
+
+	if (entry == NULL)
+		return EINVAL;
+
+	__atomic_store_n(&entry->cur_lat_us, (uint64_t)cur_lat_us, __ATOMIC_RELAXED);
+	__atomic_fetch_add(&entry->update_cnt, 1, __ATOMIC_RELEASE);
+	return 0;
+}
+
+static inline int ibv_srm_add_tot_recv_cqes(struct ibv_qp *qp,
+		uint32_t local_thread_idx,
+		uint64_t cqes)
+{
+	struct srm_xrc_table_entry *entry =
+		ibv_srm_xrc_entry(qp, local_thread_idx, 0, 0);
+
+	if (entry == NULL)
+		return EINVAL;
+
+	__atomic_fetch_add(&entry->tot_recv_cqes, cqes, __ATOMIC_RELAXED);
+	return 0;
+}
 
 struct ibv_qp_ex {
 	struct ibv_qp qp_base;
