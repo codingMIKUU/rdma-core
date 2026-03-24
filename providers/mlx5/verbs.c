@@ -2663,6 +2663,7 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 
 	ibqp = &qp->verbs_qp;
 	qp->ibv_qp = ibqp;
+	qp->sender_side = attr->sender_side ? 1 : 0;
 
 	if ((attr->comp_mask & IBV_QP_INIT_ATTR_CREATE_FLAGS) &&
 		(attr->create_flags & IBV_QP_CREATE_SOURCE_QPN)) {

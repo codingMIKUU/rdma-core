@@ -169,6 +169,7 @@ static const struct verbs_context_ops mlx5_ctx_common_ops = {
 	.alloc_null_mr = mlx5_alloc_null_mr,
 	.free_context = mlx5_free_context,
 	.set_ece = mlx5_set_ece,
+	.srm_add_tot_recv_cqes = mlx5_srm_add_tot_recv_cqes,
 	.unimport_dm = mlx5_unimport_dm,
 	.unimport_mr = mlx5_unimport_mr,
 	.unimport_pd = mlx5_unimport_pd,

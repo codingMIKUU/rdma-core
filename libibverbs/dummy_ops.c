@@ -479,6 +479,11 @@ static int set_ece(struct ibv_qp *qp, struct ibv_ece *ece)
 	return EOPNOTSUPP;
 }
 
+static int srm_add_tot_recv_cqes(struct ibv_qp *qp, uint64_t cqes)
+{
+	return EOPNOTSUPP;
+}
+
 static void unimport_dm(struct ibv_dm *dm)
 {
 }
@@ -576,6 +581,7 @@ const struct verbs_context_ops verbs_dummy_ops = {
 	rereg_mr,
 	resize_cq,
 	set_ece,
+	srm_add_tot_recv_cqes,
 	unimport_dm,
 	unimport_mr,
 	unimport_pd,
@@ -701,6 +707,7 @@ void verbs_set_ops(struct verbs_context *vctx,
 	SET_PRIV_OP(ctx, rereg_mr);
 	SET_PRIV_OP(ctx, resize_cq);
 	SET_PRIV_OP_IC(vctx, set_ece);
+	SET_OP(vctx, srm_add_tot_recv_cqes);
 	SET_PRIV_OP_IC(vctx, unimport_dm);
 	SET_PRIV_OP_IC(vctx, unimport_mr);
 	SET_PRIV_OP_IC(vctx, unimport_pd);

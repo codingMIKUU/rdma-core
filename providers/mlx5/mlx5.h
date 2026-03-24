@@ -735,6 +735,7 @@ struct mlx5_qp {
 	uint32_t			get_ece;
 
 	uint8_t				need_mmo_enable:1;
+	uint8_t			sender_side;
 
 
 	/*
@@ -1253,6 +1254,7 @@ void mlx5_init_qp_indices(struct mlx5_qp *qp);
 void mlx5_init_rwq_indices(struct mlx5_rwq *rwq);
 int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			  struct ibv_send_wr **bad_wr);
+int mlx5_srm_add_tot_recv_cqes(struct ibv_qp *qp, uint64_t cqes);
 int mlx5_post_recv(struct ibv_qp *ibqp, struct ibv_recv_wr *wr,
 			  struct ibv_recv_wr **bad_wr);
 int mlx5_post_wq_recv(struct ibv_wq *ibwq, struct ibv_recv_wr *wr,

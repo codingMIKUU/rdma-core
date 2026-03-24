@@ -1405,6 +1405,36 @@ int mlx5_poll_cq(struct ibv_cq *ibcq, int ne, struct ibv_wc *wc)
 int mlx5_poll_cq_v1(struct ibv_cq *ibcq, int ne, struct ibv_wc *wc)
 {
 	return poll_cq(ibcq, ne, wc, 1);
+
+	// if (ret > 0) {
+	// 	struct mlx5_context *mctx = to_mctx(ibcq->context);
+	// 	struct mlx5_qp *mqp;
+	// 	struct mlx5_resource *rsc = NULL;
+	// 	mqp = get_req_context(mctx, &rsc,
+	// 			      (wc[0].qp_num),
+	// 			      1);
+		
+
+	// 	if (!mqp) {
+	// 		printf("failed to find qp by wc[0]: qp_num=%u src_qp=%u\n",
+	// 		       wc[0].qp_num, wc[0].src_qp);
+	// 	}else if(mqp->srm_proxy_enabled){	
+	// 		struct ibv_qp * qp = &mqp->verbs_qp.qp;
+	// 		struct srm_xrc_table_entry *entry =
+	// 			ibv_srm_xrc_entry(qp, mqp->srm_thread_idx, 0, 0);
+
+	// 		if (entry == NULL){
+	// 			printf("failed to find srm entry for qp_num=%u src_qp=%u\n",
+	// 			       wc[0].qp_num, wc[0].src_qp);
+	// 		}
+	// 		else{
+	// 			__atomic_fetch_add(&entry->tot_recv_cqes, ret, __ATOMIC_RELAXED);	
+	// 		}
+
+			
+
+	// 	}
+	// }
 }
 
 static inline enum ibv_wc_opcode mlx5_cq_read_wc_opcode(struct ibv_cq_ex *ibcq)

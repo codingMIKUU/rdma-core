@@ -442,6 +442,7 @@ struct verbs_context_ops {
 			void *addr, size_t length, int access);
 	int (*resize_cq)(struct ibv_cq *cq, int cqe);
 	int (*set_ece)(struct ibv_qp *qp, struct ibv_ece *ece);
+	int (*srm_add_tot_recv_cqes)(struct ibv_qp *qp, uint64_t cqes);
 	void (*unimport_dm)(struct ibv_dm *dm);
 	void (*unimport_mr)(struct ibv_mr *mr);
 	void (*unimport_pd)(struct ibv_pd *pd);

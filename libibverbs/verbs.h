@@ -927,7 +927,7 @@ enum ibv_qp_type {
 
 #define SRM_AUTO_APP_ID 0xffffffffU
 #define SRM_KERN_MAX_USER_THREADS 17
-#define SRM_KERN_MAX_APP 64
+#define SRM_KERN_MAX_APP 4
 #define SRM_MAX_USER_XRC_QP_PER_SRM 1024
 #define SRM_BRIDGE_DEV_PATH "/dev/mlx5_table_bridge"
 #define SRM_NUM_LEVEL 2
@@ -1459,18 +1459,7 @@ static inline int ibv_srm_update_cur_lat_us(struct ibv_qp *qp,
 }
 
 static inline int ibv_srm_add_tot_recv_cqes(struct ibv_qp *qp,
-		uint32_t local_thread_idx,
-		uint64_t cqes)
-{
-	struct srm_xrc_table_entry *entry =
-		ibv_srm_xrc_entry(qp, local_thread_idx, 0, 0);
-
-	if (entry == NULL)
-		return EINVAL;
-
-	__atomic_fetch_add(&entry->tot_recv_cqes, cqes, __ATOMIC_RELAXED);
-	return 0;
-}
+		uint64_t cqes);
 
 struct ibv_qp_ex {
 	struct ibv_qp qp_base;
@@ -2380,6 +2369,8 @@ struct verbs_context {
 	struct ibv_xrcd *	(*open_xrcd)(struct ibv_context *context,
 					     struct ibv_xrcd_init_attr *xrcd_init_attr);
 	int			(*close_xrcd)(struct ibv_xrcd *xrcd);
+	int                     (*srm_add_tot_recv_cqes)(struct ibv_qp *qp,
+						     uint64_t cqes);
 	uint64_t _ABI_placeholder3;
 	size_t   sz;			/* Must be immediately before struct ibv_context */
 	struct ibv_context context;	/* Must be last field in the struct */
@@ -3251,6 +3242,18 @@ ibv_create_qp_ex(struct ibv_context *context, struct ibv_qp_init_attr_ex *qp_ini
 		return NULL;
 	}
 	return vctx->create_qp_ex(context, qp_init_attr_ex);
+}
+
+static inline int ibv_srm_add_tot_recv_cqes(struct ibv_qp *qp,
+		uint64_t cqes)
+{
+	struct verbs_context *vctx;
+
+	vctx = verbs_get_ctx_op(qp->context, srm_add_tot_recv_cqes);
+	if (!vctx)
+		return EOPNOTSUPP;
+
+	return vctx->srm_add_tot_recv_cqes(qp, cqes);
 }
 
 /**
