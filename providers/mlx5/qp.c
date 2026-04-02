@@ -1012,6 +1012,8 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	// printf("用户态sq地址:%p\n",sq_rdmacore_addr);
 	// printf("用户态qpn:%d\n",ibqp->qp_num);
 
+	struct ibv_send_wr *st_wr = wr;
+
 	for (nreq = 0; wr; ++nreq, wr = wr->next) {
 		wr_id = wr->wr_id;//for debug
 		if (unlikely(wr->opcode < 0 ||
@@ -1362,6 +1364,7 @@ out:
 		else
 			post_send_db(qp, bf, nreq, inl, size, ctrl);
 	}
+	//st_wr->wr_id = rdtsc();
 
 	mlx5_spin_unlock(&qp->sq.lock);
 
@@ -1390,6 +1393,8 @@ int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		struct mlx5_qp *mqp = to_mqp(ibqp);
 		static __thread int rc_srm_dbg_cnt;
 
+
+		
 		ret = _mlx5_post_send(ibqp, wr, bad_wr);
 		if (ret)
 			return ret;
@@ -1397,10 +1402,8 @@ int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 
 		if (mqp->srm_proxy_enabled && mqp->srm_proxy_qp) {
 			struct ibv_send_wr *cur = wr;
-			uint32_t num_level = mqp->srm_num_level ? mqp->srm_num_level : 2;
-			uint32_t num_sched = mqp->srm_num_sched ? mqp->srm_num_sched : 1;
-			uint32_t max_xrc_qp = SRM_MAX_USER_XRC_QP_PER_SRM;
-			uint32_t table_stride = num_level * num_sched;
+
+			uint32_t table_stride = SRM_NUM_SCHED * SRM_NUM_LEVEL;
 			struct srm_aligned_u32 *wqe_table =
 				(struct srm_aligned_u32 *)ibqp->srm_wqe_table;
 			struct srm_aligned_u32 *level_table =
@@ -1413,9 +1416,9 @@ int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 					(cur->num_sge > 0 && cur->sg_list) ?
 					cur->sg_list[0].length : 0;
 				uint32_t group_idx =
-					(num_level > 1 && bytes >= 10 * 1024) ? 1 : 0;
+					( bytes >= 10 * 1024) ? 1 : 0;
 				uint32_t sched_idx = 0;//目前仅支持单调度器，写死了
-				uint32_t proxy_idx = group_idx * num_sched + sched_idx;
+				uint32_t proxy_idx = group_idx * SRM_NUM_SCHED + sched_idx;
 				struct ibv_qp *srm_ibqp = mqp->srm_proxy_qp[proxy_idx];
 				struct mlx5_qp *srm_mqp;
 
@@ -1427,12 +1430,12 @@ int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 				srm_mqp = to_mqp(srm_ibqp);
 				uint32_t xrc_qp_idx = mqp->srm_proxy_db_idx ;
 				uint32_t wqe_idx = mqp->srm_thread_idx * table_stride +
-					group_idx * num_sched + sched_idx;
-				uint32_t level_idx = group_idx + sched_idx * num_level;
+					group_idx * SRM_NUM_SCHED + sched_idx;
+				uint32_t level_idx = group_idx + sched_idx * SRM_NUM_LEVEL;
 				uint64_t xrc_idx =
 					((uint64_t)mqp->srm_thread_idx * table_stride +
-					 group_idx * num_sched + sched_idx) * max_xrc_qp +
-					(xrc_qp_idx % max_xrc_qp);
+					 group_idx * SRM_NUM_SCHED + sched_idx) * SRM_MAX_USER_XRC_QP_PER_SRM +
+					(xrc_qp_idx % SRM_MAX_USER_XRC_QP_PER_SRM);
 
 				uint32_t idx = srm_mqp->sq.cur_post &
 					       (srm_mqp->sq.srm_entries_cap - 1);
@@ -1482,6 +1485,8 @@ int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 							   __ATOMIC_RELEASE);
 				//printf("level %d cnt:%d\n",level_idx, __atomic_load_n(&level_table[level_idx].val, __ATOMIC_ACQUIRE));
 
+				//for log
+				cur->wr_id = entry;
 
 				srm_mqp->sq.cur_post++;
 				cur = cur->next;

@@ -3845,7 +3845,7 @@ struct ibv_qp *mlx5_create_qp_ex(struct ibv_context *context,
 			for(int i =0;i<SRM_NUM_SCHED*SRM_NUM_LEVEL;i++)
 				mqp->srm_proxy_qp[i] = tls_hidden_srm_qp[i];
 			mqp->srm_thread_idx = tls_srm_thread_idx;
-			mqp->srm_proxy_db_idx = tls_next_rc_db_idx++ % attr->srm_xrc_qp_num_per_srm;
+			mqp->srm_proxy_db_idx = tls_next_rc_db_idx++/2 % attr->srm_xrc_qp_num_per_srm;
 			mqp->srm_proxy_enabled = attr->sender_side ? 1 : 0;
 			mqp->srm_num_level = SRM_NUM_LEVEL;
 			mqp->srm_num_sched = SRM_NUM_SCHED;

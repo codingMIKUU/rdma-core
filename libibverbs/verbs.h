@@ -939,7 +939,7 @@ struct srm_qp_entry{
 	uint32_t valid;
 	uint64_t ctrl;
 	uint64_t bytes;
-	//uint64_t cycles;
+	uint64_t cycles;
 }__attribute__((__aligned__(64)));
 
 struct srm_xrc_table_entry {
