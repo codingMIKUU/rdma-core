@@ -928,7 +928,7 @@ enum ibv_qp_type {
 #define SRM_AUTO_APP_ID 0xffffffffU
 #define SRM_KERN_MAX_USER_THREADS 17
 #define SRM_KERN_MAX_APP 4
-#define SRM_MAX_USER_XRC_QP_PER_SRM 1024
+#define SRM_MAX_USER_XRC_QP_PER_SRM 2048
 #define SRM_BRIDGE_DEV_PATH "/dev/mlx5_table_bridge"
 #define SRM_NUM_LEVEL 2
 #define SRM_NUM_SCHED 1
