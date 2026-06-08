@@ -91,6 +91,7 @@ struct mlx5_modify_qp {
 	__u32				comp_mask;
 	struct mlx5_ib_burst_info	burst_info;
 	__u32				ece_options;
+	__u8				gid[16];
 };
 
 #endif /* MLX5_ABI_H */

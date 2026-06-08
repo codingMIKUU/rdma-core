@@ -469,6 +469,17 @@ struct mlx5_pd {
 	};
 };
 
+struct mlx5_sq_ctrl_page {
+	uint64_t resv_idx;
+	uint8_t resv_pad[56];
+	uint64_t pub_idx;
+	uint8_t pub_pad[56];
+	uint64_t cons_idx;
+	uint8_t cons_pad[56];
+	uint64_t wqe_cnt;
+	uint8_t wqe_cnt_pad[56];
+} __attribute__((aligned(64)));
+
 struct mlx5_parent_domain {
 	struct mlx5_pd mpd;
 	struct mlx5_td *mtd;
@@ -702,6 +713,20 @@ struct mlx5_qp {
 	uint8_t				fm_cache;
 	uint8_t	                        sq_signal_bits;
 	void				*sq_start;
+	void			*sq_mmap_buf;
+	size_t			sq_mmap_len;
+	void			*sq_ctrl_mmap_buf;
+	size_t			sq_ctrl_mmap_len;
+	struct mlx5_sq_ctrl_page	*sq_ctrl;
+	uint32_t		sq_ctrl_slot_idx;
+	uint64_t		*sq_ready_seq;
+	void			*sq_ready_mmap_buf;
+	size_t			sq_ready_mmap_len;
+	uint32_t		sq_ready_depth;
+	uint32_t		*sq_usr_rc_cnt;
+	void			*sq_usr_rc_mmap_buf;
+	size_t			sq_usr_rc_mmap_len;
+	uint32_t		sq_usr_rc_depth;
 	struct mlx5_wq                  sq;
 
 	__be32                         *db;
@@ -720,6 +745,7 @@ struct mlx5_qp {
 	uint32_t			rqn;
 	uint32_t			sqn;
 	uint64_t			tir_icm_addr;
+	uint32_t		usr_rc_cnt;
 	/*
 	 * ECE configuration is done in create/modify QP stages,
 	 * so this value is cached version of the requested ECE prior
@@ -736,6 +762,9 @@ struct mlx5_qp {
 
 	uint8_t				need_mmo_enable:1;
 	uint8_t			sender_side;
+	uint8_t			skip_kern_qp;
+	uint8_t			srm_kernel_qpn_valid;
+	uint32_t		srm_kernel_qpn;
 
 
 	/*
@@ -747,6 +776,7 @@ struct mlx5_qp {
 	uint32_t srm_thread_idx;
 	uint32_t srm_proxy_db_idx;
 	uint8_t srm_proxy_enabled;
+	uint8_t hollow_rc;
 	uint32_t srm_num_level;
 	uint32_t srm_num_sched;
 	uint32_t srm_max_xrc_qp_per_srm;

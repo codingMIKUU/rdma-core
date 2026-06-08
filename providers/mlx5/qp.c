@@ -34,9 +34,11 @@
 
 #include <stdlib.h>
 #include <pthread.h>
+#include <sched.h>
 #include <string.h>
 #include <errno.h>
 #include <stdio.h>
+#include <time.h>
 #include <util/mmio.h>
 #include <util/compiler.h>
 
@@ -46,6 +48,12 @@
 #include "wqe.h"
 
 #define MLX5_ATOMIC_SIZE 8
+
+#define SRM_BACKOFF_SPIN_RETRIES 4
+#define SRM_BACKOFF_YIELD_RETRIES 2
+#define SRM_BACKOFF_BASE_NS 1000ULL
+#define SRM_BACKOFF_MAX_NS 64000ULL
+#define SRM_RESERVE_MAX_WAIT_NS 1000000ULL
 
 static const uint32_t mlx5_ib_opcode[] = {
 	[IBV_WR_SEND]			= MLX5_OPCODE_SEND,
@@ -915,6 +923,128 @@ static inline void post_send_db(struct mlx5_qp *qp, struct mlx5_bf *bf,
 		mlx5_spin_unlock(&bf->lock);
 }
 
+static inline uint64_t srm_monotonic_ns(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static inline void srm_queue_backoff(unsigned int attempt,
+				     uint64_t remaining_ns)
+{
+	unsigned int loops;
+	unsigned int sleep_attempt;
+	uint64_t sleep_ns;
+	struct timespec ts;
+
+	if (attempt < SRM_BACKOFF_SPIN_RETRIES) {
+		loops = 16U << attempt;
+		while (loops--)
+			__asm__ __volatile__("pause");
+		return;
+	}
+
+	attempt -= SRM_BACKOFF_SPIN_RETRIES;
+	if (attempt < SRM_BACKOFF_YIELD_RETRIES) {
+		sched_yield();
+		return;
+	}
+
+	sleep_attempt = attempt - SRM_BACKOFF_YIELD_RETRIES;
+	sleep_ns = SRM_BACKOFF_BASE_NS;
+	if (sleep_attempt < 6)
+		sleep_ns <<= sleep_attempt;
+	else
+		sleep_ns = SRM_BACKOFF_MAX_NS;
+
+	/* Desynchronize contending producers without exceeding the sleep cap. */
+	sleep_ns += ((rdtsc() & 0xff) * sleep_ns) >> 10;
+	if (sleep_ns > SRM_BACKOFF_MAX_NS)
+		sleep_ns = SRM_BACKOFF_MAX_NS;
+	if (sleep_ns > remaining_ns)
+		sleep_ns = remaining_ns;
+	if (!sleep_ns)
+		return;
+
+	ts.tv_sec = sleep_ns / 1000000000ULL;
+	ts.tv_nsec = sleep_ns % 1000000000ULL;
+	clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
+}
+
+static inline int srm_reserve_wqe_blocking(struct mlx5_qp *qp,
+					    uint64_t *slot,
+					    uint64_t *cons_out)
+{
+	uint64_t start_ns = 0;
+	uint64_t now_ns;
+	uint64_t resv;
+	uint64_t cons;
+	uint64_t limit;
+	unsigned int attempt = 0;
+
+	limit = ((uint64_t)qp->sq.wqe_cnt * 2) / 3;
+
+	for (;;) {
+		resv = __atomic_load_n(&qp->sq_ctrl->resv_idx,
+				       __ATOMIC_RELAXED);
+		cons = __atomic_load_n(&qp->sq_ctrl->cons_idx,
+				       __ATOMIC_ACQUIRE);
+		if (resv - cons < limit) {
+			resv = __atomic_fetch_add(&qp->sq_ctrl->resv_idx, 1,
+						  __ATOMIC_RELAXED);
+			if (slot)
+				*slot = resv;
+			if (cons_out)
+				*cons_out = cons;
+			return 0;
+		}
+
+		now_ns = srm_monotonic_ns();
+		if (!start_ns)
+			start_ns = now_ns;
+		else if (now_ns - start_ns >= SRM_RESERVE_MAX_WAIT_NS)
+			return ENOMEM;
+
+		srm_queue_backoff(attempt,
+				  SRM_RESERVE_MAX_WAIT_NS - (now_ns - start_ns));
+		if (attempt != UINT_MAX)
+			attempt++;
+	}
+}
+
+static inline void srm_publish_wqe(struct mlx5_qp *qp, uint64_t slot)
+{
+	uint64_t pub;
+	uint64_t new_pub;
+	uint32_t mask = qp->sq_ready_depth - 1;
+
+	__atomic_store_n(&qp->sq_ready_seq[slot & mask], slot + 1,
+			 __ATOMIC_RELEASE);
+
+	pub = __atomic_load_n(&qp->sq_ctrl->pub_idx, __ATOMIC_ACQUIRE);
+	if (slot != pub)
+		return;
+
+	for (;;) {
+		new_pub = pub;
+
+		while (__atomic_load_n(&qp->sq_ready_seq[new_pub & mask],
+				       __ATOMIC_ACQUIRE) == new_pub + 1)
+			new_pub++;
+
+		if (new_pub == pub)
+			return;
+
+		if (__atomic_compare_exchange_n(&qp->sq_ctrl->pub_idx, &pub,
+						new_pub, false,
+						__ATOMIC_RELEASE,
+						__ATOMIC_ACQUIRE))
+			pub = new_pub;
+	}
+}
+
 //dosen't write bf reg
 static inline void fc_post_send_db(struct mlx5_qp *qp, struct mlx5_bf *bf,
 				int nreq, int inl, int size, void *ctrl){
@@ -931,7 +1061,8 @@ static inline void fc_post_send_db(struct mlx5_qp *qp, struct mlx5_bf *bf,
 	 * updating doorbell record and ringing the doorbell
 	 */
 	udma_to_device_barrier();
-	qp->db[MLX5_SND_DBR] = htobe32(qp->sq.cur_post & 0xffff);
+	if (qp->db)
+		qp->db[MLX5_SND_DBR] = htobe32(qp->sq.cur_post & 0xffff);
 
 	// /* Make sure that the doorbell write happens before the memcpy
 	//  * to WC memory below
@@ -1003,11 +1134,20 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	uint32_t max_tso = 0;
 	FILE *fp = to_mctx(ibqp->context)->dbg_fp; /* The compiler ignores in non-debug mode */
 	uint32_t imm;
+	bool xrc_wqe;
 
 	uint64_t wr_id;
 	mlx5_spin_lock(&qp->sq.lock);
 
 	next_fence = qp->fm_cache;
+	if (unlikely(qp->hollow_rc &&
+		     (!qp->sq_start || !qp->sq_ctrl || !qp->sq_ready_seq ||
+		      !qp->sq_usr_rc_cnt || !qp->sq_usr_rc_depth))) {
+		if (bad_wr)
+			*bad_wr = wr;
+		mlx5_spin_unlock(&qp->sq.lock);
+		return EINVAL;
+	}
 	//uint64_t sq_rdmacore_addr=qp->sq_start;
 	// printf("用户态sq地址:%p\n",sq_rdmacore_addr);
 	// printf("用户态qpn:%d\n",ibqp->qp_num);
@@ -1015,6 +1155,19 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	struct ibv_send_wr *st_wr = wr;
 
 	for (nreq = 0; wr; ++nreq, wr = wr->next) {
+		uint64_t slot = 0;
+		uint64_t cons = 0;
+
+		if (qp->sender_side && qp->sq_ctrl) {
+			err = srm_reserve_wqe_blocking(qp, &slot, &cons);
+			if (err) {
+				if (bad_wr)
+					*bad_wr = wr;
+				goto out;
+			}
+			qp->sq.cur_post = slot;
+			qp->sq.tail = cons;
+		}
 		wr_id = wr->wr_id;//for debug
 		if (unlikely(wr->opcode < 0 ||
 		    wr->opcode >= sizeof mlx5_ib_opcode / sizeof mlx5_ib_opcode[0])) {
@@ -1024,8 +1177,9 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			goto out;
 		}
 
-		if (unlikely(mlx5_wq_overflow(&qp->sq, nreq,
-					      to_mcq(qp->ibv_qp->send_cq)))) {
+		if (!(qp->sender_side && qp->sq_ctrl) &&
+		    unlikely(mlx5_wq_overflow(&qp->sq, nreq,
+				      to_mcq(qp->ibv_qp->send_cq)))) {
 			mlx5_dbg(fp, MLX5_DBG_QP_SEND, "work queue overflow\n");
 			printf("work queue overflow, head:%u,tail:%u,max_post:%u\n",qp->sq.head,qp->sq.tail,qp->sq.max_post);
 			err = ENOMEM;
@@ -1078,17 +1232,20 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		size = sizeof *ctrl / 16;
 		qp->sq.wr_data[idx] = 0;
 
+		xrc_wqe = ibqp->qp_type == IBV_QPT_SRM ||
+			  ibqp->qp_type == IBV_QPT_XRC_SEND ||
+			  (ibqp->qp_type == IBV_QPT_RC && qp->hollow_rc);
+		if (xrc_wqe && unlikely(wr->opcode != IBV_WR_BIND_MW &&
+					 wr->opcode != IBV_WR_LOCAL_INV)) {
+			xrc = seg;
+			xrc->xrc_srqn = htobe32(wr->qp_type.xrc.remote_srqn);
+			seg += sizeof(*xrc);
+			size += sizeof(*xrc) / 16;
+		}
+
 		switch (ibqp->qp_type) {
 		case IBV_QPT_SRM:
 		case IBV_QPT_XRC_SEND:
-			if (unlikely(wr->opcode != IBV_WR_BIND_MW &&
-				     wr->opcode != IBV_WR_LOCAL_INV)) {
-				xrc = seg;
-				xrc->xrc_srqn = htobe32(wr->qp_type.xrc.remote_srqn);
-				seg += sizeof(*xrc);
-				size += sizeof(*xrc) / 16;
-			}
-			/* fall through */
 		case IBV_QPT_RC:
 			switch (wr->opcode) {
 			case IBV_WR_RDMA_READ:
@@ -1328,19 +1485,43 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 
 		mlx5_opcode = mlx5_ib_opcode[wr->opcode];
 		ctrl->opmod_idx_opcode = htobe32(((qp->sq.cur_post & 0xffff) << 8) |
-					       mlx5_opcode			 |
-					       (opmod << 24));
-		ctrl->qpn_ds = htobe32(size | (ibqp->qp_num << 8));
+				       mlx5_opcode			 |
+				       (opmod << 24));
+		{
+			uint32_t wqe_qpn = ibqp->qp_num;
+			if (qp->sender_side && qp->srm_kernel_qpn_valid)
+				wqe_qpn = qp->srm_kernel_qpn;
+			ctrl->qpn_ds = htobe32(size | (wqe_qpn << 8));
+		}
 
 		if (unlikely(qp->wq_sig))
 			ctrl->signature = wq_sig(ctrl);
 
 		qp->sq.wrid[idx] = wr->wr_id;
-		qp->sq.wqe_head[idx] = qp->sq.head + nreq;
+		if (qp->sender_side && qp->sq_ctrl)
+			qp->sq.wqe_head[idx] = slot;
+		else
+			qp->sq.wqe_head[idx] = qp->sq.head + nreq;
 		qp->sq.cur_post += DIV_ROUND_UP(size * 16, MLX5_SEND_WQE_BB);
+		if (qp->sender_side && qp->sq_ctrl) {
+			if (qp->sq_ready_seq) {
+				if (qp->hollow_rc)
+					__atomic_store_n(&qp->sq_usr_rc_cnt
+							 [slot & (qp->sq_usr_rc_depth - 1)],
+							 qp->usr_rc_cnt,
+							 __ATOMIC_RELAXED);
+				srm_publish_wqe(qp, slot);
+			} else {
+				__atomic_fetch_add(&qp->sq_ctrl->pub_idx, 1,
+						   __ATOMIC_RELEASE);
+			}
+		}
 
-		if(ibqp->qp_type == IBV_QPT_RC){
-			wr->wr_id = *(__be64 *)ctrl;
+		if (ibqp->qp_type == IBV_QPT_RC) {
+			uint64_t ctrl_wr_id = *(__be64 *)ctrl;
+
+			if (!qp->hollow_rc)
+				wr->wr_id = ctrl_wr_id;
 		}
 		
  
@@ -1358,7 +1539,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 
 out:
 	qp->fm_cache = next_fence;
-	if (!err) {
+	if (!err && !(qp->hollow_rc && qp->sender_side)) {
 		if (ibqp->qp_type == IBV_QPT_RC && qp->sender_side)
 			fc_post_send_db(qp, bf, nreq, inl, size, ctrl);
 		else
@@ -1374,6 +1555,7 @@ out:
 int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		   struct ibv_send_wr **bad_wr)
 {
+	struct mlx5_qp *mqp = to_mqp(ibqp);
 	int ret;
 #ifdef MW_DEBUG
 	if (wr->opcode == IBV_WR_BIND_MW) {
@@ -1389,115 +1571,114 @@ int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			return EINVAL;
 	}
 #endif
+	if (unlikely(mqp->skip_kern_qp)) {
+		if (bad_wr)
+			*bad_wr = wr;
+		return EINVAL;
+	}
 	if (ibqp->qp_type == IBV_QPT_RC) {
-		struct mlx5_qp *mqp = to_mqp(ibqp);
-		static __thread int rc_srm_dbg_cnt;
-
-
-		
 		ret = _mlx5_post_send(ibqp, wr, bad_wr);
 		if (ret)
 			return ret;
 			
 
-		if (mqp->srm_proxy_enabled && mqp->srm_proxy_qp) {
-			struct ibv_send_wr *cur = wr;
+		// if (mqp->srm_proxy_enabled && mqp->srm_proxy_qp) {
+		// 	struct ibv_send_wr *cur = wr;
 
-			uint32_t table_stride = SRM_NUM_SCHED * SRM_NUM_LEVEL;
-			struct srm_aligned_u32 *wqe_table =
-				(struct srm_aligned_u32 *)ibqp->srm_wqe_table;
-			struct srm_aligned_u32 *level_table =
-				(struct srm_aligned_u32 *)ibqp->srm_level_table;
-			struct srm_xrc_table_entry *xrc_table =
-				(struct srm_xrc_table_entry *)ibqp->srm_xrc_table;
+		// 	uint32_t table_stride = SRM_NUM_SCHED * SRM_NUM_LEVEL;
+		// 	struct srm_aligned_u32 *wqe_table =
+		// 		(struct srm_aligned_u32 *)ibqp->srm_wqe_table;
+		// 	struct srm_aligned_u32 *level_table =
+		// 		(struct srm_aligned_u32 *)ibqp->srm_level_table;
+		// 	struct srm_xrc_table_entry *xrc_table =
+		// 		(struct srm_xrc_table_entry *)ibqp->srm_xrc_table;
 
-			while (cur) {
-				uint32_t bytes =
-					(cur->num_sge > 0 && cur->sg_list) ?
-					cur->sg_list[0].length : 0;
-				uint32_t group_idx =
-					( bytes >= 10 * 1024) ? 1 : 0;
-				uint32_t sched_idx = 0;//目前仅支持单调度器，写死了
-				uint32_t proxy_idx = group_idx * SRM_NUM_SCHED + sched_idx;
-				struct ibv_qp *srm_ibqp = mqp->srm_proxy_qp[proxy_idx];
-				struct mlx5_qp *srm_mqp;
+		// 	while (cur) {
+		// 		uint32_t bytes =
+		// 			(cur->num_sge > 0 && cur->sg_list) ?
+		// 			cur->sg_list[0].length : 0;
+		// 		uint32_t group_idx =
+		// 			( bytes >= 10 * 1024) ? 1 : 0;
+		// 		uint32_t sched_idx = 0;//目前仅支持单调度器，写死了
+		// 		uint32_t proxy_idx = group_idx * SRM_NUM_SCHED + sched_idx;
+		// 		struct ibv_qp *srm_ibqp = mqp->srm_proxy_qp[proxy_idx];
+		// 		struct mlx5_qp *srm_mqp;
 
-				if (unlikely(srm_ibqp == NULL)) {
-					*bad_wr = cur;
-					return EINVAL;
-				}
+		// 		if (unlikely(srm_ibqp == NULL)) {
+		// 			*bad_wr = cur;
+		// 			return EINVAL;
+		// 		}
 
-				srm_mqp = to_mqp(srm_ibqp);
-				uint32_t xrc_qp_idx = mqp->srm_proxy_db_idx ;
-				uint32_t wqe_idx = mqp->srm_thread_idx * table_stride +
-					group_idx * SRM_NUM_SCHED + sched_idx;
-				uint32_t level_idx = group_idx + sched_idx * SRM_NUM_LEVEL;
-				uint64_t xrc_idx =
-					((uint64_t)mqp->srm_thread_idx * table_stride +
-					 group_idx * SRM_NUM_SCHED + sched_idx) * SRM_MAX_USER_XRC_QP_PER_SRM +
-					(xrc_qp_idx % SRM_MAX_USER_XRC_QP_PER_SRM);
+		// 		srm_mqp = to_mqp(srm_ibqp);
+		// 		uint32_t xrc_qp_idx = mqp->srm_proxy_db_idx ;
+		// 		uint32_t wqe_idx = mqp->srm_thread_idx * table_stride +
+		// 			group_idx * SRM_NUM_SCHED + sched_idx;
+		// 		uint32_t level_idx = group_idx + sched_idx * SRM_NUM_LEVEL;
+		// 		uint64_t xrc_idx =
+		// 			((uint64_t)mqp->srm_thread_idx * table_stride +
+		// 			 group_idx * SRM_NUM_SCHED + sched_idx) * SRM_MAX_USER_XRC_QP_PER_SRM +
+		// 			(xrc_qp_idx % SRM_MAX_USER_XRC_QP_PER_SRM);
 
-				uint32_t idx = srm_mqp->sq.cur_post &
-					       (srm_mqp->sq.srm_entries_cap - 1);
-				struct srm_qp_entry *entry =
-					mlx5_get_srm_qp_entry(srm_mqp, idx);
+		// 		uint32_t idx = srm_mqp->sq.cur_post &
+		// 			       (srm_mqp->sq.srm_entries_cap - 1);
+		// 		struct srm_qp_entry *entry =
+		// 			mlx5_get_srm_qp_entry(srm_mqp, idx);
 
-				/* Keep producer and kernel consumer strictly in sync. */
-				while (__atomic_load_n(&entry->valid, __ATOMIC_ACQUIRE) != 0)
-					;
+		// 		/* Keep producer and kernel consumer strictly in sync. */
+		// 		while (__atomic_load_n(&entry->valid, __ATOMIC_ACQUIRE) != 0)
+		// 			;
 
-				entry->qp_idx = xrc_qp_idx;
-				entry->ctrl = cur->wr_id;
-				entry->bytes = bytes;
-				__atomic_store_n(&entry->valid, 1, __ATOMIC_RELEASE);
+		// 		entry->qp_idx = xrc_qp_idx;
+		// 		entry->ctrl = cur->wr_id;
+		// 		entry->bytes = bytes;
+		// 		__atomic_store_n(&entry->valid, 1, __ATOMIC_RELEASE);
 
-				// if (rc_srm_dbg_cnt < 16) {
-				// 	fprintf(stderr,
-				// 		"[mlx5-rc-post] qpn=%u thread_idx=%u db_idx=%u level=%u sched=%u entry_idx=%u xrc_qp_idx=%u wqe_idx=%u level_idx=%u wr_id=%llu bytes=%u,xrc_table_idx:%d\n",
-				// 		ibqp->qp_num,
-				// 		mqp->srm_thread_idx,
-				// 		mqp->srm_proxy_db_idx,
-				// 		group_idx,
-				// 		sched_idx,
-				// 		idx,
-				// 		xrc_qp_idx,
-				// 		wqe_idx,
-				// 		level_idx,
-				// 		(unsigned long long)cur->wr_id,
-				// 		bytes,
-				// 		(int)xrc_idx);
-				// 	rc_srm_dbg_cnt++;
-				// }
+		// 		// if (rc_srm_dbg_cnt < 16) {
+		// 		// 	fprintf(stderr,
+		// 		// 		"[mlx5-rc-post] qpn=%u thread_idx=%u db_idx=%u level=%u sched=%u entry_idx=%u xrc_qp_idx=%u wqe_idx=%u level_idx=%u wr_id=%llu bytes=%u,xrc_table_idx:%d\n",
+		// 		// 		ibqp->qp_num,
+		// 		// 		mqp->srm_thread_idx,
+		// 		// 		mqp->srm_proxy_db_idx,
+		// 		// 		group_idx,
+		// 		// 		sched_idx,
+		// 		// 		idx,
+		// 		// 		xrc_qp_idx,
+		// 		// 		wqe_idx,
+		// 		// 		level_idx,
+		// 		// 		(unsigned long long)cur->wr_id,
+		// 		// 		bytes,
+		// 		// 		(int)xrc_idx);
+		// 		// 	rc_srm_dbg_cnt++;
+		// 		// }
 
-				/* Publish table counters only after entry is visible. */
-				if (xrc_table) {
-					__atomic_store_n(&xrc_table[xrc_idx].tot_bytes,
-							xrc_table[xrc_idx].tot_bytes + bytes,
-							__ATOMIC_RELEASE);
-					__atomic_store_n(&xrc_table[xrc_idx].ctrl,
-							cur->wr_id, __ATOMIC_RELEASE);
-				}
-				if (wqe_table)
-					__atomic_fetch_add(&wqe_table[wqe_idx].val, 1,
-							   __ATOMIC_RELEASE);
-				if (level_table)
-					__atomic_fetch_add(&level_table[level_idx].val, 1,
-							   __ATOMIC_RELEASE);
-				//printf("level %d cnt:%d\n",level_idx, __atomic_load_n(&level_table[level_idx].val, __ATOMIC_ACQUIRE));
+		// 		/* Publish table counters only after entry is visible. */
+		// 		if (xrc_table) {
+		// 			__atomic_store_n(&xrc_table[xrc_idx].tot_bytes,
+		// 					xrc_table[xrc_idx].tot_bytes + bytes,
+		// 					__ATOMIC_RELEASE);
+		// 			__atomic_store_n(&xrc_table[xrc_idx].ctrl,
+		// 					cur->wr_id, __ATOMIC_RELEASE);
+		// 		}
+		// 		if (wqe_table)
+		// 			__atomic_fetch_add(&wqe_table[wqe_idx].val, 1,
+		// 					   __ATOMIC_RELEASE);
+		// 		if (level_table)
+		// 			__atomic_fetch_add(&level_table[level_idx].val, 1,
+		// 					   __ATOMIC_RELEASE);
+		// 		//printf("level %d cnt:%d\n",level_idx, __atomic_load_n(&level_table[level_idx].val, __ATOMIC_ACQUIRE));
 
-				//for log
-				cur->wr_id = entry;
+		// 		//for log
+		// 		cur->wr_id = entry;
 
-				srm_mqp->sq.cur_post++;
-				cur = cur->next;
-			}
-		}
+		// 		srm_mqp->sq.cur_post++;
+		// 		cur = cur->next;
+		// 	}
+		// }
 
 		return 0;
 	}
 
-
-	
+	return _mlx5_post_send(ibqp, wr, bad_wr);
 }
 
 enum {

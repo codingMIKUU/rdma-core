@@ -1038,6 +1038,7 @@ struct ibv_qp_init_attr_ex {
 
 	// following are for fcscale 
 	int sender_side;
+	int skip_kern_qp;
 	uint32_t rnode_num;
 	uint32_t srm_app_threads;
 	uint32_t srm_max_app;
@@ -1048,6 +1049,7 @@ struct ibv_qp_init_attr_ex {
 	uint64_t srm_wqe_table_bytes;
 	uint64_t srm_level_table_bytes;
 	uint64_t srm_xrc_table_bytes;
+	union ibv_gid gid;
 };
 
 enum ibv_qp_open_attr_mask {
