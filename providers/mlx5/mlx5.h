@@ -727,6 +727,7 @@ struct mlx5_qp {
 	void			*sq_usr_rc_mmap_buf;
 	size_t			sq_usr_rc_mmap_len;
 	uint32_t		sq_usr_rc_depth;
+	uint32_t		sq_metadata_cnt;
 	struct mlx5_wq                  sq;
 
 	__be32                         *db;
@@ -1401,15 +1402,9 @@ int mlx5_query_ece(struct ibv_qp *qp, struct ibv_ece *ece);
 struct mlx5_psv *mlx5_create_psv(struct ibv_pd *pd);
 int mlx5_destroy_psv(struct mlx5_psv *psv);
 
-static inline void *mlx5_find_uidx(struct mlx5_context *ctx, uint32_t uidx)
-{
-	int tind = uidx >> MLX5_UIDX_TABLE_SHIFT;
-
-	if (likely(ctx->uidx_table[tind].refcnt))
-		return ctx->uidx_table[tind].table[uidx & MLX5_UIDX_TABLE_MASK];
-
-	return NULL;
-}
+void *mlx5_find_uidx(struct mlx5_context *ctx, uint32_t uidx);
+void *mlx5_find_uidx_locked(struct mlx5_context *ctx, uint32_t uidx);
+void mlx5_uidx_unlock(struct mlx5_context *ctx);
 
 static inline int mlx5_spin_lock(struct mlx5_spinlock *lock)
 {

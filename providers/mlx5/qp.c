@@ -1024,8 +1024,6 @@ static inline void srm_publish_wqe(struct mlx5_qp *qp, uint64_t slot)
 			 __ATOMIC_RELEASE);
 
 	pub = __atomic_load_n(&qp->sq_ctrl->pub_idx, __ATOMIC_ACQUIRE);
-	if (slot != pub)
-		return;
 
 	for (;;) {
 		new_pub = pub;
@@ -1142,7 +1140,9 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	next_fence = qp->fm_cache;
 	if (unlikely(qp->hollow_rc &&
 		     (!qp->sq_start || !qp->sq_ctrl || !qp->sq_ready_seq ||
-		      !qp->sq_usr_rc_cnt || !qp->sq_usr_rc_depth))) {
+		      !qp->sq_usr_rc_cnt || !qp->sq_usr_rc_depth ||
+		      !qp->sq.wrid || !qp->sq.wqe_head || !qp->sq.wr_data ||
+		      qp->sq_metadata_cnt < qp->sq.wqe_cnt))) {
 		if (bad_wr)
 			*bad_wr = wr;
 		mlx5_spin_unlock(&qp->sq.lock);

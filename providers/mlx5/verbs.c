@@ -2177,6 +2177,70 @@ static size_t mlx5_set_custom_qp_alignment(struct ibv_context *context,
 	return max(max_stride, buf_page / MLX5_QPC_PAGE_OFFSET_QUANTA);
 }
 
+static void mlx5_free_qp_wrid(struct mlx5_qp *qp)
+{
+	free(qp->rq.wrid);
+	qp->rq.wrid = NULL;
+	free(qp->sq.wqe_head);
+	qp->sq.wqe_head = NULL;
+	free(qp->sq.wr_data);
+	qp->sq.wr_data = NULL;
+	free(qp->sq.wrid);
+	qp->sq.wrid = NULL;
+	qp->sq_metadata_cnt = 0;
+}
+
+static int mlx5_resize_qp_sq_metadata(struct mlx5_qp *qp, uint32_t wqe_cnt)
+{
+	uint64_t *wrid;
+	uint32_t *wr_data;
+	unsigned int *wqe_head;
+
+	if (qp->sq_metadata_cnt == wqe_cnt)
+		return 0;
+
+	wrid = calloc(wqe_cnt, sizeof(*wrid));
+	wr_data = calloc(wqe_cnt, sizeof(*wr_data));
+	wqe_head = calloc(wqe_cnt, sizeof(*wqe_head));
+	if (!wrid || !wr_data || !wqe_head) {
+		free(wrid);
+		free(wr_data);
+		free(wqe_head);
+		errno = ENOMEM;
+		return -1;
+	}
+
+	free(qp->sq.wrid);
+	free(qp->sq.wr_data);
+	free(qp->sq.wqe_head);
+	qp->sq.wrid = wrid;
+	qp->sq.wr_data = wr_data;
+	qp->sq.wqe_head = wqe_head;
+	qp->sq_metadata_cnt = wqe_cnt;
+	return 0;
+}
+
+static int mlx5_alloc_qp_wrid(struct mlx5_qp *qp)
+{
+	if (qp->sq.wqe_cnt) {
+		if (mlx5_resize_qp_sq_metadata(qp, qp->sq.wqe_cnt))
+			goto err;
+	}
+
+	if (qp->rq.wqe_cnt) {
+		qp->rq.wrid = calloc(qp->rq.wqe_cnt, sizeof(*qp->rq.wrid));
+		if (!qp->rq.wrid)
+			goto err;
+	}
+
+	return 0;
+
+err:
+	errno = ENOMEM;
+	mlx5_free_qp_wrid(qp);
+	return -1;
+}
+
 static int mlx5_alloc_qp_buf(struct ibv_context *context,
 			     struct ibv_qp_init_attr_ex *attr,
 			     struct mlx5_qp *qp,
@@ -2188,37 +2252,9 @@ static int mlx5_alloc_qp_buf(struct ibv_context *context,
 	const char *qp_huge_key;
 	size_t req_align = to_mdev(context->device)->page_size;
 
-	if (qp->sq.wqe_cnt) {
-		qp->sq.wrid = malloc(qp->sq.wqe_cnt * sizeof(*qp->sq.wrid));
-		if (!qp->sq.wrid) {
-			errno = ENOMEM;
-			err = -1;
-			return err;
-		}
-
-		qp->sq.wr_data = malloc(qp->sq.wqe_cnt * sizeof(*qp->sq.wr_data));
-		if (!qp->sq.wr_data) {
-			errno = ENOMEM;
-			err = -1;
-			goto ex_wrid;
-		}
-
-		qp->sq.wqe_head = malloc(qp->sq.wqe_cnt * sizeof(*qp->sq.wqe_head));
-		if (!qp->sq.wqe_head) {
-			errno = ENOMEM;
-			err = -1;
-			goto ex_wrid;
-		}
-	}
-
-	if (qp->rq.wqe_cnt) {
-		qp->rq.wrid = malloc(qp->rq.wqe_cnt * sizeof(uint64_t));
-		if (!qp->rq.wrid) {
-			errno = ENOMEM;
-			err = -1;
-			goto ex_wrid;
-		}
-	}
+	err = mlx5_alloc_qp_wrid(qp);
+	if (err)
+		return err;
 
 	/* compatibility support */
 	qp_huge_key = qptype2key(attr->qp_type);
@@ -2281,16 +2317,7 @@ static int mlx5_alloc_qp_buf(struct ibv_context *context,
 rq_buf:
 	mlx5_free_actual_buf(to_mctx(context), &qp->buf);
 ex_wrid:
-	if (qp->rq.wrid)
-		free(qp->rq.wrid);
-
-	if (qp->sq.wqe_head)
-		free(qp->sq.wqe_head);
-
-	if (qp->sq.wr_data)
-		free(qp->sq.wr_data);
-	if (qp->sq.wrid)
-		free(qp->sq.wrid);
+	mlx5_free_qp_wrid(qp);
 
 	return err;
 }
@@ -2302,17 +2329,7 @@ static void mlx5_free_qp_buf(struct mlx5_context *ctx, struct mlx5_qp *qp)
 	if (qp->sq_buf.buf)
 		mlx5_free_actual_buf(ctx, &qp->sq_buf);
 
-	if (qp->rq.wrid)
-		free(qp->rq.wrid);
-
-	if (qp->sq.wqe_head)
-		free(qp->sq.wqe_head);
-
-	if (qp->sq.wrid)
-		free(qp->sq.wrid);
-
-	if (qp->sq.wr_data)
-		free(qp->sq.wr_data);
+	mlx5_free_qp_wrid(qp);
 }
 
 int mlx5_set_ece(struct ibv_qp *qp, struct ibv_ece *ece)
@@ -2666,7 +2683,7 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 		return NULL;
 	}
 
-	ibqp = &qp->verbs_qp;
+	ibqp = &qp->verbs_qp.qp;
 	qp->ibv_qp = ibqp;
 	qp->sender_side = attr->sender_side ? 1 : 0;
 	qp->skip_kern_qp = attr->skip_kern_qp ? 1 : 0;
@@ -2897,6 +2914,11 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 				(qp->sq.wqe_cnt << qp->sq.wqe_shift);
 		}
 	} else {
+		if (use_kernel_sq && mlx5_alloc_qp_wrid(qp)) {
+			mlx5_dbg(fp, MLX5_DBG_QP,
+				 "Failed to allocate kernel SQ metadata\n");
+			goto err;
+		}
 		qp->buf.buf = NULL;
 		qp->sq_buf.buf = NULL;
 		qp->sq_start = NULL;
@@ -2935,6 +2957,7 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 	cmd.rq_wqe_count = qp->rq.wqe_cnt;
 	cmd.rq_wqe_shift = qp->rq.wqe_shift;
 
+	qp->rsc.type = MLX5_RSC_TYPE_QP;
 	if (!ctx->cqe_version) {
 		cmd.uidx = 0xffffff;
 		pthread_mutex_lock(&ctx->qp_table_mutex);
@@ -2946,6 +2969,7 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 		}
 
 		cmd.uidx = usr_idx;
+		qp->rsc.rsn = usr_idx;
 	}
 
 	mparent_domain = to_mparent_domain(attr->pd);
@@ -3057,7 +3081,6 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 	attr->cap.max_recv_wr = qp->rq.max_post;
 	attr->cap.max_recv_sge = qp->rq.max_gs;
 
-	qp->rsc.type = MLX5_RSC_TYPE_QP;
 	qp->rsc.rsn = (ctx->cqe_version && !is_xrc_tgt(attr->qp_type)) ?
 		      usr_idx : ibqp->qp_num;
 
@@ -3107,7 +3130,8 @@ err_rq_db:
 		mlx5_free_db(to_mctx(context), qp->db, attr->pd, qp->custom_db);
 
 err_free_qp_buf:
-	if (qp->buf.buf || qp->sq_buf.buf)
+	if (qp->buf.buf || qp->sq_buf.buf || qp->sq.wrid ||
+	    qp->sq.wr_data || qp->sq.wqe_head || qp->rq.wrid)
 		mlx5_free_qp_buf(ctx, qp);
 
 err:
@@ -3235,7 +3259,8 @@ int mlx5_destroy_qp(struct ibv_qp *ibqp)
 	if (qp->dc_type != MLX5DV_DCTYPE_DCT) {
 		if (qp->db)
 			mlx5_free_db(ctx, qp->db, ibqp->pd, qp->custom_db);
-		if (qp->buf.buf || qp->sq_buf.buf)
+		if (qp->buf.buf || qp->sq_buf.buf || qp->sq.wrid ||
+		    qp->sq.wr_data || qp->sq.wqe_head || qp->rq.wrid)
 			mlx5_free_qp_buf(ctx, qp);
 	}
 free:
@@ -3652,6 +3677,8 @@ int __mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 			errno = EINVAL;
 			return errno;
 		}
+		if (mlx5_resize_qp_sq_metadata(mqp, wqe_cnt))
+			return errno;
 
 		mqp->srm_kernel_qpn = resp.drv_payload.kernel_qpn;
 		mqp->srm_kernel_qpn_valid = resp.drv_payload.kernel_qpn ? 1 : 0;
