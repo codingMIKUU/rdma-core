@@ -74,6 +74,83 @@ static inline uint64_t rdtsc() {
   __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
   return ((uint64_t)hi << 32) | lo;
 }
+
+static inline uint64_t srm_monotonic_ns(void);
+
+struct srm_reserve_stats {
+	uint64_t calls;
+	uint64_t cycles;
+	uint64_t waited;
+	uint64_t retries;
+	uint64_t timeouts;
+	uint64_t max_occupancy;
+	uint64_t phase_calls;
+	uint64_t lock_cycles;
+	uint64_t build_cycles;
+	uint64_t publish_cycles;
+	uint64_t unlock_cycles;
+	uint64_t last_report_ns;
+};
+
+static pthread_once_t srm_stats_once = PTHREAD_ONCE_INIT;
+static int srm_stats_enabled;
+static __thread struct srm_reserve_stats srm_reserve_stats;
+
+static void srm_stats_init(void)
+{
+	const char *value = getenv("MLX5_SRM_STATS");
+
+	srm_stats_enabled = value && atoi(value) != 0;
+}
+
+static inline int srm_stats_is_enabled(void)
+{
+	pthread_once(&srm_stats_once, srm_stats_init);
+	return srm_stats_enabled;
+}
+
+static void srm_maybe_report_reserve_stats(void)
+{
+	struct srm_reserve_stats *stats = &srm_reserve_stats;
+	uint64_t now_ns;
+
+	if ((stats->calls & 0xffff) != 0)
+		return;
+
+	now_ns = srm_monotonic_ns();
+	if (!stats->last_report_ns) {
+		stats->last_report_ns = now_ns;
+		return;
+	}
+	if (now_ns - stats->last_report_ns < 1000000000ULL)
+		return;
+
+	fprintf(stderr,
+		"SRM_RDMA_STATS thread=%lu reserve_calls=%llu "
+		"reserve_avg_cycles=%.2f waited_pct=%.2f retries=%llu "
+		"timeouts=%llu max_occupancy=%llu phase_calls=%llu "
+		"lock_avg_cycles=%.2f build_avg_cycles=%.2f "
+		"publish_avg_cycles=%.2f unlock_avg_cycles=%.2f\n",
+		(unsigned long)pthread_self(),
+		(unsigned long long)stats->calls,
+		stats->calls ? (double)stats->cycles / stats->calls : 0.0,
+		stats->calls ? 100.0 * (double)stats->waited / stats->calls : 0.0,
+		(unsigned long long)stats->retries,
+		(unsigned long long)stats->timeouts,
+		(unsigned long long)stats->max_occupancy,
+		(unsigned long long)stats->phase_calls,
+		stats->phase_calls
+			? (double)stats->lock_cycles / stats->phase_calls : 0.0,
+		stats->phase_calls
+			? (double)stats->build_cycles / stats->phase_calls : 0.0,
+		stats->phase_calls
+			? (double)stats->publish_cycles / stats->phase_calls : 0.0,
+		stats->phase_calls
+			? (double)stats->unlock_cycles / stats->phase_calls : 0.0);
+
+	memset(stats, 0, sizeof(*stats));
+	stats->last_report_ns = now_ns;
+}
 static void *get_recv_wqe(struct mlx5_qp *qp, int n)
 {
 	return qp->buf.buf + qp->rq.offset + (n << qp->rq.wqe_shift);
@@ -977,20 +1054,29 @@ static inline int srm_reserve_wqe_blocking(struct mlx5_qp *qp,
 					    uint64_t *slot,
 					    uint64_t *cons_out)
 {
+	struct srm_reserve_stats *stats = &srm_reserve_stats;
+	uint64_t stat_start = 0;
 	uint64_t start_ns = 0;
 	uint64_t now_ns;
 	uint64_t resv;
 	uint64_t cons;
 	uint64_t limit;
+	uint64_t occupancy;
 	unsigned int attempt = 0;
+	int stats_enabled = srm_stats_is_enabled();
 
 	limit = ((uint64_t)qp->sq.wqe_cnt * 2) / 3;
+	if (stats_enabled)
+		stat_start = rdtsc();
 
 	for (;;) {
 		resv = __atomic_load_n(&qp->sq_ctrl->resv_idx,
 				       __ATOMIC_RELAXED);
 		cons = __atomic_load_n(&qp->sq_ctrl->cons_idx,
 				       __ATOMIC_ACQUIRE);
+		occupancy = resv - cons;
+		if (stats_enabled && occupancy > stats->max_occupancy)
+			stats->max_occupancy = occupancy;
 		if (resv - cons < limit) {
 			resv = __atomic_fetch_add(&qp->sq_ctrl->resv_idx, 1,
 						  __ATOMIC_RELAXED);
@@ -998,14 +1084,29 @@ static inline int srm_reserve_wqe_blocking(struct mlx5_qp *qp,
 				*slot = resv;
 			if (cons_out)
 				*cons_out = cons;
+			if (stats_enabled) {
+				stats->calls++;
+				stats->cycles += rdtsc() - stat_start;
+				stats->waited += attempt != 0;
+				stats->retries += attempt;
+			}
 			return 0;
 		}
 
 		now_ns = srm_monotonic_ns();
 		if (!start_ns)
 			start_ns = now_ns;
-		else if (now_ns - start_ns >= SRM_RESERVE_MAX_WAIT_NS)
+		else if (now_ns - start_ns >= SRM_RESERVE_MAX_WAIT_NS) {
+			if (stats_enabled) {
+				stats->calls++;
+				stats->cycles += rdtsc() - stat_start;
+				stats->waited++;
+				stats->retries += attempt;
+				stats->timeouts++;
+				srm_maybe_report_reserve_stats();
+			}
 			return ENOMEM;
+		}
 
 		srm_queue_backoff(attempt,
 				  SRM_RESERVE_MAX_WAIT_NS - (now_ns - start_ns));
@@ -1014,33 +1115,12 @@ static inline int srm_reserve_wqe_blocking(struct mlx5_qp *qp,
 	}
 }
 
-static inline void srm_publish_wqe(struct mlx5_qp *qp, uint64_t slot)
+static inline void srm_mark_wqe_ready(struct mlx5_qp *qp, uint64_t slot)
 {
-	uint64_t pub;
-	uint64_t new_pub;
 	uint32_t mask = qp->sq_ready_depth - 1;
 
 	__atomic_store_n(&qp->sq_ready_seq[slot & mask], slot + 1,
 			 __ATOMIC_RELEASE);
-
-	pub = __atomic_load_n(&qp->sq_ctrl->pub_idx, __ATOMIC_ACQUIRE);
-
-	for (;;) {
-		new_pub = pub;
-
-		while (__atomic_load_n(&qp->sq_ready_seq[new_pub & mask],
-				       __ATOMIC_ACQUIRE) == new_pub + 1)
-			new_pub++;
-
-		if (new_pub == pub)
-			return;
-
-		if (__atomic_compare_exchange_n(&qp->sq_ctrl->pub_idx, &pub,
-						new_pub, false,
-						__ATOMIC_RELEASE,
-						__ATOMIC_ACQUIRE))
-			pub = new_pub;
-	}
 }
 
 //dosen't write bf reg
@@ -1135,7 +1215,14 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	bool xrc_wqe;
 
 	uint64_t wr_id;
+	int phase_stats =
+		qp->hollow_rc && qp->sender_side && srm_stats_is_enabled();
+	uint64_t phase_start = phase_stats ? rdtsc() : 0;
+	uint64_t build_start = 0;
+	uint64_t publish_start = 0;
 	mlx5_spin_lock(&qp->sq.lock);
+	if (phase_stats)
+		srm_reserve_stats.lock_cycles += rdtsc() - phase_start;
 
 	next_fence = qp->fm_cache;
 	if (unlikely(qp->hollow_rc &&
@@ -1168,6 +1255,8 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			qp->sq.cur_post = slot;
 			qp->sq.tail = cons;
 		}
+		if (phase_stats)
+			build_start = rdtsc();
 		wr_id = wr->wr_id;//for debug
 		if (unlikely(wr->opcode < 0 ||
 		    wr->opcode >= sizeof mlx5_ib_opcode / sizeof mlx5_ib_opcode[0])) {
@@ -1497,6 +1586,11 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		if (unlikely(qp->wq_sig))
 			ctrl->signature = wq_sig(ctrl);
 
+		if (phase_stats) {
+			publish_start = rdtsc();
+			srm_reserve_stats.build_cycles +=
+				publish_start - build_start;
+		}
 		qp->sq.wrid[idx] = wr->wr_id;
 		if (qp->sender_side && qp->sq_ctrl)
 			qp->sq.wqe_head[idx] = slot;
@@ -1510,12 +1604,12 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 							 [slot & (qp->sq_usr_rc_depth - 1)],
 							 qp->usr_rc_cnt,
 							 __ATOMIC_RELAXED);
-				srm_publish_wqe(qp, slot);
-			} else {
-				__atomic_fetch_add(&qp->sq_ctrl->pub_idx, 1,
-						   __ATOMIC_RELEASE);
+				srm_mark_wqe_ready(qp, slot);
+				}
 			}
-		}
+		if (phase_stats)
+			srm_reserve_stats.publish_cycles +=
+				rdtsc() - publish_start;
 
 		if (ibqp->qp_type == IBV_QPT_RC) {
 			uint64_t ctrl_wr_id = *(__be64 *)ctrl;
@@ -1547,7 +1641,14 @@ out:
 	}
 	//st_wr->wr_id = rdtsc();
 
+	if (phase_stats)
+		phase_start = rdtsc();
 	mlx5_spin_unlock(&qp->sq.lock);
+	if (phase_stats) {
+		srm_reserve_stats.unlock_cycles += rdtsc() - phase_start;
+		srm_reserve_stats.phase_calls += nreq;
+		srm_maybe_report_reserve_stats();
+	}
 
 	return err;
 }
