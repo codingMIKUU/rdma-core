@@ -308,6 +308,7 @@ struct mlx5_reserved_qpns {
 };
 
 struct mlx5_dv_context_ops;
+struct mlx5_srm_mapping_bundle;
 
 #define MLX5_DMA_MMO_MAX_SIZE	(1ULL << 31)
 struct mlx5_dma_mmo_caps {
@@ -332,6 +333,10 @@ struct mlx5_context {
 		int			refcnt;
 	}				qp_table[MLX5_QP_TABLE_SIZE];
 	pthread_mutex_t			qp_table_mutex;
+	pthread_mutex_t			srm_mapping_mutex;
+	void				*srm_ctrl_map;
+	size_t				srm_ctrl_map_len;
+	struct mlx5_srm_mapping_bundle	*srm_mapping_bundles;
 
 	struct {
 		struct mlx5_srq	      **table;
@@ -472,13 +477,33 @@ struct mlx5_pd {
 struct mlx5_sq_ctrl_page {
 	uint64_t resv_idx;
 	uint8_t resv_pad[56];
-	uint64_t pub_idx;
-	uint8_t pub_pad[56];
 	uint64_t cons_idx;
 	uint8_t cons_pad[56];
-	uint64_t wqe_cnt;
-	uint8_t wqe_cnt_pad[56];
 } __attribute__((aligned(64)));
+_Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 128,
+	       "hollow RC ctrl ABI must occupy two cachelines");
+
+#define MLX5_SRM_PUBLISH_USR_BITS 16
+#define MLX5_SRM_PUBLISH_USR_MASK ((1ULL << MLX5_SRM_PUBLISH_USR_BITS) - 1)
+#define MLX5_SRM_PUBLISH_SEQ_MASK ((1ULL << 48) - 1)
+
+static inline uint64_t mlx5_srm_publish_token(uint64_t slot, uint16_t usr_rc)
+{
+	return (((slot + 1) & MLX5_SRM_PUBLISH_SEQ_MASK) <<
+		MLX5_SRM_PUBLISH_USR_BITS) | usr_rc;
+}
+
+struct mlx5_srm_mapping_bundle {
+	struct mlx5_srm_mapping_bundle *next;
+	uint32_t kernel_qpn;
+	uint32_t slot_idx;
+	uint32_t refs;
+	uint32_t publish_depth;
+	void *sq_map;
+	size_t sq_map_len;
+	uint64_t *publish_map;
+	size_t publish_map_len;
+};
 
 struct mlx5_parent_domain {
 	struct mlx5_pd mpd;
@@ -713,20 +738,13 @@ struct mlx5_qp {
 	uint8_t				fm_cache;
 	uint8_t	                        sq_signal_bits;
 	void				*sq_start;
-	void			*sq_mmap_buf;
-	size_t			sq_mmap_len;
-	void			*sq_ctrl_mmap_buf;
-	size_t			sq_ctrl_mmap_len;
+	void				*sq_mmap_buf;
+	size_t				sq_mmap_len;
+	struct mlx5_srm_mapping_bundle *srm_mapping;
 	struct mlx5_sq_ctrl_page	*sq_ctrl;
 	uint32_t		sq_ctrl_slot_idx;
-	uint64_t		*sq_ready_seq;
-	void			*sq_ready_mmap_buf;
-	size_t			sq_ready_mmap_len;
-	uint32_t		sq_ready_depth;
-	uint32_t		*sq_usr_rc_cnt;
-	void			*sq_usr_rc_mmap_buf;
-	size_t			sq_usr_rc_mmap_len;
-	uint32_t		sq_usr_rc_depth;
+	uint64_t		*sq_publish_token;
+	uint32_t		sq_publish_depth;
 	uint32_t		sq_metadata_cnt;
 	struct mlx5_wq                  sq;
 
@@ -1393,6 +1411,7 @@ int mlx5_qp_fill_wr_pfns(struct mlx5_qp *mqp,
 			 const struct ibv_qp_init_attr_ex *attr,
 			 const struct mlx5dv_qp_init_attr *mlx5_attr);
 void mlx5_srm_release_tables(struct mlx5_context *ctx);
+void mlx5_srm_release_mappings(struct mlx5_context *ctx);
 void clean_dyn_uars(struct ibv_context *context);
 void mlx5_set_singleton_nc_uar(struct ibv_context *context);
 

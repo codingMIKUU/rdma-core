@@ -67,6 +67,9 @@
 
 int mlx5_single_threaded = 0;
 
+static void mlx5_srm_release_mapping(struct mlx5_context *ctx,
+				     struct mlx5_qp *qp);
+
 static inline int is_xrc_tgt(int type)
 {
 	return type == IBV_QPT_XRC_RECV;
@@ -3051,7 +3054,8 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 		qp->bf = bf;
 	else
 		map_uuar(context, qp, resp_drv->bfreg_index, bf);
-	if (resp_drv->comp_mask & MLX5_IB_CREATE_QP_RESP_MASK_SQ_MMAP) {
+	if ((resp_drv->comp_mask & MLX5_IB_CREATE_QP_RESP_MASK_SQ_MMAP) &&
+	    !qp->hollow_rc) {
 		void *sq_map;
 
 		if (!resp_drv->sq_mmap_len) {
@@ -3264,33 +3268,15 @@ int mlx5_destroy_qp(struct ibv_qp *ibqp)
 			mlx5_free_qp_buf(ctx, qp);
 	}
 free:
-	if (qp->sq_mmap_buf) {
+	if (qp->srm_mapping) {
+		mlx5_srm_release_mapping(ctx, qp);
+	} else if (qp->sq_mmap_buf) {
 		munmap(qp->sq_mmap_buf, qp->sq_mmap_len);
 		qp->sq_mmap_buf = NULL;
 		qp->sq_mmap_len = 0;
 	}
-	if (qp->sq_ctrl_mmap_buf) {
-		munmap(qp->sq_ctrl_mmap_buf, qp->sq_ctrl_mmap_len);
-		qp->sq_ctrl_mmap_buf = NULL;
-		qp->sq_ctrl_mmap_len = 0;
-		qp->sq_ctrl = NULL;
-	}
-		if (qp->sq_ready_mmap_buf) {
-			munmap(qp->sq_ready_mmap_buf, qp->sq_ready_mmap_len);
-			qp->sq_ready_mmap_buf = NULL;
-			qp->sq_ready_mmap_len = 0;
-			qp->sq_ready_seq = NULL;
-			qp->sq_ready_depth = 0;
-		}
-		if (qp->sq_usr_rc_mmap_buf) {
-			munmap(qp->sq_usr_rc_mmap_buf, qp->sq_usr_rc_mmap_len);
-			qp->sq_usr_rc_mmap_buf = NULL;
-			qp->sq_usr_rc_mmap_len = 0;
-			qp->sq_usr_rc_cnt = NULL;
-			qp->sq_usr_rc_depth = 0;
-		}
-		if (mparent_domain)
-			atomic_fetch_sub(&mparent_domain->mpd.refcount, 1);
+	if (mparent_domain)
+		atomic_fetch_sub(&mparent_domain->mpd.refcount, 1);
 
 	mlx5_put_qp_uar(ctx, qp->bf);
 	free(qp);
@@ -3454,6 +3440,176 @@ static int qp_enable_mmo(struct ibv_qp *qp)
 	return ret ? mlx5_get_cmd_status_err(ret, out) : 0;
 }
 
+static void mlx5_srm_release_mapping(struct mlx5_context *ctx,
+				     struct mlx5_qp *qp)
+{
+	struct mlx5_srm_mapping_bundle **link;
+	struct mlx5_srm_mapping_bundle *bundle = qp->srm_mapping;
+
+	if (!bundle)
+		return;
+
+	pthread_mutex_lock(&ctx->srm_mapping_mutex);
+	if (--bundle->refs == 0) {
+		for (link = &ctx->srm_mapping_bundles; *link;
+		     link = &(*link)->next) {
+			if (*link == bundle) {
+				*link = bundle->next;
+				break;
+			}
+		}
+		munmap(bundle->sq_map, bundle->sq_map_len);
+		munmap(bundle->publish_map, bundle->publish_map_len);
+		free(bundle);
+	}
+	pthread_mutex_unlock(&ctx->srm_mapping_mutex);
+
+	qp->srm_mapping = NULL;
+	qp->sq_mmap_buf = NULL;
+	qp->sq_mmap_len = 0;
+	qp->sq_start = NULL;
+	qp->sq.qend = NULL;
+	qp->sq_ctrl = NULL;
+	qp->sq_publish_token = NULL;
+	qp->sq_publish_depth = 0;
+}
+
+void mlx5_srm_release_mappings(struct mlx5_context *ctx)
+{
+	struct mlx5_srm_mapping_bundle *bundle;
+
+	pthread_mutex_lock(&ctx->srm_mapping_mutex);
+	while ((bundle = ctx->srm_mapping_bundles)) {
+		ctx->srm_mapping_bundles = bundle->next;
+		munmap(bundle->sq_map, bundle->sq_map_len);
+		munmap(bundle->publish_map, bundle->publish_map_len);
+		free(bundle);
+	}
+	if (ctx->srm_ctrl_map) {
+		munmap(ctx->srm_ctrl_map, ctx->srm_ctrl_map_len);
+		ctx->srm_ctrl_map = NULL;
+		ctx->srm_ctrl_map_len = 0;
+	}
+	pthread_mutex_unlock(&ctx->srm_mapping_mutex);
+}
+
+static int mlx5_srm_acquire_mapping(struct mlx5_context *ctx,
+				    struct mlx5_qp *qp,
+				    const struct mlx5_ib_modify_qp_resp *resp)
+{
+	struct mlx5_srm_mapping_bundle *bundle;
+	struct mlx5_sq_ctrl_page *ctrl_base;
+	size_t kernel_sq_bytes;
+	size_t publish_bytes;
+	void *sq_map = MAP_FAILED;
+	void *publish_map = MAP_FAILED;
+
+	if (!resp->kernel_qpn || !resp->kernel_sq_wqe_cnt ||
+	    !resp->sq_mmap_len || !resp->sq_state_mmap_len ||
+	    !resp->publish_mmap_len || !resp->publish_depth ||
+	    (resp->publish_depth & (resp->publish_depth - 1)) ||
+	    resp->kernel_sq_wqe_shift >= 8U * sizeof(size_t) ||
+	    resp->kernel_sq_wqe_cnt > (SIZE_MAX >> resp->kernel_sq_wqe_shift)) {
+		errno = EINVAL;
+		return errno;
+	}
+
+	kernel_sq_bytes = (size_t)resp->kernel_sq_wqe_cnt <<
+			  resp->kernel_sq_wqe_shift;
+	publish_bytes = (size_t)resp->publish_depth * sizeof(uint64_t);
+	if (kernel_sq_bytes > resp->sq_mmap_len ||
+	    publish_bytes > resp->publish_mmap_len ||
+	    resp->sq_state_slot_idx >=
+		resp->sq_state_mmap_len / sizeof(*ctrl_base)) {
+		errno = EINVAL;
+		return errno;
+	}
+
+	pthread_mutex_lock(&ctx->srm_mapping_mutex);
+	for (bundle = ctx->srm_mapping_bundles; bundle;
+	     bundle = bundle->next) {
+		if (bundle->kernel_qpn == resp->kernel_qpn &&
+		    bundle->slot_idx == resp->sq_state_slot_idx)
+			break;
+	}
+
+	if (bundle) {
+		if (bundle->sq_map_len != resp->sq_mmap_len ||
+		    bundle->publish_map_len != resp->publish_mmap_len ||
+		    bundle->publish_depth != resp->publish_depth) {
+			errno = EPROTO;
+			goto err_unlock;
+		}
+		bundle->refs++;
+		goto attach;
+	}
+
+	if (!ctx->srm_ctrl_map) {
+		ctx->srm_ctrl_map = mmap(NULL, resp->sq_state_mmap_len,
+					 PROT_READ | PROT_WRITE, MAP_SHARED,
+					 ctx->ibv_ctx.context.cmd_fd,
+					 resp->sq_state_mmap_offset);
+		if (ctx->srm_ctrl_map == MAP_FAILED) {
+			ctx->srm_ctrl_map = NULL;
+			goto err_unlock;
+		}
+		ctx->srm_ctrl_map_len = resp->sq_state_mmap_len;
+	} else if (ctx->srm_ctrl_map_len != resp->sq_state_mmap_len) {
+		errno = EPROTO;
+		goto err_unlock;
+	}
+
+	sq_map = mmap(NULL, resp->sq_mmap_len, PROT_READ | PROT_WRITE,
+		      MAP_SHARED, ctx->ibv_ctx.context.cmd_fd,
+		      resp->sq_mmap_offset);
+	if (sq_map == MAP_FAILED)
+		goto err_unlock;
+
+	publish_map = mmap(NULL, resp->publish_mmap_len,
+			   PROT_READ | PROT_WRITE, MAP_SHARED,
+			   ctx->ibv_ctx.context.cmd_fd,
+			   resp->publish_mmap_offset);
+	if (publish_map == MAP_FAILED)
+		goto err_sq;
+
+	bundle = calloc(1, sizeof(*bundle));
+	if (!bundle)
+		goto err_publish;
+
+	bundle->kernel_qpn = resp->kernel_qpn;
+	bundle->slot_idx = resp->sq_state_slot_idx;
+	bundle->refs = 1;
+	bundle->publish_depth = resp->publish_depth;
+	bundle->sq_map = sq_map;
+	bundle->sq_map_len = resp->sq_mmap_len;
+	bundle->publish_map = publish_map;
+	bundle->publish_map_len = resp->publish_mmap_len;
+	bundle->next = ctx->srm_mapping_bundles;
+	ctx->srm_mapping_bundles = bundle;
+
+attach:
+	ctrl_base = ctx->srm_ctrl_map;
+	qp->srm_mapping = bundle;
+	qp->sq_ctrl_slot_idx = bundle->slot_idx;
+	qp->sq_ctrl = &ctrl_base[bundle->slot_idx];
+	qp->sq_mmap_buf = bundle->sq_map;
+	qp->sq_mmap_len = bundle->sq_map_len;
+	qp->sq_start = bundle->sq_map;
+	qp->sq.qend = qp->sq_start + kernel_sq_bytes;
+	qp->sq_publish_token = bundle->publish_map;
+	qp->sq_publish_depth = bundle->publish_depth;
+	pthread_mutex_unlock(&ctx->srm_mapping_mutex);
+	return 0;
+
+err_publish:
+	munmap(publish_map, resp->publish_mmap_len);
+err_sq:
+	munmap(sq_map, resp->sq_mmap_len);
+err_unlock:
+	pthread_mutex_unlock(&ctx->srm_mapping_mutex);
+	return errno;
+}
+
 int __mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 		   int attr_mask)
 {
@@ -3523,143 +3679,31 @@ int __mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 		mqp->get_ece = resp.ece_options;
 	}
 
-	if (!ret && (resp.drv_payload.comp_mask & MLX5_IB_MODIFY_QP_RESP_MASK_SQ_MMAP)) {
-		void *sq_map;
+	if (!ret && mqp->hollow_rc) {
+		uint32_t mapping_mask =
+			MLX5_IB_MODIFY_QP_RESP_MASK_SQ_MMAP |
+			MLX5_IB_MODIFY_QP_RESP_MASK_SQ_STATE_MMAP |
+			MLX5_IB_MODIFY_QP_RESP_MASK_PUBLISH_MMAP |
+			MLX5_IB_MODIFY_QP_RESP_MASK_KERNEL_QP_INFO;
 
-		if (!resp.drv_payload.sq_mmap_len) {
-			errno = EINVAL;
+		if ((resp.drv_payload.comp_mask & mapping_mask) &&
+		    (resp.drv_payload.comp_mask & mapping_mask) != mapping_mask) {
+			errno = EPROTO;
 			return errno;
 		}
-
-		if (!mqp->sq_mmap_buf) {
-			sq_map = mmap(NULL, resp.drv_payload.sq_mmap_len,
-				      PROT_READ | PROT_WRITE, MAP_SHARED,
-				      context->ibv_ctx.context.cmd_fd,
-				      resp.drv_payload.sq_mmap_offset);
-			if (sq_map == MAP_FAILED)
-				return errno;
-
-			mqp->sq_mmap_buf = sq_map;
-			mqp->sq_mmap_len = resp.drv_payload.sq_mmap_len;
-		}
-
-		mqp->sq_start = mqp->sq_mmap_buf;
-		mqp->sq.qend = mqp->sq_start +
-			(mqp->sq.wqe_cnt << mqp->sq.wqe_shift);
+		if ((resp.drv_payload.comp_mask & mapping_mask) &&
+		    !mqp->srm_mapping &&
+		    mlx5_srm_acquire_mapping(context, mqp, &resp.drv_payload))
+			return errno;
 	}
 
-	if (!ret && (resp.drv_payload.comp_mask & MLX5_IB_MODIFY_QP_RESP_MASK_SQ_STATE_MMAP)) {
-		void *ctrl_map;
-		struct mlx5_sq_ctrl_page *ctrl_base;
-		size_t slot_offset;
-
-		if (!resp.drv_payload.sq_state_mmap_len) {
-			errno = EINVAL;
-			return errno;
-		}
-		if (!mqp->sq_ctrl_mmap_buf) {
-			ctrl_map = mmap(NULL, resp.drv_payload.sq_state_mmap_len,
-					PROT_READ | PROT_WRITE, MAP_SHARED,
-					context->ibv_ctx.context.cmd_fd,
-					resp.drv_payload.sq_state_mmap_offset);
-			if (ctrl_map == MAP_FAILED)
-				return errno;
-
-			mqp->sq_ctrl_mmap_buf = ctrl_map;
-			mqp->sq_ctrl_mmap_len = resp.drv_payload.sq_state_mmap_len;
-		}
-
-		if (resp.drv_payload.sq_state_slot_idx >=
-		    mqp->sq_ctrl_mmap_len / sizeof(*ctrl_base)) {
-			errno = EINVAL;
-			return errno;
-		}
-
-		ctrl_base = mqp->sq_ctrl_mmap_buf;
-		slot_offset = (size_t)resp.drv_payload.sq_state_slot_idx *
-			      sizeof(*ctrl_base);
-		mqp->sq_ctrl_slot_idx = resp.drv_payload.sq_state_slot_idx;
-		mqp->sq_ctrl = (struct mlx5_sq_ctrl_page *)
-			((char *)ctrl_base + slot_offset);
-		mqp->sq_ctrl->wqe_cnt = mqp->sq.wqe_cnt;
-	}
-
-	if (!ret && (resp.drv_payload.comp_mask & MLX5_IB_MODIFY_QP_RESP_MASK_READY_MMAP)) {
-		void *ready_map;
-		size_t ready_bytes;
-
-		if (!resp.drv_payload.ready_mmap_len ||
-		    !resp.drv_payload.ready_depth ||
-		    (resp.drv_payload.ready_depth &
-		     (resp.drv_payload.ready_depth - 1))) {
-			errno = EINVAL;
-			return errno;
-		}
-
-		ready_bytes = (size_t)resp.drv_payload.ready_depth *
-			      sizeof(*mqp->sq_ready_seq);
-		if (ready_bytes > resp.drv_payload.ready_mmap_len) {
-			errno = EINVAL;
-			return errno;
-		}
-
-		if (!mqp->sq_ready_mmap_buf) {
-			ready_map = mmap(NULL, resp.drv_payload.ready_mmap_len,
-					 PROT_READ | PROT_WRITE, MAP_SHARED,
-					 context->ibv_ctx.context.cmd_fd,
-					 resp.drv_payload.ready_mmap_offset);
-			if (ready_map == MAP_FAILED)
-				return errno;
-
-			mqp->sq_ready_mmap_buf = ready_map;
-			mqp->sq_ready_mmap_len = resp.drv_payload.ready_mmap_len;
-		}
-
-		mqp->sq_ready_seq = mqp->sq_ready_mmap_buf;
-		mqp->sq_ready_depth = resp.drv_payload.ready_depth;
-	}
-
-	if (!ret && (resp.drv_payload.comp_mask & MLX5_IB_MODIFY_QP_RESP_MASK_USR_RC_MMAP)) {
-		void *usr_rc_map;
-		size_t usr_rc_bytes;
-
-		if (!resp.drv_payload.usr_rc_mmap_len ||
-		    !resp.drv_payload.usr_rc_depth ||
-		    (resp.drv_payload.usr_rc_depth &
-		     (resp.drv_payload.usr_rc_depth - 1))) {
-			errno = EINVAL;
-			return errno;
-		}
-
-		usr_rc_bytes = (size_t)resp.drv_payload.usr_rc_depth *
-			       sizeof(*mqp->sq_usr_rc_cnt);
-		if (usr_rc_bytes > resp.drv_payload.usr_rc_mmap_len) {
-			errno = EINVAL;
-			return errno;
-		}
-
-		if (!mqp->sq_usr_rc_mmap_buf) {
-			usr_rc_map = mmap(NULL, resp.drv_payload.usr_rc_mmap_len,
-					  PROT_READ | PROT_WRITE, MAP_SHARED,
-					  context->ibv_ctx.context.cmd_fd,
-					  resp.drv_payload.usr_rc_mmap_offset);
-			if (usr_rc_map == MAP_FAILED)
-				return errno;
-
-			mqp->sq_usr_rc_mmap_buf = usr_rc_map;
-			mqp->sq_usr_rc_mmap_len = resp.drv_payload.usr_rc_mmap_len;
-		}
-
-		mqp->sq_usr_rc_cnt = mqp->sq_usr_rc_mmap_buf;
-		mqp->sq_usr_rc_depth = resp.drv_payload.usr_rc_depth;
-	}
-
-	if (!ret && (resp.drv_payload.comp_mask & MLX5_IB_MODIFY_QP_RESP_MASK_KERNEL_QP_INFO)) {
+	if (!ret && (resp.drv_payload.comp_mask &
+		     MLX5_IB_MODIFY_QP_RESP_MASK_KERNEL_QP_INFO)) {
 		size_t kernel_sq_bytes = 0;
 		uint32_t wqe_shift = resp.drv_payload.kernel_sq_wqe_shift;
 		uint32_t wqe_cnt = resp.drv_payload.kernel_sq_wqe_cnt;
 
-		if (!mqp->sq_mmap_buf || !mqp->sq_mmap_len) {
+		if (!mqp->sq_start || !mqp->sq_mmap_len) {
 			errno = EINVAL;
 			return errno;
 		}
@@ -3690,8 +3734,6 @@ int __mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 		mqp->max_inline_data = resp.drv_payload.kernel_max_inline_data;
 		if (mqp->sq_start)
 			mqp->sq.qend = mqp->sq_start + kernel_sq_bytes;
-		if (mqp->sq_ctrl)
-			mqp->sq_ctrl->wqe_cnt = mqp->sq.wqe_cnt;
 	}
 
 	if (!ret		       &&

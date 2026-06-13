@@ -2536,6 +2536,7 @@ static int mlx5_set_context(struct mlx5_context *context,
 		context->eth_min_inline_size = MLX5_ETH_L2_INLINE_HEADER_SIZE;
 
 	pthread_mutex_init(&context->qp_table_mutex, NULL);
+	pthread_mutex_init(&context->srm_mapping_mutex, NULL);
 	pthread_mutex_init(&context->srq_table_mutex, NULL);
 	pthread_mutex_init(&context->uidx_table_mutex, NULL);
 	pthread_mutex_init(&context->mkey_table_mutex, NULL);
@@ -2770,6 +2771,7 @@ static void mlx5_free_context(struct ibv_context *ibctx)
 	int i;
 
 	mlx5_srm_release_tables(context);
+	mlx5_srm_release_mappings(context);
 
 	free(context->bfs);
 	for (i = 0; i < MLX5_MAX_UARS; ++i) {
