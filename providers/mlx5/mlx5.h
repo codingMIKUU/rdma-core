@@ -1422,8 +1422,6 @@ struct mlx5_psv *mlx5_create_psv(struct ibv_pd *pd);
 int mlx5_destroy_psv(struct mlx5_psv *psv);
 
 void *mlx5_find_uidx(struct mlx5_context *ctx, uint32_t uidx);
-void *mlx5_find_uidx_locked(struct mlx5_context *ctx, uint32_t uidx);
-void mlx5_uidx_unlock(struct mlx5_context *ctx);
 
 static inline int mlx5_spin_lock(struct mlx5_spinlock *lock)
 {

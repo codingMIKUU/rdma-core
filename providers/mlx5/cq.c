@@ -413,22 +413,17 @@ static void mlx5_get_cycles(uint64_t *cycles)
 static inline struct mlx5_qp *get_req_context(struct mlx5_context *mctx,
 					      struct mlx5_resource **cur_rsc,
 					      struct mlx5_cqe64 *cqe64,
-					      uint32_t rsn, int cqe_ver,
-					      bool *uidx_locked)
+					      uint32_t rsn, int cqe_ver)
 					      ALWAYS_INLINE;
 static inline struct mlx5_qp *get_req_context(struct mlx5_context *mctx,
 					      struct mlx5_resource **cur_rsc,
 					      struct mlx5_cqe64 *cqe64,
-					      uint32_t rsn, int cqe_ver,
-					      bool *uidx_locked)
+					      uint32_t rsn, int cqe_ver)
 {
-	*uidx_locked = false;
-	if (cqe_ver) {
-		*cur_rsc = mlx5_find_uidx_locked(mctx, rsn);
-		*uidx_locked = true;
-	}
-	else if (!*cur_rsc || (rsn != (*cur_rsc)->rsn))
-		*cur_rsc = (struct mlx5_resource *)mlx5_find_qp(mctx, rsn);
+	if (!*cur_rsc || rsn != (*cur_rsc)->rsn)
+		*cur_rsc = cqe_ver ? mlx5_find_uidx(mctx, rsn) :
+				      (struct mlx5_resource *)mlx5_find_qp(mctx,
+									  rsn);
 
 	/* mlx5_qp is allocated by calloc(), which is max_align_t aligned. */
 	if (unlikely(!*cur_rsc || ((uintptr_t)*cur_rsc & 0xf))) {
@@ -440,10 +435,6 @@ static inline struct mlx5_qp *get_req_context(struct mlx5_context *mctx,
 			be16toh(cqe64->wqe_counter),
 			mlx5dv_get_cqe_opcode(cqe64));
 		*cur_rsc = NULL;
-		if (*uidx_locked) {
-			mlx5_uidx_unlock(mctx);
-			*uidx_locked = false;
-		}
 		return NULL;
 	}
 
@@ -453,10 +444,6 @@ static inline struct mlx5_qp *get_req_context(struct mlx5_context *mctx,
 			"mlx5: invalid request CQE resource: cqe_ver=%d rsn=%u rsc=%p\n",
 			cqe_ver, rsn, (void *)*cur_rsc);
 		*cur_rsc = NULL;
-		if (*uidx_locked) {
-			mlx5_uidx_unlock(mctx);
-			*uidx_locked = false;
-		}
 		return NULL;
 	}
 
@@ -768,7 +755,6 @@ static inline int mlx5_parse_cqe(struct mlx5_cq *cq,
 	struct mlx5_qp *mqp;
 	struct mlx5_context *mctx;
 	uint8_t is_srq;
-	bool uidx_locked = false;
 
 again:
 	is_srq = 0;
@@ -792,7 +778,7 @@ again:
 		mqp = get_req_context(mctx, cur_rsc,
 				      cqe64,
 				      (cqe_ver ? (be32toh(cqe64->srqn_uidx) & 0xffffff) : qpn),
-				      cqe_ver, &uidx_locked);
+				      cqe_ver);
 		if (unlikely(!mqp))
 			return CQ_POLL_ERR;
 		wq = &mqp->sq;
@@ -805,8 +791,6 @@ again:
 				(void *)mqp, wq->wqe_cnt, (void *)wq->wrid,
 				(void *)wq->wqe_head, (void *)wq->wr_data);
 			*cur_rsc = NULL;
-			if (uidx_locked)
-				mlx5_uidx_unlock(mctx);
 			return CQ_POLL_ERR;
 		}
 		idx = wqe_ctr & (wq->wqe_cnt - 1);
@@ -858,8 +842,6 @@ again:
 		}
 
 		wq->tail = wq->wqe_head[idx] + 1;
-		if (uidx_locked)
-			mlx5_uidx_unlock(mctx);
 		break;
 	}
 	case MLX5_CQE_RESP_WR_IMM:
@@ -961,16 +943,14 @@ again:
 		if (opcode == MLX5_CQE_REQ_ERR) {
 			mqp = get_req_context(mctx, cur_rsc,
 					      cqe64,
-					      (cqe_ver ? srqn_uidx : qpn), cqe_ver,
-					      &uidx_locked);
+					      (cqe_ver ? srqn_uidx : qpn),
+					      cqe_ver);
 			if (unlikely(!mqp))
 				return CQ_POLL_ERR;
 			wq = &mqp->sq;
 			if (unlikely(!wq->wqe_cnt || !wq->wrid ||
 				     !wq->wqe_head)) {
 				*cur_rsc = NULL;
-				if (uidx_locked)
-					mlx5_uidx_unlock(mctx);
 				return CQ_POLL_ERR;
 			}
 			idx = wqe_ctr & (wq->wqe_cnt - 1);
@@ -979,8 +959,6 @@ again:
 			else
 				wc->wr_id = wq->wrid[idx];
 			wq->tail = wq->wqe_head[idx] + 1;
-			if (uidx_locked)
-				mlx5_uidx_unlock(mctx);
 		} else {
 			err = get_cur_rsc(mctx, cqe_ver, qpn, srqn_uidx,
 					  cur_rsc, cur_srq, &is_srq);

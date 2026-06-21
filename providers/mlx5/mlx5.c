@@ -315,11 +315,11 @@ void mlx5_clear_uidx(struct mlx5_context *ctx, uint32_t uidx)
 		return;
 	}
 
-	fprintf(stderr,
-		"mlx5: uidx clear uidx=%u rsc=%p table=%p refcnt=%d\n",
-		uidx, (void *)ctx->uidx_table[tind].table[entry],
-		(void *)ctx->uidx_table[tind].table,
-		ctx->uidx_table[tind].refcnt);
+	// fprintf(stderr,
+	// 	"mlx5: uidx clear uidx=%u rsc=%p table=%p refcnt=%d\n",
+	// 	uidx, (void *)ctx->uidx_table[tind].table[entry],
+	// 	(void *)ctx->uidx_table[tind].table,
+	// 	ctx->uidx_table[tind].refcnt);
 	ctx->uidx_table[tind].table[entry] = NULL;
 	if (!--ctx->uidx_table[tind].refcnt) {
 		free(ctx->uidx_table[tind].table);
@@ -329,36 +329,18 @@ void mlx5_clear_uidx(struct mlx5_context *ctx, uint32_t uidx)
 	pthread_mutex_unlock(&ctx->uidx_table_mutex);
 }
 
-void *mlx5_find_uidx_locked(struct mlx5_context *ctx, uint32_t uidx)
+void *mlx5_find_uidx(struct mlx5_context *ctx, uint32_t uidx)
 {
 	int tind = uidx >> MLX5_UIDX_TABLE_SHIFT;
-	void *rsc = NULL;
 
 	if (unlikely(tind >= MLX5_UIDX_TABLE_SIZE))
 		return NULL;
+	if (likely(ctx->uidx_table[tind].refcnt &&
+		   ctx->uidx_table[tind].table))
+		return ctx->uidx_table[tind].table[uidx &
+						  MLX5_UIDX_TABLE_MASK];
 
-	pthread_mutex_lock(&ctx->uidx_table_mutex);
-	if (ctx->uidx_table[tind].refcnt && ctx->uidx_table[tind].table)
-		rsc = ctx->uidx_table[tind].table[uidx &
-						 MLX5_UIDX_TABLE_MASK];
-
-	return rsc;
-}
-
-void mlx5_uidx_unlock(struct mlx5_context *ctx)
-{
-	pthread_mutex_unlock(&ctx->uidx_table_mutex);
-}
-
-void *mlx5_find_uidx(struct mlx5_context *ctx, uint32_t uidx)
-{
-	void *rsc = mlx5_find_uidx_locked(ctx, uidx);
-
-	if (likely((uidx >> MLX5_UIDX_TABLE_SHIFT) <
-		   MLX5_UIDX_TABLE_SIZE))
-		mlx5_uidx_unlock(ctx);
-
-	return rsc;
+	return NULL;
 }
 
 struct mlx5_mkey *mlx5_find_mkey(struct mlx5_context *ctx, uint32_t mkey)
