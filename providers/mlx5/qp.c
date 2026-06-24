@@ -1216,13 +1216,15 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	bool xrc_wqe;
 
 	uint64_t wr_id;
+	bool lock_sq = (qp->hollow_rc && qp->sender_side);
 	int phase_stats =
 		qp->hollow_rc && qp->sender_side && srm_stats_is_enabled();
 	uint64_t phase_start = phase_stats ? rdtsc() : 0;
 	uint64_t build_start = 0;
 	uint64_t publish_start = 0;
-	mlx5_spin_lock(&qp->sq.lock);
-	if (phase_stats)
+	if (lock_sq)
+		mlx5_spin_lock(&qp->sq.lock);
+	if (phase_stats && lock_sq)
 		srm_reserve_stats.lock_cycles += rdtsc() - phase_start;
 
 	next_fence = qp->fm_cache;
@@ -1233,7 +1235,8 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		      qp->sq_metadata_cnt < qp->sq.wqe_cnt))) {
 		if (bad_wr)
 			*bad_wr = wr;
-		mlx5_spin_unlock(&qp->sq.lock);
+		if (lock_sq)
+			mlx5_spin_unlock(&qp->sq.lock);
 		return EINVAL;
 	}
 	//uint64_t sq_rdmacore_addr=qp->sq_start;
@@ -1634,11 +1637,13 @@ out:
 	}
 	//st_wr->wr_id = rdtsc();
 
-	if (phase_stats)
+	if (phase_stats && lock_sq)
 		phase_start = rdtsc();
-	mlx5_spin_unlock(&qp->sq.lock);
+	if (lock_sq)
+		mlx5_spin_unlock(&qp->sq.lock);
 	if (phase_stats) {
-		srm_reserve_stats.unlock_cycles += rdtsc() - phase_start;
+		if (lock_sq)
+			srm_reserve_stats.unlock_cycles += rdtsc() - phase_start;
 		srm_reserve_stats.phase_calls += nreq;
 		srm_maybe_report_reserve_stats();
 	}
