@@ -1216,7 +1216,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	bool xrc_wqe;
 
 	uint64_t wr_id;
-	bool lock_sq = (qp->hollow_rc && qp->sender_side);
+	bool lock_sq = !(qp->hollow_rc && qp->sender_side);
 	int phase_stats =
 		qp->hollow_rc && qp->sender_side && srm_stats_is_enabled();
 	uint64_t phase_start = phase_stats ? rdtsc() : 0;
