@@ -85,9 +85,16 @@ struct srm_reserve_stats {
 	uint64_t timeouts;
 	uint64_t max_occupancy;
 	uint64_t phase_calls;
+	uint64_t total_cycles;
+	uint64_t pre_reserve_cycles;
 	uint64_t lock_cycles;
+	uint64_t post_reserve_cycles;
 	uint64_t build_cycles;
 	uint64_t publish_cycles;
+	uint64_t ready_token_cycles;
+	uint64_t ready_store_cycles;
+	uint64_t post_publish_cycles;
+	uint64_t cleanup_cycles;
 	uint64_t unlock_cycles;
 	uint64_t last_report_ns;
 };
@@ -113,6 +120,8 @@ static void srm_maybe_report_reserve_stats(void)
 {
 	struct srm_reserve_stats *stats = &srm_reserve_stats;
 	uint64_t now_ns;
+	uint64_t accounted_cycles;
+	uint64_t unaccounted_cycles;
 
 	if ((stats->calls & 0xffff) != 0)
 		return;
@@ -125,12 +134,29 @@ static void srm_maybe_report_reserve_stats(void)
 	if (now_ns - stats->last_report_ns < 1000000000ULL)
 		return;
 
+	accounted_cycles = stats->cycles +
+			   stats->pre_reserve_cycles +
+			   stats->lock_cycles +
+			   stats->post_reserve_cycles +
+			   stats->build_cycles +
+			   stats->publish_cycles +
+			   stats->post_publish_cycles +
+			   stats->cleanup_cycles +
+			   stats->unlock_cycles;
+	unaccounted_cycles = stats->total_cycles > accounted_cycles
+				 ? stats->total_cycles - accounted_cycles
+				 : 0;
+
 	fprintf(stderr,
 		"SRM_RDMA_STATS thread=%lu reserve_calls=%llu "
 		"reserve_avg_cycles=%.2f waited_pct=%.2f retries=%llu "
 		"timeouts=%llu max_occupancy=%llu phase_calls=%llu "
-		"lock_avg_cycles=%.2f build_avg_cycles=%.2f "
-		"publish_avg_cycles=%.2f unlock_avg_cycles=%.2f\n",
+		"total_avg_cycles=%.2f pre_reserve_avg_cycles=%.2f "
+		"lock_avg_cycles=%.2f post_reserve_avg_cycles=%.2f "
+		"build_avg_cycles=%.2f publish_avg_cycles=%.2f "
+		"ready_token_avg_cycles=%.2f ready_store_avg_cycles=%.2f "
+		"post_publish_avg_cycles=%.2f cleanup_avg_cycles=%.2f "
+		"unlock_avg_cycles=%.2f unaccounted_avg_cycles=%.2f\n",
 		(unsigned long)pthread_self(),
 		(unsigned long long)stats->calls,
 		stats->calls ? (double)stats->cycles / stats->calls : 0.0,
@@ -140,13 +166,30 @@ static void srm_maybe_report_reserve_stats(void)
 		(unsigned long long)stats->max_occupancy,
 		(unsigned long long)stats->phase_calls,
 		stats->phase_calls
+			? (double)stats->total_cycles / stats->phase_calls : 0.0,
+		stats->phase_calls
+			? (double)stats->pre_reserve_cycles / stats->phase_calls : 0.0,
+		stats->phase_calls
 			? (double)stats->lock_cycles / stats->phase_calls : 0.0,
+		stats->phase_calls
+			? (double)stats->post_reserve_cycles / stats->phase_calls : 0.0,
 		stats->phase_calls
 			? (double)stats->build_cycles / stats->phase_calls : 0.0,
 		stats->phase_calls
 			? (double)stats->publish_cycles / stats->phase_calls : 0.0,
 		stats->phase_calls
-			? (double)stats->unlock_cycles / stats->phase_calls : 0.0);
+			? (double)stats->ready_token_cycles / stats->phase_calls : 0.0,
+		stats->phase_calls
+			? (double)stats->ready_store_cycles / stats->phase_calls : 0.0,
+		stats->phase_calls
+			? (double)stats->post_publish_cycles / stats->phase_calls : 0.0,
+		stats->phase_calls
+			? (double)stats->cleanup_cycles / stats->phase_calls : 0.0,
+		stats->phase_calls
+			? (double)stats->unlock_cycles / stats->phase_calls : 0.0,
+		stats->phase_calls
+			? (double)unaccounted_cycles / stats->phase_calls
+			: 0.0);
 
 	memset(stats, 0, sizeof(*stats));
 	stats->last_report_ns = now_ns;
@@ -1115,13 +1158,30 @@ static inline int srm_reserve_wqe_blocking(struct mlx5_qp *qp,
 	}
 }
 
-static inline void srm_mark_wqe_ready(struct mlx5_qp *qp, uint64_t slot)
+static inline void srm_mark_wqe_ready(struct mlx5_qp *qp, uint64_t slot,
+				      int phase_stats)
 {
-	uint32_t mask = qp->sq_publish_depth - 1;
-	uint64_t token = mlx5_srm_publish_token(slot, qp->usr_rc_cnt);
+	uint32_t mask;
+	uint64_t token;
+	uint64_t start = 0;
+	uint64_t before_store = 0;
+
+	if (phase_stats)
+		start = rdtsc();
+
+	mask = qp->sq_publish_depth - 1;
+	token = mlx5_srm_publish_token(slot, qp->usr_rc_cnt);
+
+	if (phase_stats) {
+		before_store = rdtsc();
+		srm_reserve_stats.ready_token_cycles += before_store - start;
+	}
 
 	__atomic_store_n(&qp->sq_publish_token[slot & mask], token,
 			 __ATOMIC_RELEASE);
+
+	if (phase_stats)
+		srm_reserve_stats.ready_store_cycles += rdtsc() - before_store;
 }
 
 //dosen't write bf reg
@@ -1204,35 +1264,42 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	int i;
 	unsigned idx;
 	uint8_t opmod = 0;
-	struct mlx5_bf *bf = qp->bf;
-	void *qend = qp->sq.qend;
+	struct mlx5_bf *bf;
+	void *qend;
 	uint32_t mlx5_opcode;
 	struct mlx5_wqe_xrc_seg *xrc;
 	uint8_t fence;
 	uint8_t next_fence;
 	uint32_t max_tso = 0;
-	FILE *fp = to_mctx(ibqp->context)->dbg_fp; /* The compiler ignores in non-debug mode */
+	FILE *fp; /* The compiler ignores in non-debug mode */
 	uint32_t imm;
 	bool xrc_wqe;
 
 	uint64_t wr_id;
-	bool lock_sq = !(qp->hollow_rc && qp->sender_side);
+	bool srm_fast = qp->srm_fast_ready;
+	bool lock_sq = !srm_fast;
 	int phase_stats =
 		qp->hollow_rc && qp->sender_side && srm_stats_is_enabled();
 	uint64_t phase_start = phase_stats ? rdtsc() : 0;
 	uint64_t build_start = 0;
 	uint64_t publish_start = 0;
+	uint64_t total_start = phase_start;
+	uint64_t iter_start = phase_start;
+	uint64_t reserve_start = 0;
+	uint64_t reserve_done = 0;
+	uint64_t post_publish_start = 0;
+	uint64_t cleanup_start = 0;
+	uint64_t cleanup_done = 0;
+	bf = qp->bf;
+	qend = qp->sq.qend;
+	fp = to_mctx(ibqp->context)->dbg_fp;
 	if (lock_sq)
 		mlx5_spin_lock(&qp->sq.lock);
 	if (phase_stats && lock_sq)
 		srm_reserve_stats.lock_cycles += rdtsc() - phase_start;
 
 	next_fence = qp->fm_cache;
-	if (unlikely(qp->hollow_rc &&
-		     (!qp->sq_start || !qp->sq_ctrl || !qp->sq_publish_token ||
-		      !qp->sq_publish_depth ||
-		      !qp->sq.wrid || !qp->sq.wqe_head || !qp->sq.wr_data ||
-		      qp->sq_metadata_cnt < qp->sq.wqe_cnt))) {
+	if (unlikely(qp->hollow_rc && qp->sender_side && !srm_fast)) {
 		if (bad_wr)
 			*bad_wr = wr;
 		if (lock_sq)
@@ -1250,16 +1317,28 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		uint64_t cons = 0;
 
 		if (qp->sender_side && qp->sq_ctrl) {
+			if (phase_stats) {
+				reserve_start = rdtsc();
+				srm_reserve_stats.pre_reserve_cycles +=
+					reserve_start - iter_start;
+			}
 			err = srm_reserve_wqe_blocking(qp, &slot, &cons);
 			if (err) {
 				if (bad_wr)
 					*bad_wr = wr;
 				goto out;
 			}
+			if (phase_stats)
+				reserve_done = rdtsc();
 			qp->sq.cur_post = slot;
 			qp->sq.tail = cons;
+			if (phase_stats) {
+				build_start = rdtsc();
+				srm_reserve_stats.post_reserve_cycles +=
+					build_start - reserve_done;
+			}
 		}
-		if (phase_stats)
+		if (phase_stats && !(qp->sender_side && qp->sq_ctrl))
 			build_start = rdtsc();
 		wr_id = wr->wr_id;//for debug
 		if (unlikely(wr->opcode < 0 ||
@@ -1323,7 +1402,8 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 
 		seg += sizeof *ctrl;
 		size = sizeof *ctrl / 16;
-		qp->sq.wr_data[idx] = 0;
+		if (!srm_fast)
+			qp->sq.wr_data[idx] = 0;
 
 		xrc_wqe = ibqp->qp_type == IBV_QPT_SRM ||
 			  ibqp->qp_type == IBV_QPT_XRC_SEND ||
@@ -1596,16 +1676,19 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 				publish_start - build_start;
 		}
 		qp->sq.wrid[idx] = wr->wr_id;
-		if (qp->sender_side && qp->sq_ctrl)
-			qp->sq.wqe_head[idx] = slot;
+		if (srm_fast)
+			;
 		else
 			qp->sq.wqe_head[idx] = qp->sq.head + nreq;
 		qp->sq.cur_post += DIV_ROUND_UP(size * 16, MLX5_SEND_WQE_BB);
-		if (qp->sender_side && qp->sq_ctrl && qp->sq_publish_token)
-			srm_mark_wqe_ready(qp, slot);
+		if (srm_fast)
+			srm_mark_wqe_ready(qp, slot, phase_stats);
 		if (phase_stats)
+		{
+			post_publish_start = rdtsc();
 			srm_reserve_stats.publish_cycles +=
-				rdtsc() - publish_start;
+				post_publish_start - publish_start;
+		}
 
 		if (ibqp->qp_type == IBV_QPT_RC) {
 			uint64_t ctrl_wr_id = *(__be64 *)ctrl;
@@ -1625,9 +1708,16 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 				ibqp->qp_num,
 				(char *)ibv_wr_opcode_str(wr->opcode),
 				wr->num_sge);
+		if (phase_stats) {
+			iter_start = rdtsc();
+			srm_reserve_stats.post_publish_cycles +=
+				iter_start - post_publish_start;
+		}
 	}
 
 out:
+	if (phase_stats)
+		cleanup_start = rdtsc();
 	qp->fm_cache = next_fence;
 	if (!err && !(qp->hollow_rc && qp->sender_side)) {
 		if (ibqp->qp_type == IBV_QPT_RC && qp->sender_side)
@@ -1636,6 +1726,10 @@ out:
 			post_send_db(qp, bf, nreq, inl, size, ctrl);
 	}
 	//st_wr->wr_id = rdtsc();
+	if (phase_stats) {
+		cleanup_done = rdtsc();
+		srm_reserve_stats.cleanup_cycles += cleanup_done - cleanup_start;
+	}
 
 	if (phase_stats && lock_sq)
 		phase_start = rdtsc();
@@ -1644,6 +1738,7 @@ out:
 	if (phase_stats) {
 		if (lock_sq)
 			srm_reserve_stats.unlock_cycles += rdtsc() - phase_start;
+		srm_reserve_stats.total_cycles += rdtsc() - total_start;
 		srm_reserve_stats.phase_calls += nreq;
 		srm_maybe_report_reserve_stats();
 	}

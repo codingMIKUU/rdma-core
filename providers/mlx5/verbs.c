@@ -3598,6 +3598,10 @@ attach:
 	qp->sq.qend = qp->sq_start + kernel_sq_bytes;
 	qp->sq_publish_token = bundle->publish_map;
 	qp->sq_publish_depth = bundle->publish_depth;
+	qp->srm_fast_ready = qp->hollow_rc && qp->sender_side &&
+		qp->sq_start && qp->sq_ctrl && qp->sq_publish_token &&
+		qp->sq_publish_depth && qp->sq.wrid &&
+		qp->sq_metadata_cnt >= qp->sq.wqe_cnt;
 	pthread_mutex_unlock(&ctx->srm_mapping_mutex);
 	return 0;
 

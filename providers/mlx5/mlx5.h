@@ -796,6 +796,7 @@ struct mlx5_qp {
 	uint32_t srm_proxy_db_idx;
 	uint8_t srm_proxy_enabled;
 	uint8_t hollow_rc;
+	uint8_t srm_fast_ready;
 	uint32_t srm_num_level;
 	uint32_t srm_num_sched;
 	uint32_t srm_max_xrc_qp_per_srm;
