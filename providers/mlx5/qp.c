@@ -247,7 +247,14 @@ int mlx5_copy_to_recv_wqe(struct mlx5_qp *qp, int idx, void *buf, int size)
 	return copy_to_scat(scat, buf, &size, max, ctx);
 }
 
-int mlx5_copy_to_send_wqe(struct mlx5_qp *qp, int idx, void *buf, int size)
+static inline void *mlx5_get_send_wqe_from(void *sq_start, struct mlx5_wq *wq,
+					   int n)
+{
+	return sq_start + (n << wq->wqe_shift);
+}
+
+int mlx5_copy_to_send_wqe_from(struct mlx5_qp *qp, struct mlx5_wq *wq,
+			       void *sq_start, int idx, void *buf, int size)
 {
 	struct mlx5_context *ctx = to_mctx(qp->ibv_qp->pd->context);
 	struct mlx5_wqe_ctrl_seg *ctrl;
@@ -255,8 +262,8 @@ int mlx5_copy_to_send_wqe(struct mlx5_qp *qp, int idx, void *buf, int size)
 	void *p;
 	int max;
 
-	idx &= (qp->sq.wqe_cnt - 1);
-	ctrl = mlx5_get_send_wqe(qp, idx);
+	idx &= (wq->wqe_cnt - 1);
+	ctrl = mlx5_get_send_wqe_from(sq_start, wq, idx);
 	if (qp->ibv_qp->qp_type != IBV_QPT_RC) {
 		mlx5_err(ctx->dbg_fp, "scatter to CQE is supported only for RC QPs\n");
 		return IBV_WC_GENERAL_ERR;
@@ -282,18 +289,24 @@ int mlx5_copy_to_send_wqe(struct mlx5_qp *qp, int idx, void *buf, int size)
 
 	scat = p;
 	max = (be32toh(ctrl->qpn_ds) & 0x3F) - (((void *)scat - (void *)ctrl) >> 4);
-	if (unlikely((void *)(scat + max) > qp->sq.qend)) {
-		int tmp = ((void *)qp->sq.qend - (void *)scat) >> 4;
+	if (unlikely((void *)(scat + max) > wq->qend)) {
+		int tmp = ((void *)wq->qend - (void *)scat) >> 4;
 		int orig_size = size;
 
 		if (copy_to_scat(scat, buf, &size, tmp, ctx) == IBV_WC_SUCCESS)
 			return IBV_WC_SUCCESS;
 		max = max - tmp;
 		buf += orig_size - size;
-		scat = mlx5_get_send_wqe(qp, 0);
+		scat = mlx5_get_send_wqe_from(sq_start, wq, 0);
 	}
 
 	return copy_to_scat(scat, buf, &size, max, ctx);
+}
+
+int mlx5_copy_to_send_wqe(struct mlx5_qp *qp, int idx, void *buf, int size)
+{
+	return mlx5_copy_to_send_wqe_from(qp, &qp->sq, qp->sq_start, idx, buf,
+					  size);
 }
 
 void *mlx5_get_send_wqe(struct mlx5_qp *qp, int n)
@@ -1093,8 +1106,21 @@ static inline void srm_queue_backoff(unsigned int attempt,
 	clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
 }
 
-static inline int srm_reserve_wqe_blocking(struct mlx5_qp *qp,
-					    uint64_t *slot,
+#define MLX5_SRM_LARGE_MSG_THRESHOLD (10U * 1024U)
+
+static inline uint32_t mlx5_srm_wr_data_bytes(const struct ibv_send_wr *wr)
+{
+	uint64_t bytes = 0;
+	int i;
+
+	for (i = 0; i < wr->num_sge; i++)
+		bytes += wr->sg_list[i].length;
+
+	return bytes > UINT32_MAX ? UINT32_MAX : (uint32_t)bytes;
+}
+
+static inline int srm_reserve_wqe_blocking(struct mlx5_sq_ctrl_page *ctrl,
+					    uint32_t wqe_cnt, uint64_t *slot,
 					    uint64_t *cons_out)
 {
 	struct srm_reserve_stats *stats = &srm_reserve_stats;
@@ -1108,20 +1134,18 @@ static inline int srm_reserve_wqe_blocking(struct mlx5_qp *qp,
 	unsigned int attempt = 0;
 	int stats_enabled = srm_stats_is_enabled();
 
-	limit = ((uint64_t)qp->sq.wqe_cnt * 2) / 3;
+	limit = ((uint64_t)wqe_cnt * 2) / 3;
 	if (stats_enabled)
 		stat_start = rdtsc();
 
 	for (;;) {
-		resv = __atomic_load_n(&qp->sq_ctrl->resv_idx,
-				       __ATOMIC_RELAXED);
-		cons = __atomic_load_n(&qp->sq_ctrl->cons_idx,
-				       __ATOMIC_ACQUIRE);
+		resv = __atomic_load_n(&ctrl->resv_idx, __ATOMIC_RELAXED);
+		cons = __atomic_load_n(&ctrl->cons_idx, __ATOMIC_ACQUIRE);
 		occupancy = resv - cons;
 		if (stats_enabled && occupancy > stats->max_occupancy)
 			stats->max_occupancy = occupancy;
 		if (resv - cons < limit) {
-			resv = __atomic_fetch_add(&qp->sq_ctrl->resv_idx, 1,
+			resv = __atomic_fetch_add(&ctrl->resv_idx, 1,
 						  __ATOMIC_RELAXED);
 			if (slot)
 				*slot = resv;
@@ -1158,7 +1182,9 @@ static inline int srm_reserve_wqe_blocking(struct mlx5_qp *qp,
 	}
 }
 
-static inline void srm_mark_wqe_ready(struct mlx5_qp *qp, uint64_t slot,
+static inline void srm_mark_wqe_ready(uint64_t *publish_token,
+				      uint32_t publish_depth,
+				      uint32_t usr_rc_cnt, uint64_t slot,
 				      int phase_stats)
 {
 	uint32_t mask;
@@ -1169,16 +1195,15 @@ static inline void srm_mark_wqe_ready(struct mlx5_qp *qp, uint64_t slot,
 	if (phase_stats)
 		start = rdtsc();
 
-	mask = qp->sq_publish_depth - 1;
-	token = mlx5_srm_publish_token(slot, qp->usr_rc_cnt);
+	mask = publish_depth - 1;
+	token = mlx5_srm_publish_token(slot, usr_rc_cnt);
 
 	if (phase_stats) {
 		before_store = rdtsc();
 		srm_reserve_stats.ready_token_cycles += before_store - start;
 	}
 
-	__atomic_store_n(&qp->sq_publish_token[slot & mask], token,
-			 __ATOMIC_RELEASE);
+	__atomic_store_n(&publish_token[slot & mask], token, __ATOMIC_RELEASE);
 
 	if (phase_stats)
 		srm_reserve_stats.ready_store_cycles += rdtsc() - before_store;
@@ -1276,7 +1301,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	bool xrc_wqe;
 
 	uint64_t wr_id;
-	bool srm_fast = qp->srm_fast_ready;
+	bool srm_fast = qp->srm_fast_ready && qp->srm_large_fast_ready;
 	bool lock_sq = !srm_fast;
 	int phase_stats =
 		qp->hollow_rc && qp->sender_side && srm_stats_is_enabled();
@@ -1315,14 +1340,32 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	for (nreq = 0; wr; ++nreq, wr = wr->next) {
 		uint64_t slot = 0;
 		uint64_t cons = 0;
+		struct mlx5_wq *post_wq = &qp->sq;
+		void *post_sq_start = qp->sq_start;
+		struct mlx5_sq_ctrl_page *post_ctrl = qp->sq_ctrl;
+		uint64_t *post_publish_token = qp->sq_publish_token;
+		uint32_t post_publish_depth = qp->sq_publish_depth;
+		uint32_t post_kernel_qpn = qp->srm_kernel_qpn;
 
-		if (qp->sender_side && qp->sq_ctrl) {
+		if (srm_fast &&
+		    mlx5_srm_wr_data_bytes(wr) > MLX5_SRM_LARGE_MSG_THRESHOLD) {
+			post_wq = &qp->srm_large_sq;
+			post_sq_start = qp->srm_large_sq_start;
+			post_ctrl = qp->srm_large_sq_ctrl;
+			post_publish_token = qp->srm_large_sq_publish_token;
+			post_publish_depth = qp->srm_large_sq_publish_depth;
+			post_kernel_qpn = qp->srm_large_kernel_qpn;
+		}
+
+		if (srm_fast) {
 			if (phase_stats) {
 				reserve_start = rdtsc();
 				srm_reserve_stats.pre_reserve_cycles +=
 					reserve_start - iter_start;
 			}
-			err = srm_reserve_wqe_blocking(qp, &slot, &cons);
+			err = srm_reserve_wqe_blocking(post_ctrl,
+						       post_wq->wqe_cnt,
+						       &slot, &cons);
 			if (err) {
 				if (bad_wr)
 					*bad_wr = wr;
@@ -1330,15 +1373,15 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			}
 			if (phase_stats)
 				reserve_done = rdtsc();
-			qp->sq.cur_post = slot;
-			qp->sq.tail = cons;
+			post_wq->cur_post = slot;
+			post_wq->tail = cons;
 			if (phase_stats) {
 				build_start = rdtsc();
 				srm_reserve_stats.post_reserve_cycles +=
 					build_start - reserve_done;
 			}
 		}
-		if (phase_stats && !(qp->sender_side && qp->sq_ctrl))
+		if (phase_stats && !srm_fast)
 			build_start = rdtsc();
 		wr_id = wr->wr_id;//for debug
 		if (unlikely(wr->opcode < 0 ||
@@ -1349,7 +1392,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			goto out;
 		}
 
-		if (!(qp->sender_side && qp->sq_ctrl) &&
+		if (!srm_fast &&
 		    unlikely(mlx5_wq_overflow(&qp->sq, nreq,
 				      to_mcq(qp->ibv_qp->send_cq)))) {
 			mlx5_dbg(fp, MLX5_DBG_QP_SEND, "work queue overflow\n");
@@ -1389,8 +1432,9 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		else
 			fence = next_fence;
 		next_fence = 0;
-		idx = qp->sq.cur_post & (qp->sq.wqe_cnt - 1);
-		ctrl = seg = mlx5_get_send_wqe(qp, idx);		 
+		idx = post_wq->cur_post & (post_wq->wqe_cnt - 1);
+		ctrl = seg = mlx5_get_send_wqe_from(post_sq_start, post_wq, idx);
+		qend = post_wq->qend;
 
 		*(uint32_t *)(seg + 8) = 0;
 		ctrl->imm = send_ieth(wr);
@@ -1404,6 +1448,8 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		size = sizeof *ctrl / 16;
 		if (!srm_fast)
 			qp->sq.wr_data[idx] = 0;
+		else
+			post_wq->wr_data[idx] = 0;
 
 		xrc_wqe = ibqp->qp_type == IBV_QPT_SRM ||
 			  ibqp->qp_type == IBV_QPT_XRC_SEND ||
@@ -1463,7 +1509,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 					goto out;
 				}
 
-				qp->sq.wr_data[idx] = IBV_WC_BIND_MW;
+				post_wq->wr_data[idx] = IBV_WC_BIND_MW;
 				break;
 			case IBV_WR_LOCAL_INV: {
 				struct ibv_mw_bind_info	bind_info = {};
@@ -1478,7 +1524,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 					goto out;
 				}
 
-				qp->sq.wr_data[idx] = IBV_WC_LOCAL_INV;
+				post_wq->wr_data[idx] = IBV_WC_LOCAL_INV;
 				break;
 			}
 
@@ -1508,7 +1554,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 					goto out;
 				}
 
-				qp->sq.wr_data[idx] = IBV_WC_BIND_MW;
+				post_wq->wr_data[idx] = IBV_WC_BIND_MW;
 				break;
 			case IBV_WR_LOCAL_INV: {
 				struct ibv_mw_bind_info	bind_info = {};
@@ -1523,7 +1569,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 					goto out;
 				}
 
-				qp->sq.wr_data[idx] = IBV_WC_LOCAL_INV;
+				post_wq->wr_data[idx] = IBV_WC_LOCAL_INV;
 				break;
 			}
 
@@ -1537,7 +1583,8 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			seg  += sizeof(struct mlx5_wqe_datagram_seg);
 			size += sizeof(struct mlx5_wqe_datagram_seg) / 16;
 			if (unlikely((seg == qend)))
-				seg = mlx5_get_send_wqe(qp, 0);
+				seg = mlx5_get_send_wqe_from(post_sq_start,
+							      post_wq, 0);
 
 			if (unlikely(qp->flags & MLX5_QP_FLAGS_USE_UNDERLAY)) {
 				err = mlx5_post_send_underlay(qp, wr, &seg, &size, &sg_copy_ptr);
@@ -1628,7 +1675,8 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			dpseg = seg;
 			for (i = sg_copy_ptr.index; i < wr->num_sge; ++i) {
 				if (unlikely(dpseg == qend)) {
-					seg = mlx5_get_send_wqe(qp, 0);
+					seg = mlx5_get_send_wqe_from(post_sq_start,
+								      post_wq, 0);
 					dpseg = seg;
 				}
 				if (likely(wr->sg_list[i].length)) {
@@ -1657,12 +1705,14 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		}
 
 		mlx5_opcode = mlx5_ib_opcode[wr->opcode];
-		ctrl->opmod_idx_opcode = htobe32(((qp->sq.cur_post & 0xffff) << 8) |
+		ctrl->opmod_idx_opcode = htobe32(((post_wq->cur_post & 0xffff) << 8) |
 				       mlx5_opcode			 |
 				       (opmod << 24));
 		{
 			uint32_t wqe_qpn = ibqp->qp_num;
-			if (qp->sender_side && qp->srm_kernel_qpn_valid)
+			if (srm_fast)
+				wqe_qpn = post_kernel_qpn;
+			else if (qp->sender_side && qp->srm_kernel_qpn_valid)
 				wqe_qpn = qp->srm_kernel_qpn;
 			ctrl->qpn_ds = htobe32(size | (wqe_qpn << 8));
 		}
@@ -1675,14 +1725,15 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			srm_reserve_stats.build_cycles +=
 				publish_start - build_start;
 		}
-		qp->sq.wrid[idx] = wr->wr_id;
+		post_wq->wrid[idx] = wr->wr_id;
 		if (srm_fast)
 			;
 		else
 			qp->sq.wqe_head[idx] = qp->sq.head + nreq;
-		qp->sq.cur_post += DIV_ROUND_UP(size * 16, MLX5_SEND_WQE_BB);
+		post_wq->cur_post += DIV_ROUND_UP(size * 16, MLX5_SEND_WQE_BB);
 		if (srm_fast)
-			srm_mark_wqe_ready(qp, slot, phase_stats);
+			srm_mark_wqe_ready(post_publish_token, post_publish_depth,
+					   qp->usr_rc_cnt, slot, phase_stats);
 		if (phase_stats)
 		{
 			post_publish_start = rdtsc();

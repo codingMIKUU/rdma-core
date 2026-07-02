@@ -747,6 +747,16 @@ struct mlx5_qp {
 	uint32_t		sq_publish_depth;
 	uint32_t		sq_metadata_cnt;
 	struct mlx5_wq                  sq;
+	struct mlx5_srm_mapping_bundle *srm_large_mapping;
+	void				*srm_large_sq_start;
+	void				*srm_large_sq_mmap_buf;
+	size_t				srm_large_sq_mmap_len;
+	struct mlx5_sq_ctrl_page	*srm_large_sq_ctrl;
+	uint32_t		srm_large_sq_ctrl_slot_idx;
+	uint64_t		*srm_large_sq_publish_token;
+	uint32_t		srm_large_sq_publish_depth;
+	uint32_t		srm_large_sq_metadata_cnt;
+	struct mlx5_wq		srm_large_sq;
 
 	__be32                         *db;
 	bool				custom_db;
@@ -784,6 +794,8 @@ struct mlx5_qp {
 	uint8_t			skip_kern_qp;
 	uint8_t			srm_kernel_qpn_valid;
 	uint32_t		srm_kernel_qpn;
+	uint8_t			srm_large_kernel_qpn_valid;
+	uint32_t		srm_large_kernel_qpn;
 
 
 	/*
@@ -797,6 +809,7 @@ struct mlx5_qp {
 	uint8_t srm_proxy_enabled;
 	uint8_t hollow_rc;
 	uint8_t srm_fast_ready;
+	uint8_t srm_large_fast_ready;
 	uint32_t srm_num_level;
 	uint32_t srm_num_sched;
 	uint32_t srm_max_xrc_qp_per_srm;
@@ -1337,6 +1350,8 @@ void *mlx5_get_atomic_laddr(struct mlx5_qp *qp, uint16_t idx, int *byte_count);
 void *mlx5_get_send_wqe(struct mlx5_qp *qp, int n);
 int mlx5_copy_to_recv_wqe(struct mlx5_qp *qp, int idx, void *buf, int size);
 int mlx5_copy_to_send_wqe(struct mlx5_qp *qp, int idx, void *buf, int size);
+int mlx5_copy_to_send_wqe_from(struct mlx5_qp *qp, struct mlx5_wq *wq,
+			       void *sq_start, int idx, void *buf, int size);
 int mlx5_copy_to_recv_srq(struct mlx5_srq *srq, int idx, void *buf, int size);
 struct ibv_xrcd *mlx5_open_xrcd(struct ibv_context *context,
 				struct ibv_xrcd_init_attr *xrcd_init_attr);

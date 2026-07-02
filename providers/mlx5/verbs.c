@@ -2182,6 +2182,13 @@ static size_t mlx5_set_custom_qp_alignment(struct ibv_context *context,
 
 static void mlx5_free_qp_wrid(struct mlx5_qp *qp)
 {
+	free(qp->srm_large_sq.wqe_head);
+	qp->srm_large_sq.wqe_head = NULL;
+	free(qp->srm_large_sq.wr_data);
+	qp->srm_large_sq.wr_data = NULL;
+	free(qp->srm_large_sq.wrid);
+	qp->srm_large_sq.wrid = NULL;
+	qp->srm_large_sq_metadata_cnt = 0;
 	free(qp->rq.wrid);
 	qp->rq.wrid = NULL;
 	free(qp->sq.wqe_head);
@@ -2193,13 +2200,15 @@ static void mlx5_free_qp_wrid(struct mlx5_qp *qp)
 	qp->sq_metadata_cnt = 0;
 }
 
-static int mlx5_resize_qp_sq_metadata(struct mlx5_qp *qp, uint32_t wqe_cnt)
+static int mlx5_resize_wq_metadata(struct mlx5_wq *wq,
+				   uint32_t *metadata_cnt,
+				   uint32_t wqe_cnt)
 {
 	uint64_t *wrid;
 	uint32_t *wr_data;
 	unsigned int *wqe_head;
 
-	if (qp->sq_metadata_cnt == wqe_cnt)
+	if (*metadata_cnt == wqe_cnt)
 		return 0;
 
 	wrid = calloc(wqe_cnt, sizeof(*wrid));
@@ -2213,14 +2222,20 @@ static int mlx5_resize_qp_sq_metadata(struct mlx5_qp *qp, uint32_t wqe_cnt)
 		return -1;
 	}
 
-	free(qp->sq.wrid);
-	free(qp->sq.wr_data);
-	free(qp->sq.wqe_head);
-	qp->sq.wrid = wrid;
-	qp->sq.wr_data = wr_data;
-	qp->sq.wqe_head = wqe_head;
-	qp->sq_metadata_cnt = wqe_cnt;
+	free(wq->wrid);
+	free(wq->wr_data);
+	free(wq->wqe_head);
+	wq->wrid = wrid;
+	wq->wr_data = wr_data;
+	wq->wqe_head = wqe_head;
+	*metadata_cnt = wqe_cnt;
 	return 0;
+}
+
+static int mlx5_resize_qp_sq_metadata(struct mlx5_qp *qp, uint32_t wqe_cnt)
+{
+	return mlx5_resize_wq_metadata(&qp->sq, &qp->sq_metadata_cnt,
+				       wqe_cnt);
 }
 
 static int mlx5_alloc_qp_wrid(struct mlx5_qp *qp)
@@ -3444,25 +3459,29 @@ static void mlx5_srm_release_mapping(struct mlx5_context *ctx,
 				     struct mlx5_qp *qp)
 {
 	struct mlx5_srm_mapping_bundle **link;
-	struct mlx5_srm_mapping_bundle *bundle = qp->srm_mapping;
+	struct mlx5_srm_mapping_bundle *bundle;
+	int lane;
 
-	if (!bundle)
-		return;
+	for (lane = 0; lane < 2; lane++) {
+		bundle = lane ? qp->srm_large_mapping : qp->srm_mapping;
+		if (!bundle)
+			continue;
 
-	pthread_mutex_lock(&ctx->srm_mapping_mutex);
-	if (--bundle->refs == 0) {
-		for (link = &ctx->srm_mapping_bundles; *link;
-		     link = &(*link)->next) {
-			if (*link == bundle) {
-				*link = bundle->next;
-				break;
+		pthread_mutex_lock(&ctx->srm_mapping_mutex);
+		if (--bundle->refs == 0) {
+			for (link = &ctx->srm_mapping_bundles; *link;
+			     link = &(*link)->next) {
+				if (*link == bundle) {
+					*link = bundle->next;
+					break;
+				}
 			}
+			munmap(bundle->sq_map, bundle->sq_map_len);
+			munmap(bundle->publish_map, bundle->publish_map_len);
+			free(bundle);
 		}
-		munmap(bundle->sq_map, bundle->sq_map_len);
-		munmap(bundle->publish_map, bundle->publish_map_len);
-		free(bundle);
+		pthread_mutex_unlock(&ctx->srm_mapping_mutex);
 	}
-	pthread_mutex_unlock(&ctx->srm_mapping_mutex);
 
 	qp->srm_mapping = NULL;
 	qp->sq_mmap_buf = NULL;
@@ -3472,6 +3491,17 @@ static void mlx5_srm_release_mapping(struct mlx5_context *ctx,
 	qp->sq_ctrl = NULL;
 	qp->sq_publish_token = NULL;
 	qp->sq_publish_depth = 0;
+	qp->srm_fast_ready = 0;
+
+	qp->srm_large_mapping = NULL;
+	qp->srm_large_sq_mmap_buf = NULL;
+	qp->srm_large_sq_mmap_len = 0;
+	qp->srm_large_sq_start = NULL;
+	qp->srm_large_sq.qend = NULL;
+	qp->srm_large_sq_ctrl = NULL;
+	qp->srm_large_sq_publish_token = NULL;
+	qp->srm_large_sq_publish_depth = 0;
+	qp->srm_large_fast_ready = 0;
 }
 
 void mlx5_srm_release_mappings(struct mlx5_context *ctx)
@@ -3614,6 +3644,135 @@ err_unlock:
 	return errno;
 }
 
+static int mlx5_srm_acquire_large_mapping(struct mlx5_context *ctx,
+					  struct mlx5_qp *qp,
+					  const struct mlx5_ib_modify_qp_resp *resp)
+{
+	struct mlx5_srm_mapping_bundle *bundle;
+	struct mlx5_sq_ctrl_page *ctrl_base;
+	size_t kernel_sq_bytes;
+	size_t publish_bytes;
+	void *sq_map = MAP_FAILED;
+	void *publish_map = MAP_FAILED;
+
+	if (!resp->large_kernel_qpn || !resp->large_kernel_sq_wqe_cnt ||
+	    !resp->large_sq_mmap_len || !resp->sq_state_mmap_len ||
+	    !resp->large_publish_mmap_len || !resp->large_publish_depth ||
+	    (resp->large_publish_depth & (resp->large_publish_depth - 1)) ||
+	    resp->large_kernel_sq_wqe_shift >= 8U * sizeof(size_t) ||
+	    resp->large_kernel_sq_wqe_cnt >
+		    (SIZE_MAX >> resp->large_kernel_sq_wqe_shift)) {
+		errno = EINVAL;
+		return errno;
+	}
+
+	kernel_sq_bytes = (size_t)resp->large_kernel_sq_wqe_cnt <<
+			  resp->large_kernel_sq_wqe_shift;
+	publish_bytes = (size_t)resp->large_publish_depth * sizeof(uint64_t);
+	if (kernel_sq_bytes > resp->large_sq_mmap_len ||
+	    publish_bytes > resp->large_publish_mmap_len ||
+	    resp->large_sq_state_slot_idx >=
+		    resp->sq_state_mmap_len / sizeof(*ctrl_base)) {
+		errno = EINVAL;
+		return errno;
+	}
+
+	pthread_mutex_lock(&ctx->srm_mapping_mutex);
+	for (bundle = ctx->srm_mapping_bundles; bundle;
+	     bundle = bundle->next) {
+		if (bundle->kernel_qpn == resp->large_kernel_qpn &&
+		    bundle->slot_idx == resp->large_sq_state_slot_idx)
+			break;
+	}
+
+	if (bundle) {
+		if (bundle->sq_map_len != resp->large_sq_mmap_len ||
+		    bundle->publish_map_len != resp->large_publish_mmap_len ||
+		    bundle->publish_depth != resp->large_publish_depth) {
+			errno = EPROTO;
+			goto err_unlock;
+		}
+		bundle->refs++;
+		goto attach;
+	}
+
+	if (!ctx->srm_ctrl_map) {
+		ctx->srm_ctrl_map = mmap(NULL, resp->sq_state_mmap_len,
+					 PROT_READ | PROT_WRITE, MAP_SHARED,
+					 ctx->ibv_ctx.context.cmd_fd,
+					 resp->sq_state_mmap_offset);
+		if (ctx->srm_ctrl_map == MAP_FAILED) {
+			ctx->srm_ctrl_map = NULL;
+			goto err_unlock;
+		}
+		ctx->srm_ctrl_map_len = resp->sq_state_mmap_len;
+	} else if (ctx->srm_ctrl_map_len != resp->sq_state_mmap_len) {
+		errno = EPROTO;
+		goto err_unlock;
+	}
+
+	sq_map = mmap(NULL, resp->large_sq_mmap_len, PROT_READ | PROT_WRITE,
+		      MAP_SHARED, ctx->ibv_ctx.context.cmd_fd,
+		      resp->large_sq_mmap_offset);
+	if (sq_map == MAP_FAILED)
+		goto err_unlock;
+
+	publish_map = mmap(NULL, resp->large_publish_mmap_len,
+			   PROT_READ | PROT_WRITE, MAP_SHARED,
+			   ctx->ibv_ctx.context.cmd_fd,
+			   resp->large_publish_mmap_offset);
+	if (publish_map == MAP_FAILED)
+		goto err_sq;
+
+	bundle = calloc(1, sizeof(*bundle));
+	if (!bundle)
+		goto err_publish;
+
+	bundle->kernel_qpn = resp->large_kernel_qpn;
+	bundle->slot_idx = resp->large_sq_state_slot_idx;
+	bundle->refs = 1;
+	bundle->publish_depth = resp->large_publish_depth;
+	bundle->sq_map = sq_map;
+	bundle->sq_map_len = resp->large_sq_mmap_len;
+	bundle->publish_map = publish_map;
+	bundle->publish_map_len = resp->large_publish_mmap_len;
+	bundle->next = ctx->srm_mapping_bundles;
+	ctx->srm_mapping_bundles = bundle;
+
+attach:
+	ctrl_base = ctx->srm_ctrl_map;
+	qp->srm_large_mapping = bundle;
+	qp->srm_large_sq_ctrl_slot_idx = bundle->slot_idx;
+	qp->srm_large_sq_ctrl = &ctrl_base[bundle->slot_idx];
+	qp->srm_large_sq_mmap_buf = bundle->sq_map;
+	qp->srm_large_sq_mmap_len = bundle->sq_map_len;
+	qp->srm_large_sq_start = bundle->sq_map;
+	qp->srm_large_sq.qend = qp->srm_large_sq_start + kernel_sq_bytes;
+	qp->srm_large_sq_publish_token = bundle->publish_map;
+	qp->srm_large_sq_publish_depth = bundle->publish_depth;
+	qp->srm_large_sq.wqe_cnt = resp->large_kernel_sq_wqe_cnt;
+	qp->srm_large_sq.wqe_shift = resp->large_kernel_sq_wqe_shift;
+	qp->srm_large_sq.max_post = resp->large_kernel_sq_max_post;
+	qp->srm_large_sq.max_gs = resp->large_kernel_sq_max_gs;
+	qp->srm_large_sq.qp_state_max_gs =
+		resp->large_kernel_sq_qp_state_max_gs;
+	qp->srm_large_fast_ready = qp->hollow_rc && qp->sender_side &&
+		qp->srm_large_sq_start && qp->srm_large_sq_ctrl &&
+		qp->srm_large_sq_publish_token &&
+		qp->srm_large_sq_publish_depth && qp->srm_large_sq.wrid &&
+		qp->srm_large_sq_metadata_cnt >= qp->srm_large_sq.wqe_cnt;
+	pthread_mutex_unlock(&ctx->srm_mapping_mutex);
+	return 0;
+
+err_publish:
+	munmap(publish_map, resp->large_publish_mmap_len);
+err_sq:
+	munmap(sq_map, resp->large_sq_mmap_len);
+err_unlock:
+	pthread_mutex_unlock(&ctx->srm_mapping_mutex);
+	return errno;
+}
+
 int __mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 		   int attr_mask)
 {
@@ -3738,6 +3897,25 @@ int __mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 		mqp->max_inline_data = resp.drv_payload.kernel_max_inline_data;
 		if (mqp->sq_start)
 			mqp->sq.qend = mqp->sq_start + kernel_sq_bytes;
+
+		if (!resp.drv_payload.large_kernel_qpn ||
+		    !resp.drv_payload.large_kernel_sq_wqe_cnt) {
+			errno = EINVAL;
+			return errno;
+		}
+		if (mlx5_resize_wq_metadata(&mqp->srm_large_sq,
+					    &mqp->srm_large_sq_metadata_cnt,
+					    resp.drv_payload.large_kernel_sq_wqe_cnt))
+			return errno;
+
+		ret = mlx5_srm_acquire_large_mapping(context, mqp,
+						     &resp.drv_payload);
+		if (ret)
+			return ret;
+
+		mqp->srm_large_kernel_qpn = resp.drv_payload.large_kernel_qpn;
+		mqp->srm_large_kernel_qpn_valid =
+			resp.drv_payload.large_kernel_qpn ? 1 : 0;
 	}
 
 	if (!ret		       &&

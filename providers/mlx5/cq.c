@@ -755,6 +755,7 @@ static inline int mlx5_parse_cqe(struct mlx5_cq *cq,
 	struct mlx5_qp *mqp;
 	struct mlx5_context *mctx;
 	uint8_t is_srq;
+	void *sq_start;
 
 again:
 	is_srq = 0;
@@ -782,6 +783,12 @@ again:
 		if (unlikely(!mqp))
 			return CQ_POLL_ERR;
 		wq = &mqp->sq;
+		sq_start = mqp->sq_start;
+		if (mqp->hollow_rc && mqp->srm_large_kernel_qpn_valid &&
+		    qpn == mqp->srm_large_kernel_qpn) {
+			wq = &mqp->srm_large_sq;
+			sq_start = mqp->srm_large_sq_start;
+		}
 		if (unlikely(!wq->wqe_cnt || !wq->wrid ||
 			     !wq->wqe_head || !wq->wr_data)) {
 			fprintf(stderr,
@@ -814,11 +821,13 @@ again:
 
 			scatter_out:
 				if (cqe64->op_own & MLX5_INLINE_SCATTER_32)
-					err = mlx5_copy_to_send_wqe(
-					    mqp, wqe_ctr, cqe, wc_byte_len);
+					err = mlx5_copy_to_send_wqe_from(
+					    mqp, wq, sq_start, wqe_ctr, cqe,
+					    wc_byte_len);
 				else if (cqe64->op_own & MLX5_INLINE_SCATTER_64)
-					err = mlx5_copy_to_send_wqe(
-					    mqp, wqe_ctr, cqe - 1, wc_byte_len);
+					err = mlx5_copy_to_send_wqe_from(
+					    mqp, wq, sq_start, wqe_ctr, cqe - 1,
+					    wc_byte_len);
 				break;
 			}
 
@@ -831,17 +840,21 @@ again:
 			handle_good_req(wc, cqe64, wq, idx);
 
 			if (cqe64->op_own & MLX5_INLINE_SCATTER_32)
-				err = mlx5_copy_to_send_wqe(mqp, wqe_ctr, cqe,
-							    wc->byte_len);
+				err = mlx5_copy_to_send_wqe_from(
+					mqp, wq, sq_start, wqe_ctr, cqe,
+					wc->byte_len);
 			else if (cqe64->op_own & MLX5_INLINE_SCATTER_64)
-				err = mlx5_copy_to_send_wqe(
-				    mqp, wqe_ctr, cqe - 1, wc->byte_len);
+				err = mlx5_copy_to_send_wqe_from(
+					mqp, wq, sq_start, wqe_ctr, cqe - 1,
+					wc->byte_len);
 
 			wc->wr_id = wq->wrid[idx];
 			wc->status = err;
+			if (mqp->hollow_rc)
+				wc->qp_num = mqp->verbs_qp.qp.qp_num;
 		}
 
-		wq->tail = wq->wqe_head[idx] + 1;
+		wq->tail = mqp->hollow_rc ? wqe_ctr + 1 : wq->wqe_head[idx] + 1;
 		break;
 	}
 	case MLX5_CQE_RESP_WR_IMM:
