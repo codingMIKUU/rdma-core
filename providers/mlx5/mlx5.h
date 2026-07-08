@@ -484,13 +484,32 @@ _Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 128,
 	       "hollow RC ctrl ABI must occupy two cachelines");
 
 #define MLX5_SRM_PUBLISH_USR_BITS 16
+#define MLX5_SRM_PUBLISH_BYTES_BITS 16
+#define MLX5_SRM_PUBLISH_SEQ_BITS 32
 #define MLX5_SRM_PUBLISH_USR_MASK ((1ULL << MLX5_SRM_PUBLISH_USR_BITS) - 1)
-#define MLX5_SRM_PUBLISH_SEQ_MASK ((1ULL << 48) - 1)
+#define MLX5_SRM_PUBLISH_BYTES_MASK ((1ULL << MLX5_SRM_PUBLISH_BYTES_BITS) - 1)
+#define MLX5_SRM_PUBLISH_SEQ_MASK ((1ULL << MLX5_SRM_PUBLISH_SEQ_BITS) - 1)
+#define MLX5_SRM_PUBLISH_BYTES_SHIFT MLX5_SRM_PUBLISH_USR_BITS
+#define MLX5_SRM_PUBLISH_SEQ_SHIFT \
+	(MLX5_SRM_PUBLISH_USR_BITS + MLX5_SRM_PUBLISH_BYTES_BITS)
 
-static inline uint64_t mlx5_srm_publish_token(uint64_t slot, uint16_t usr_rc)
+static inline uint16_t mlx5_srm_publish_bytes64(uint32_t bytes)
 {
+	uint32_t units = (bytes + 63U) >> 6;
+
+	return units > MLX5_SRM_PUBLISH_BYTES_MASK ?
+		MLX5_SRM_PUBLISH_BYTES_MASK : units;
+}
+
+static inline uint64_t mlx5_srm_publish_token(uint64_t slot, uint16_t usr_rc,
+					      uint32_t bytes)
+{
+	uint16_t bytes64 = mlx5_srm_publish_bytes64(bytes);
+
 	return (((slot + 1) & MLX5_SRM_PUBLISH_SEQ_MASK) <<
-		MLX5_SRM_PUBLISH_USR_BITS) | usr_rc;
+		MLX5_SRM_PUBLISH_SEQ_SHIFT) |
+		(((uint64_t)bytes64 & MLX5_SRM_PUBLISH_BYTES_MASK) <<
+		 MLX5_SRM_PUBLISH_BYTES_SHIFT) | usr_rc;
 }
 
 struct mlx5_srm_mapping_bundle {
