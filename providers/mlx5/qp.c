@@ -1185,7 +1185,7 @@ static inline int srm_reserve_wqe_blocking(struct mlx5_sq_ctrl_page *ctrl,
 static inline void srm_mark_wqe_ready(uint64_t *publish_token,
 				      uint32_t publish_depth,
 				      uint32_t usr_rc_cnt, uint64_t slot,
-				      uint32_t bytes, int phase_stats)
+				      int phase_stats)
 {
 	uint32_t mask;
 	uint64_t token;
@@ -1196,7 +1196,7 @@ static inline void srm_mark_wqe_ready(uint64_t *publish_token,
 		start = rdtsc();
 
 	mask = publish_depth - 1;
-	token = mlx5_srm_publish_token(slot, usr_rc_cnt, bytes);
+	token = mlx5_srm_publish_token(slot, usr_rc_cnt);
 
 	if (phase_stats) {
 		before_store = rdtsc();
@@ -1346,12 +1346,9 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		uint64_t *post_publish_token = qp->sq_publish_token;
 		uint32_t post_publish_depth = qp->sq_publish_depth;
 		uint32_t post_kernel_qpn = qp->srm_kernel_qpn;
-		uint32_t srm_wqe_bytes = 0;
 
-		if (srm_fast)
-			srm_wqe_bytes = mlx5_srm_wr_data_bytes(wr);
-
-		if (srm_fast && srm_wqe_bytes > MLX5_SRM_LARGE_MSG_THRESHOLD) {
+		if (srm_fast &&
+		    mlx5_srm_wr_data_bytes(wr) > MLX5_SRM_LARGE_MSG_THRESHOLD) {
 			post_wq = &qp->srm_large_sq;
 			post_sq_start = qp->srm_large_sq_start;
 			post_ctrl = qp->srm_large_sq_ctrl;
@@ -1736,8 +1733,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		post_wq->cur_post += DIV_ROUND_UP(size * 16, MLX5_SEND_WQE_BB);
 		if (srm_fast)
 			srm_mark_wqe_ready(post_publish_token, post_publish_depth,
-					   qp->usr_rc_cnt, slot, srm_wqe_bytes,
-					   phase_stats);
+					   qp->usr_rc_cnt, slot, phase_stats);
 		if (phase_stats)
 		{
 			post_publish_start = rdtsc();
