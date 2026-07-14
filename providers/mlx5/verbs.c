@@ -3523,6 +3523,8 @@ void mlx5_srm_release_mappings(struct mlx5_context *ctx)
 	pthread_mutex_unlock(&ctx->srm_mapping_mutex);
 }
 
+#define MLX5_SRM_ENABLE_LARGE_KERNEL_QP 0
+
 static int mlx5_srm_acquire_mapping(struct mlx5_context *ctx,
 				    struct mlx5_qp *qp,
 				    const struct mlx5_ib_modify_qp_resp *resp)
@@ -3895,28 +3897,39 @@ int __mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 		mqp->sq.max_gs = resp.drv_payload.kernel_sq_max_gs;
 		mqp->sq.qp_state_max_gs = resp.drv_payload.kernel_sq_qp_state_max_gs;
 		mqp->max_inline_data = resp.drv_payload.kernel_max_inline_data;
+		fprintf(stderr,
+			"SRM_KERNEL_SQ qpn=%u wqe_cnt=%u max_post=%u wqe_shift=%u max_gs=%u reserve_limit=%llu\n",
+			mqp->srm_kernel_qpn, mqp->sq.wqe_cnt,
+			mqp->sq.max_post, mqp->sq.wqe_shift, mqp->sq.max_gs,
+			(unsigned long long)(((uint64_t)mqp->sq.wqe_cnt * 2) / 3));
 		if (mqp->sq_start)
 			mqp->sq.qend = mqp->sq_start + kernel_sq_bytes;
 
-		if (!resp.drv_payload.large_kernel_qpn ||
-		    !resp.drv_payload.large_kernel_sq_wqe_cnt) {
-			errno = EINVAL;
-			return errno;
+		if (MLX5_SRM_ENABLE_LARGE_KERNEL_QP) {
+			if (!resp.drv_payload.large_kernel_qpn ||
+			    !resp.drv_payload.large_kernel_sq_wqe_cnt) {
+				errno = EINVAL;
+				return errno;
+			}
+			if (mlx5_resize_wq_metadata(&mqp->srm_large_sq,
+						    &mqp->srm_large_sq_metadata_cnt,
+						    resp.drv_payload.large_kernel_sq_wqe_cnt))
+				return errno;
+
+			ret = mlx5_srm_acquire_large_mapping(context, mqp,
+							     &resp.drv_payload);
+			if (ret)
+				return ret;
+
+			mqp->srm_large_kernel_qpn =
+				resp.drv_payload.large_kernel_qpn;
+			mqp->srm_large_kernel_qpn_valid =
+				resp.drv_payload.large_kernel_qpn ? 1 : 0;
+		} else {
+			mqp->srm_large_kernel_qpn = 0;
+			mqp->srm_large_kernel_qpn_valid = 0;
 		}
-		if (mlx5_resize_wq_metadata(&mqp->srm_large_sq,
-					    &mqp->srm_large_sq_metadata_cnt,
-					    resp.drv_payload.large_kernel_sq_wqe_cnt))
-			return errno;
-
-		ret = mlx5_srm_acquire_large_mapping(context, mqp,
-						     &resp.drv_payload);
-		if (ret)
-			return ret;
-
-		mqp->srm_large_kernel_qpn = resp.drv_payload.large_kernel_qpn;
-		mqp->srm_large_kernel_qpn_valid =
-			resp.drv_payload.large_kernel_qpn ? 1 : 0;
-	}
+		}
 
 	if (!ret		       &&
 	    (attr_mask & IBV_QP_STATE) &&

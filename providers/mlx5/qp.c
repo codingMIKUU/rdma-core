@@ -53,7 +53,7 @@
 #define SRM_BACKOFF_YIELD_RETRIES 2
 #define SRM_BACKOFF_BASE_NS 1000ULL
 #define SRM_BACKOFF_MAX_NS 64000ULL
-#define SRM_RESERVE_MAX_WAIT_NS 1000000ULL
+#define SRM_RESERVE_MAX_WAIT_NS 100000000ULL
 
 static const uint32_t mlx5_ib_opcode[] = {
 	[IBV_WR_SEND]			= MLX5_OPCODE_SEND,
@@ -1106,6 +1106,7 @@ static inline void srm_queue_backoff(unsigned int attempt,
 	clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
 }
 
+#define MLX5_SRM_ENABLE_LARGE_KERNEL_QP 0
 #define MLX5_SRM_LARGE_MSG_THRESHOLD (10U * 1024U)
 
 static inline uint32_t mlx5_srm_wr_data_bytes(const struct ibv_send_wr *wr)
@@ -1301,7 +1302,8 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	bool xrc_wqe;
 
 	uint64_t wr_id;
-	bool srm_fast = qp->srm_fast_ready && qp->srm_large_fast_ready;
+	bool srm_fast = qp->srm_fast_ready &&
+		(!MLX5_SRM_ENABLE_LARGE_KERNEL_QP || qp->srm_large_fast_ready);
 	bool lock_sq = !srm_fast;
 	int phase_stats =
 		qp->hollow_rc && qp->sender_side && srm_stats_is_enabled();
@@ -1347,7 +1349,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		uint32_t post_publish_depth = qp->sq_publish_depth;
 		uint32_t post_kernel_qpn = qp->srm_kernel_qpn;
 
-		if (srm_fast &&
+		if (MLX5_SRM_ENABLE_LARGE_KERNEL_QP && srm_fast &&
 		    mlx5_srm_wr_data_bytes(wr) > MLX5_SRM_LARGE_MSG_THRESHOLD) {
 			post_wq = &qp->srm_large_sq;
 			post_sq_start = qp->srm_large_sq_start;
