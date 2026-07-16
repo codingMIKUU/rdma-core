@@ -49,10 +49,10 @@
 
 #define MLX5_ATOMIC_SIZE 8
 
-#define SRM_BACKOFF_SPIN_RETRIES 4
-#define SRM_BACKOFF_YIELD_RETRIES 2
-#define SRM_BACKOFF_BASE_NS 1000ULL
-#define SRM_BACKOFF_MAX_NS 64000ULL
+#define SRM_BACKOFF_SPIN_RETRIES 8
+#define SRM_BACKOFF_YIELD_RETRIES 0
+#define SRM_BACKOFF_BASE_NS 500ULL
+#define SRM_BACKOFF_MAX_NS 1000ULL
 #define SRM_RESERVE_MAX_WAIT_NS 100000000ULL
 
 static const uint32_t mlx5_ib_opcode[] = {
@@ -1080,10 +1080,12 @@ static inline void srm_queue_backoff(unsigned int attempt,
 	}
 
 	attempt -= SRM_BACKOFF_SPIN_RETRIES;
+#if SRM_BACKOFF_YIELD_RETRIES > 0
 	if (attempt < SRM_BACKOFF_YIELD_RETRIES) {
 		sched_yield();
 		return;
 	}
+#endif
 
 	sleep_attempt = attempt - SRM_BACKOFF_YIELD_RETRIES;
 	sleep_ns = SRM_BACKOFF_BASE_NS;
