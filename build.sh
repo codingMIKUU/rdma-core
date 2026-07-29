@@ -3,6 +3,7 @@ set -e
 
 SRCDIR=`dirname $0`
 BUILDDIR="$SRCDIR/build"
+BUILD_TYPE="${BUILD_TYPE:-Release}"
 
 mkdir -p "$BUILDDIR"
 
@@ -24,10 +25,10 @@ cd "$BUILDDIR"
 
 if [ "x$NINJA" == "x" ]; then
     echo "Ninja not found, falling back to make"
-    $CMAKE -DCMAKE_BUILD_TYPE=Debug -DIN_PLACE=1 ${EXTRA_CMAKE_FLAGS:-} ..
+    $CMAKE -DCMAKE_BUILD_TYPE="$BUILD_TYPE" -DIN_PLACE=1 ${EXTRA_CMAKE_FLAGS:-} ..
     make
 else
     echo "Ninja found, using it"
-    $CMAKE  -DIN_PLACE=1 -GNinja ${EXTRA_CMAKE_FLAGS:-} ..
+    $CMAKE -DCMAKE_BUILD_TYPE="$BUILD_TYPE" -DIN_PLACE=1 -GNinja ${EXTRA_CMAKE_FLAGS:-} ..
     $NINJA
 fi

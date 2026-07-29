@@ -784,6 +784,20 @@ again:
 			return CQ_POLL_ERR;
 		wq = &mqp->sq;
 		sq_start = mqp->sq_start;
+		if (mqp->hollow_rc && mqp->srm_path_count > 1) {
+			unsigned int path_idx;
+
+			for (path_idx = 0; path_idx < mqp->srm_path_count;
+			     path_idx++) {
+				if (mqp->srm_paths[path_idx].kernel_qpn == qpn) {
+					wq = &mqp->srm_paths[path_idx].wq;
+					sq_start = mqp->srm_paths[path_idx].sq_start;
+					break;
+				}
+			}
+			if (unlikely(path_idx == mqp->srm_path_count))
+				return CQ_POLL_ERR;
+		}
 		if (mqp->hollow_rc && mqp->srm_large_kernel_qpn_valid &&
 		    qpn == mqp->srm_large_kernel_qpn) {
 			wq = &mqp->srm_large_sq;
@@ -961,6 +975,19 @@ again:
 			if (unlikely(!mqp))
 				return CQ_POLL_ERR;
 			wq = &mqp->sq;
+			if (mqp->hollow_rc && mqp->srm_path_count > 1) {
+				unsigned int path_idx;
+
+				for (path_idx = 0; path_idx < mqp->srm_path_count;
+				     path_idx++) {
+					if (mqp->srm_paths[path_idx].kernel_qpn == qpn) {
+						wq = &mqp->srm_paths[path_idx].wq;
+						break;
+					}
+				}
+				if (unlikely(path_idx == mqp->srm_path_count))
+					return CQ_POLL_ERR;
+			}
 			if (unlikely(!wq->wqe_cnt || !wq->wrid ||
 				     !wq->wqe_head)) {
 				*cur_rsc = NULL;
@@ -971,7 +998,12 @@ again:
 				cq->verbs_cq.cq_ex.wr_id = wq->wrid[idx];
 			else
 				wc->wr_id = wq->wrid[idx];
-			wq->tail = wq->wqe_head[idx] + 1;
+			wq->tail = mqp->hollow_rc ? wqe_ctr + 1 :
+				wq->wqe_head[idx] + 1;
+			if (mqp->hollow_rc) {
+				if (!lazy)
+					wc->qp_num = mqp->verbs_qp.qp.qp_num;
+			}
 		} else {
 			err = get_cur_rsc(mctx, cqe_ver, qpn, srqn_uidx,
 					  cur_rsc, cur_srq, &is_srq);

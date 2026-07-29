@@ -99,6 +99,35 @@ struct srm_app_table_alloc_req {
 	uint64_t xrc_table_span;
 };
 
+#define MLX5_SRM_PATHS_PER_IP_PARAM \
+	"/sys/module/mlx5_ib/parameters/srm_paths_per_ip"
+
+/*
+ * Read the kernel's load-time path-pool width so rdma-core uses the same
+ * topology without requiring an application-visible configuration field.
+ */
+static int mlx5_srm_read_kernel_paths_per_ip(uint32_t *paths_per_ip)
+{
+	FILE *param;
+	unsigned int value;
+	int ret = 0;
+
+	param = fopen(MLX5_SRM_PATHS_PER_IP_PARAM, "r");
+	if (!param)
+		return -errno;
+
+	if (fscanf(param, "%u", &value) != 1)
+		ret = -EINVAL;
+	else if (!value || value > MLX5_IB_SRM_MAX_PATHS_PER_IP)
+		ret = -ERANGE;
+
+	fclose(param);
+	if (!ret)
+		*paths_per_ip = value;
+
+	return ret;
+}
+
 
 struct mlx5_srm_global_tables {
 	pthread_mutex_t mutex;
@@ -157,6 +186,8 @@ static int mlx5_srm_prepare_tables(struct mlx5_context *ctx,
 	uint32_t num_level = SRM_NUM_LEVEL;
 	uint32_t num_sched = SRM_NUM_SCHED;
 	uint32_t max_xrc = SRM_MAX_USER_XRC_QP_PER_SRM;
+	uint32_t paths_per_ip;
+	int ret;
 	size_t wqe_map_len = 
 		(sizeof(struct srm_aligned_u32) * SRM_KERN_MAX_USER_THREADS* num_level * num_sched); //TODO:改类型
 	size_t level_map_len = 
@@ -173,6 +204,12 @@ static int mlx5_srm_prepare_tables(struct mlx5_context *ctx,
 		}
 		pthread_mutex_unlock(&g_srm_tables.mutex);
 		return 0;
+	}
+
+	ret = mlx5_srm_read_kernel_paths_per_ip(&paths_per_ip);
+	if (ret) {
+		pthread_mutex_unlock(&g_srm_tables.mutex);
+		return ret;
 	}
 
 	g_srm_tables.bridge_fd = open(SRM_BRIDGE_DEV_PATH, O_RDWR);
@@ -213,7 +250,7 @@ static int mlx5_srm_prepare_tables(struct mlx5_context *ctx,
 
 	req.app_id = SRM_AUTO_APP_ID;
 	req.app_threads = app_threads;
-	req.xrc_qp_num_per_srm = attr->srm_xrc_qp_num_per_srm;
+	req.xrc_qp_num_per_srm = paths_per_ip;
 	if (ioctl(g_srm_tables.bridge_fd, SRM_ALLOC_APP_TABLE, &req) < 0) {
 		munmap(xrc_map, xrc_map_len);
 		munmap(level_map, level_map_len);
@@ -3455,12 +3492,17 @@ static int qp_enable_mmo(struct ibv_qp *qp)
 	return ret ? mlx5_get_cmd_status_err(ret, out) : 0;
 }
 
+/*
+ * Drop this QP's references to every shared SQ/token mapping and free its
+ * per-path userspace completion metadata.
+ */
 static void mlx5_srm_release_mapping(struct mlx5_context *ctx,
 				     struct mlx5_qp *qp)
 {
 	struct mlx5_srm_mapping_bundle **link;
 	struct mlx5_srm_mapping_bundle *bundle;
 	int lane;
+	unsigned int path_idx;
 
 	for (lane = 0; lane < 2; lane++) {
 		bundle = lane ? qp->srm_large_mapping : qp->srm_mapping;
@@ -3483,6 +3525,33 @@ static void mlx5_srm_release_mapping(struct mlx5_context *ctx,
 		pthread_mutex_unlock(&ctx->srm_mapping_mutex);
 	}
 
+	for (path_idx = 1; path_idx < qp->srm_path_count; path_idx++) {
+		bundle = qp->srm_paths[path_idx].mapping;
+		if (!bundle)
+			continue;
+
+		pthread_mutex_lock(&ctx->srm_mapping_mutex);
+		if (--bundle->refs == 0) {
+			for (link = &ctx->srm_mapping_bundles; *link;
+			     link = &(*link)->next) {
+				if (*link == bundle) {
+					*link = bundle->next;
+					break;
+				}
+			}
+			munmap(bundle->sq_map, bundle->sq_map_len);
+			munmap(bundle->publish_map, bundle->publish_map_len);
+			free(bundle);
+		}
+		pthread_mutex_unlock(&ctx->srm_mapping_mutex);
+
+		free(qp->srm_paths[path_idx].wq.wqe_head);
+		free(qp->srm_paths[path_idx].wq.wr_data);
+		free(qp->srm_paths[path_idx].wq.wrid);
+		memset(&qp->srm_paths[path_idx], 0,
+		       sizeof(qp->srm_paths[path_idx]));
+	}
+
 	qp->srm_mapping = NULL;
 	qp->sq_mmap_buf = NULL;
 	qp->sq_mmap_len = 0;
@@ -3502,6 +3571,9 @@ static void mlx5_srm_release_mapping(struct mlx5_context *ctx,
 	qp->srm_large_sq_publish_token = NULL;
 	qp->srm_large_sq_publish_depth = 0;
 	qp->srm_large_fast_ready = 0;
+	memset(&qp->srm_paths[0], 0, sizeof(qp->srm_paths[0]));
+	qp->srm_path_count = 0;
+	qp->srm_pinned_path = UINT8_MAX;
 }
 
 void mlx5_srm_release_mappings(struct mlx5_context *ctx)
@@ -3525,6 +3597,10 @@ void mlx5_srm_release_mappings(struct mlx5_context *ctx)
 
 #define MLX5_SRM_ENABLE_LARGE_KERNEL_QP 0
 
+/*
+ * Map and cache the primary kernel SQ, control page and publish-token array.
+ * Mapping bundles are shared by userspace QPs that resolve to the same KQP.
+ */
 static int mlx5_srm_acquire_mapping(struct mlx5_context *ctx,
 				    struct mlx5_qp *qp,
 				    const struct mlx5_ib_modify_qp_resp *resp)
@@ -3635,6 +3711,124 @@ attach:
 		qp->sq_publish_depth && qp->sq.wrid &&
 		qp->sq_metadata_cnt >= qp->sq.wqe_cnt;
 	pthread_mutex_unlock(&ctx->srm_mapping_mutex);
+	return 0;
+
+err_publish:
+	munmap(publish_map, resp->publish_mmap_len);
+err_sq:
+	munmap(sq_map, resp->sq_mmap_len);
+err_unlock:
+	pthread_mutex_unlock(&ctx->srm_mapping_mutex);
+	return errno;
+}
+
+/*
+ * Attach one additional physical path from the logical-IP pool and allocate
+ * the per-user-QP wrid metadata needed to decode completions from that path.
+ */
+static int mlx5_srm_acquire_path_mapping(
+	struct mlx5_context *ctx, struct mlx5_qp *qp,
+	const struct mlx5_ib_srm_path_resp *resp, unsigned int path_idx)
+{
+	struct mlx5_srm_mapping_bundle *bundle;
+	struct mlx5_srm_path *path;
+	struct mlx5_sq_ctrl_page *ctrl_base;
+	size_t kernel_sq_bytes;
+	size_t publish_bytes;
+	void *sq_map = MAP_FAILED;
+	void *publish_map = MAP_FAILED;
+
+	if (path_idx >= MLX5_IB_SRM_MAX_PATHS_PER_IP ||
+	    !resp->kernel_qpn || !resp->kernel_sq_wqe_cnt ||
+	    !resp->sq_mmap_len || !resp->publish_mmap_len ||
+	    !resp->publish_depth ||
+	    (resp->publish_depth & (resp->publish_depth - 1)) ||
+	    resp->kernel_sq_wqe_shift >= 8U * sizeof(size_t) ||
+	    resp->kernel_sq_wqe_cnt >
+		(SIZE_MAX >> resp->kernel_sq_wqe_shift)) {
+		errno = EINVAL;
+		return errno;
+	}
+
+	kernel_sq_bytes = (size_t)resp->kernel_sq_wqe_cnt <<
+		resp->kernel_sq_wqe_shift;
+	publish_bytes = (size_t)resp->publish_depth * sizeof(uint64_t);
+	if (kernel_sq_bytes > resp->sq_mmap_len ||
+	    publish_bytes > resp->publish_mmap_len ||
+	    !ctx->srm_ctrl_map ||
+	    resp->sq_state_slot_idx >=
+		ctx->srm_ctrl_map_len / sizeof(*ctrl_base)) {
+		errno = EINVAL;
+		return errno;
+	}
+
+	pthread_mutex_lock(&ctx->srm_mapping_mutex);
+	for (bundle = ctx->srm_mapping_bundles; bundle;
+	     bundle = bundle->next) {
+		if (bundle->kernel_qpn == resp->kernel_qpn &&
+		    bundle->slot_idx == resp->sq_state_slot_idx)
+			break;
+	}
+
+	if (bundle) {
+		if (bundle->sq_map_len != resp->sq_mmap_len ||
+		    bundle->publish_map_len != resp->publish_mmap_len ||
+		    bundle->publish_depth != resp->publish_depth) {
+			errno = EPROTO;
+			goto err_unlock;
+		}
+		bundle->refs++;
+		goto attach;
+	}
+
+	sq_map = mmap(NULL, resp->sq_mmap_len, PROT_READ | PROT_WRITE,
+		      MAP_SHARED, ctx->ibv_ctx.context.cmd_fd,
+		      resp->sq_mmap_offset);
+	if (sq_map == MAP_FAILED)
+		goto err_unlock;
+
+	publish_map = mmap(NULL, resp->publish_mmap_len,
+			   PROT_READ | PROT_WRITE, MAP_SHARED,
+			   ctx->ibv_ctx.context.cmd_fd,
+			   resp->publish_mmap_offset);
+	if (publish_map == MAP_FAILED)
+		goto err_sq;
+
+	bundle = calloc(1, sizeof(*bundle));
+	if (!bundle)
+		goto err_publish;
+
+	bundle->kernel_qpn = resp->kernel_qpn;
+	bundle->slot_idx = resp->sq_state_slot_idx;
+	bundle->refs = 1;
+	bundle->publish_depth = resp->publish_depth;
+	bundle->sq_map = sq_map;
+	bundle->sq_map_len = resp->sq_mmap_len;
+	bundle->publish_map = publish_map;
+	bundle->publish_map_len = resp->publish_mmap_len;
+	bundle->next = ctx->srm_mapping_bundles;
+	ctx->srm_mapping_bundles = bundle;
+
+attach:
+	path = &qp->srm_paths[path_idx];
+	ctrl_base = ctx->srm_ctrl_map;
+	path->mapping = bundle;
+	path->sq_start = bundle->sq_map;
+	path->ctrl = &ctrl_base[bundle->slot_idx];
+	path->publish_token = bundle->publish_map;
+	path->publish_depth = bundle->publish_depth;
+	path->kernel_qpn = bundle->kernel_qpn;
+	path->wq.wqe_cnt = resp->kernel_sq_wqe_cnt;
+	path->wq.wqe_shift = resp->kernel_sq_wqe_shift;
+	path->wq.max_post = resp->kernel_sq_max_post;
+	path->wq.max_gs = resp->kernel_sq_max_gs;
+	path->wq.qp_state_max_gs = resp->kernel_sq_qp_state_max_gs;
+	path->wq.qend = path->sq_start + kernel_sq_bytes;
+	pthread_mutex_unlock(&ctx->srm_mapping_mutex);
+
+	if (mlx5_resize_wq_metadata(&path->wq, &path->metadata_cnt,
+				    path->wq.wqe_cnt))
+		return errno;
 	return 0;
 
 err_publish:
@@ -3897,8 +4091,47 @@ int __mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 		mqp->sq.max_gs = resp.drv_payload.kernel_sq_max_gs;
 		mqp->sq.qp_state_max_gs = resp.drv_payload.kernel_sq_qp_state_max_gs;
 		mqp->max_inline_data = resp.drv_payload.kernel_max_inline_data;
+
+		if (resp.drv_payload.comp_mask &
+		    MLX5_IB_MODIFY_QP_RESP_MASK_SRM_PATH_POOL) {
+			unsigned int path_idx;
+			struct mlx5_srm_path *path0 = &mqp->srm_paths[0];
+
+			if (!resp.drv_payload.srm_path_count ||
+			    resp.drv_payload.srm_path_count >
+				MLX5_IB_SRM_MAX_PATHS_PER_IP) {
+				errno = EPROTO;
+				return errno;
+			}
+			mqp->srm_logical_ip_idx =
+				resp.drv_payload.srm_logical_ip_idx;
+			mqp->srm_path_count = resp.drv_payload.srm_path_count;
+			mqp->srm_route_slot_idx =
+				resp.drv_payload.srm_route_slot_idx;
+			mqp->srm_pinned_path = UINT8_MAX;
+			mqp->srm_route_generation = 0;
+
+			path0->mapping = mqp->srm_mapping;
+			path0->sq_start = mqp->sq_start;
+			path0->ctrl = mqp->sq_ctrl;
+			path0->publish_token = mqp->sq_publish_token;
+			path0->publish_depth = mqp->sq_publish_depth;
+			path0->kernel_qpn = mqp->srm_kernel_qpn;
+			path0->wq = mqp->sq;
+
+			for (path_idx = 1; path_idx < mqp->srm_path_count;
+			     path_idx++) {
+				ret = mlx5_srm_acquire_path_mapping(
+					context, mqp,
+					&resp.drv_payload.srm_paths[path_idx],
+					path_idx);
+				if (ret)
+					return ret;
+			}
+		}
 		fprintf(stderr,
-			"SRM_KERNEL_SQ qpn=%u wqe_cnt=%u max_post=%u wqe_shift=%u max_gs=%u reserve_limit=%llu\n",
+			"SRM_KERNEL_SQ logical_ip=%u paths=%u qpn=%u wqe_cnt=%u max_post=%u wqe_shift=%u max_gs=%u reserve_limit=%llu\n",
+			mqp->srm_logical_ip_idx, mqp->srm_path_count,
 			mqp->srm_kernel_qpn, mqp->sq.wqe_cnt,
 			mqp->sq.max_post, mqp->sq.wqe_shift, mqp->sq.max_gs,
 			(unsigned long long)(((uint64_t)mqp->sq.wqe_cnt * 2) / 3));

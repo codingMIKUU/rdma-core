@@ -479,18 +479,53 @@ struct mlx5_sq_ctrl_page {
 	uint8_t resv_pad[56];
 	uint64_t cons_idx;
 	uint8_t cons_pad[56];
+	uint32_t route_generation;
+	uint16_t logical_ip_idx;
+	uint8_t path_idx;
+	uint8_t path_count;
+	uint8_t active_path[2];
+	uint8_t path_state;
+	uint8_t replacement_path;
+	uint32_t route_flags;
+	uint64_t migration_end;
+	uint64_t migration_ready;
+	uint8_t route_pad[96];
 } __attribute__((aligned(64)));
-_Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 128,
-	       "hollow RC ctrl ABI must occupy two cachelines");
+_Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 256,
+	       "hollow RC ctrl ABI must divide the system page size");
 
 #define MLX5_SRM_PUBLISH_USR_BITS 16
 #define MLX5_SRM_PUBLISH_USR_MASK ((1ULL << MLX5_SRM_PUBLISH_USR_BITS) - 1)
-#define MLX5_SRM_PUBLISH_SEQ_MASK ((1ULL << 48) - 1)
+#define MLX5_SRM_PUBLISH_BYTES_BITS 16
+#define MLX5_SRM_PUBLISH_BYTES_SHIFT MLX5_SRM_PUBLISH_USR_BITS
+#define MLX5_SRM_PUBLISH_BYTES_MASK ((1ULL << MLX5_SRM_PUBLISH_BYTES_BITS) - 1)
+#define MLX5_SRM_PUBLISH_SEQ_SHIFT 32
+#define MLX5_SRM_PUBLISH_SEQ_MASK 0xffffffffULL
+#define MLX5_SRM_PUBLISH_BYTE_GRANULARITY 64
+#define MLX5_SRM_RESV_FROZEN (1ULL << 63)
+#define MLX5_SRM_RESV_INDEX_MASK (MLX5_SRM_RESV_FROZEN - 1)
 
-static inline uint64_t mlx5_srm_publish_token(uint64_t slot, uint16_t usr_rc)
+enum mlx5_srm_path_state {
+	MLX5_SRM_PATH_ACTIVE = 0,
+	MLX5_SRM_PATH_FREEZE_REQ,
+	MLX5_SRM_PATH_QUIESCED,
+	MLX5_SRM_PATH_COPYING,
+	MLX5_SRM_PATH_DRAINING,
+	MLX5_SRM_PATH_INACTIVE,
+};
+
+static inline uint64_t mlx5_srm_publish_token(uint64_t slot, uint16_t usr_rc,
+					       uint32_t payload_bytes)
 {
+	uint64_t units = (payload_bytes +
+		MLX5_SRM_PUBLISH_BYTE_GRANULARITY - 1) /
+		MLX5_SRM_PUBLISH_BYTE_GRANULARITY;
+
+	if (units > MLX5_SRM_PUBLISH_BYTES_MASK)
+		units = MLX5_SRM_PUBLISH_BYTES_MASK;
 	return (((slot + 1) & MLX5_SRM_PUBLISH_SEQ_MASK) <<
-		MLX5_SRM_PUBLISH_USR_BITS) | usr_rc;
+		MLX5_SRM_PUBLISH_SEQ_SHIFT) |
+	       (units << MLX5_SRM_PUBLISH_BYTES_SHIFT) | usr_rc;
 }
 
 struct mlx5_srm_mapping_bundle {
@@ -653,6 +688,17 @@ struct mlx5_wq {
 	uint32_t		srm_entries_cap; /* SRM entries capacity */
 };
 
+struct mlx5_srm_path {
+	struct mlx5_srm_mapping_bundle *mapping;
+	void *sq_start;
+	struct mlx5_sq_ctrl_page *ctrl;
+	uint64_t *publish_token;
+	uint32_t publish_depth;
+	uint32_t kernel_qpn;
+	uint32_t metadata_cnt;
+	struct mlx5_wq wq;
+};
+
 struct mlx5_devx_uar {
 	struct mlx5dv_devx_uar dv_devx_uar;
 	struct ibv_context *context;
@@ -810,6 +856,12 @@ struct mlx5_qp {
 	uint8_t hollow_rc;
 	uint8_t srm_fast_ready;
 	uint8_t srm_large_fast_ready;
+	uint16_t srm_logical_ip_idx;
+	uint8_t srm_path_count;
+	uint32_t srm_route_slot_idx;
+	uint8_t srm_pinned_path;
+	uint32_t srm_route_generation;
+	struct mlx5_srm_path srm_paths[MLX5_IB_SRM_MAX_PATHS_PER_IP];
 	uint32_t srm_num_level;
 	uint32_t srm_num_sched;
 	uint32_t srm_max_xrc_qp_per_srm;

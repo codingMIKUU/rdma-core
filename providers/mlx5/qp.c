@@ -495,7 +495,8 @@ static __be32 send_ieth(struct ibv_send_wr *wr)
 
 static int set_data_inl_seg(struct mlx5_qp *qp, struct ibv_send_wr *wr,
 			    void *wqe, int *sz,
-			    struct mlx5_sg_copy_ptr *sg_copy_ptr)
+			    struct mlx5_sg_copy_ptr *sg_copy_ptr,
+			    uint32_t *payload_bytes)
 {
 	struct mlx5_wqe_inline_seg *seg;
 	void *addr;
@@ -533,6 +534,8 @@ static int set_data_inl_seg(struct mlx5_qp *qp, struct ibv_send_wr *wr,
 		*sz = align(inl + sizeof seg->byte_count, 16) / 16;
 	} else
 		*sz = 0;
+	if (payload_bytes)
+		*payload_bytes = inl;
 
 	return 0;
 }
@@ -1111,6 +1114,108 @@ static inline void srm_queue_backoff(unsigned int attempt,
 #define MLX5_SRM_ENABLE_LARGE_KERNEL_QP 0
 #define MLX5_SRM_LARGE_MSG_THRESHOLD (10U * 1024U)
 
+/*
+ * Give each userspace QP a stable slot in active_path[0..1].  Keeping this
+ * choice fixed prevents one RC stream from alternating between kernel QPs.
+ */
+static inline unsigned int mlx5_srm_stable_active_slot(struct mlx5_qp *qp)
+{
+	uint32_t key = qp->usr_rc_cnt ^
+		((uint32_t)qp->srm_logical_ip_idx * 0x9e3779b9U);
+
+	key ^= key >> 16;
+	key *= 0x7feb352dU;
+	key ^= key >> 15;
+	return key & 1;
+}
+
+/*
+ * Resolve the stable active slot after route_generation changes and cache the
+ * selected physical path in the userspace QP.
+ */
+static inline uint8_t mlx5_srm_refresh_pinned_path(struct mlx5_qp *qp)
+{
+	struct mlx5_sq_ctrl_page *route;
+	uint32_t generation;
+	unsigned int active_slot;
+	uint8_t path;
+	uint8_t fallback;
+
+	if (qp->srm_path_count <= 1)
+		return 0;
+	route = qp->srm_paths[0].ctrl;
+	if (unlikely(!route))
+		return UINT8_MAX;
+
+	generation = __atomic_load_n(&route->route_generation,
+				      __ATOMIC_ACQUIRE);
+	active_slot = mlx5_srm_stable_active_slot(qp);
+	path = __atomic_load_n(&route->active_path[active_slot],
+			       __ATOMIC_ACQUIRE);
+	fallback = __atomic_load_n(&route->active_path[active_slot ^ 1],
+				   __ATOMIC_ACQUIRE);
+	if (unlikely(path >= qp->srm_path_count))
+		path = fallback;
+	if (unlikely(path >= qp->srm_path_count))
+		return UINT8_MAX;
+
+	qp->srm_pinned_path = path;
+	qp->srm_route_generation = generation;
+	return path;
+}
+
+/*
+ * Return the cached path on the normal post path.  Only a generation change
+ * falls back to reading active_path[] and refreshing the cache.
+ */
+static inline uint8_t mlx5_srm_get_pinned_path(struct mlx5_qp *qp)
+{
+	struct mlx5_sq_ctrl_page *route;
+	uint32_t generation;
+	uint8_t path;
+
+	if (qp->srm_path_count <= 1)
+		return 0;
+	route = qp->srm_paths[0].ctrl;
+	if (unlikely(!route))
+		return UINT8_MAX;
+
+	generation = __atomic_load_n(&route->route_generation,
+				      __ATOMIC_ACQUIRE);
+	path = qp->srm_pinned_path;
+	if (likely(path < qp->srm_path_count &&
+		   generation == qp->srm_route_generation))
+		return path;
+	return mlx5_srm_refresh_pinned_path(qp);
+}
+
+/*
+ * Resolve the replacement published by the kernel after reserve observes a
+ * frozen source, and update the cached path/generation before retrying.
+ */
+static inline uint8_t mlx5_srm_frozen_replacement(struct mlx5_qp *qp,
+						   uint8_t frozen_path)
+{
+	struct mlx5_sq_ctrl_page *ctrl;
+	uint8_t replacement;
+
+	if (unlikely(frozen_path >= qp->srm_path_count))
+		return UINT8_MAX;
+	ctrl = qp->srm_paths[frozen_path].ctrl;
+	if (unlikely(!ctrl))
+		return UINT8_MAX;
+
+	replacement = __atomic_load_n(&ctrl->replacement_path,
+				      __ATOMIC_ACQUIRE);
+	if (replacement >= qp->srm_path_count || replacement == frozen_path)
+		return UINT8_MAX;
+
+	qp->srm_pinned_path = replacement;
+	qp->srm_route_generation = __atomic_load_n(
+		&qp->srm_paths[0].ctrl->route_generation, __ATOMIC_ACQUIRE);
+	return replacement;
+}
+
 static inline uint32_t mlx5_srm_wr_data_bytes(const struct ibv_send_wr *wr)
 {
 	uint64_t bytes = 0;
@@ -1122,6 +1227,11 @@ static inline uint32_t mlx5_srm_wr_data_bytes(const struct ibv_send_wr *wr)
 	return bytes > UINT32_MAX ? UINT32_MAX : (uint32_t)bytes;
 }
 
+/*
+ * Reserve one shared kernel-SQ slot.  The pre-check handles an already frozen
+ * path; the post-fetch_add check closes the race with a concurrent kernel
+ * freeze and rolls back the transient reservation before returning EAGAIN.
+ */
 static inline int srm_reserve_wqe_blocking(struct mlx5_sq_ctrl_page *ctrl,
 					    uint32_t wqe_cnt, uint64_t *slot,
 					    uint64_t *cons_out)
@@ -1143,6 +1253,8 @@ static inline int srm_reserve_wqe_blocking(struct mlx5_sq_ctrl_page *ctrl,
 
 	for (;;) {
 		resv = __atomic_load_n(&ctrl->resv_idx, __ATOMIC_RELAXED);
+		if (unlikely(resv & MLX5_SRM_RESV_FROZEN))
+			return EAGAIN;
 		cons = __atomic_load_n(&ctrl->cons_idx, __ATOMIC_ACQUIRE);
 		occupancy = resv - cons;
 		if (stats_enabled && occupancy > stats->max_occupancy)
@@ -1150,6 +1262,11 @@ static inline int srm_reserve_wqe_blocking(struct mlx5_sq_ctrl_page *ctrl,
 		if (resv - cons < limit) {
 			resv = __atomic_fetch_add(&ctrl->resv_idx, 1,
 						  __ATOMIC_RELAXED);
+			if (unlikely(resv & MLX5_SRM_RESV_FROZEN)) {
+				__atomic_fetch_sub(&ctrl->resv_idx, 1,
+						   __ATOMIC_RELAXED);
+				return EAGAIN;
+			}
 			if (slot)
 				*slot = resv;
 			if (cons_out)
@@ -1188,6 +1305,7 @@ static inline int srm_reserve_wqe_blocking(struct mlx5_sq_ctrl_page *ctrl,
 static inline void srm_mark_wqe_ready(uint64_t *publish_token,
 				      uint32_t publish_depth,
 				      uint32_t usr_rc_cnt, uint64_t slot,
+				      uint32_t payload_bytes,
 				      int phase_stats)
 {
 	uint32_t mask;
@@ -1199,7 +1317,7 @@ static inline void srm_mark_wqe_ready(uint64_t *publish_token,
 		start = rdtsc();
 
 	mask = publish_depth - 1;
-	token = mlx5_srm_publish_token(slot, usr_rc_cnt);
+	token = mlx5_srm_publish_token(slot, usr_rc_cnt, payload_bytes);
 
 	if (phase_stats) {
 		before_store = rdtsc();
@@ -1344,12 +1462,40 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	for (nreq = 0; wr; ++nreq, wr = wr->next) {
 		uint64_t slot = 0;
 		uint64_t cons = 0;
+		uint64_t payload_bytes = 0;
+		uint64_t frozen_wait_start_ns = 0;
+		unsigned int frozen_wait_attempt = 0;
+		uint8_t post_path_idx = 0;
 		struct mlx5_wq *post_wq = &qp->sq;
 		void *post_sq_start = qp->sq_start;
 		struct mlx5_sq_ctrl_page *post_ctrl = qp->sq_ctrl;
 		uint64_t *post_publish_token = qp->sq_publish_token;
 		uint32_t post_publish_depth = qp->sq_publish_depth;
 		uint32_t post_kernel_qpn = qp->srm_kernel_qpn;
+
+		if (srm_fast && qp->srm_path_count > 1) {
+			post_path_idx = mlx5_srm_get_pinned_path(qp);
+			if (unlikely(post_path_idx >= qp->srm_path_count)) {
+				err = EOVERFLOW;
+				if (bad_wr)
+					*bad_wr = wr;
+				goto out;
+			}
+		}
+
+select_srm_path:
+		if (srm_fast && qp->srm_path_count > 1) {
+			struct mlx5_srm_path *path =
+				&qp->srm_paths[post_path_idx];
+
+			post_wq = &path->wq;
+			post_sq_start = path->sq_start;
+			post_ctrl = path->ctrl;
+			post_publish_token = path->publish_token;
+			post_publish_depth = path->publish_depth;
+			post_kernel_qpn = path->kernel_qpn;
+			qend = post_wq->qend;
+		}
 
 		if (MLX5_SRM_ENABLE_LARGE_KERNEL_QP && srm_fast &&
 		    mlx5_srm_wr_data_bytes(wr) > MLX5_SRM_LARGE_MSG_THRESHOLD) {
@@ -1370,7 +1516,93 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			err = srm_reserve_wqe_blocking(post_ctrl,
 						       post_wq->wqe_cnt,
 						       &slot, &cons);
+			if (unlikely(err == EAGAIN && qp->srm_path_count > 1)) {
+				uint8_t frozen_path = post_path_idx;
+
+				for (;;) {
+					uint64_t now_ns = srm_monotonic_ns();
+					uint64_t elapsed_ns;
+					uint64_t frozen_resv;
+					uint8_t next_path;
+
+					if (!frozen_wait_start_ns)
+						frozen_wait_start_ns = now_ns;
+					elapsed_ns = now_ns - frozen_wait_start_ns;
+					next_path = mlx5_srm_frozen_replacement(
+						qp, frozen_path);
+					if (next_path < qp->srm_path_count) {
+						post_path_idx = next_path;
+						break;
+					}
+					frozen_resv = __atomic_load_n(
+						&qp->srm_paths[frozen_path].ctrl->resv_idx,
+						__ATOMIC_ACQUIRE);
+					if (!(frozen_resv &
+					      MLX5_SRM_RESV_FROZEN)) {
+						post_path_idx =
+							mlx5_srm_get_pinned_path(qp);
+						break;
+					}
+					if (elapsed_ns >=
+					    SRM_RESERVE_MAX_WAIT_NS) {
+						struct mlx5_sq_ctrl_page *route_ctrl =
+							qp->srm_paths[0].ctrl;
+
+						fprintf(stderr,
+							"mlx5: SRM FROZEN timeout logical_ip=%u path=%u state=%u replacement=%u active=%u/%u resv=%llu cons=%llu\n",
+							qp->srm_logical_ip_idx,
+							frozen_path,
+							__atomic_load_n(
+								&post_ctrl->path_state,
+								__ATOMIC_ACQUIRE),
+							__atomic_load_n(
+								&post_ctrl->replacement_path,
+								__ATOMIC_ACQUIRE),
+							__atomic_load_n(
+								&route_ctrl->active_path[0],
+								__ATOMIC_ACQUIRE),
+							__atomic_load_n(
+								&route_ctrl->active_path[1],
+								__ATOMIC_ACQUIRE),
+							(unsigned long long)frozen_resv,
+							(unsigned long long)
+								__atomic_load_n(
+									&post_ctrl->cons_idx,
+									__ATOMIC_ACQUIRE));
+						err = ENOMEM;
+						if (bad_wr)
+							*bad_wr = wr;
+						goto out;
+					}
+					srm_queue_backoff(
+						frozen_wait_attempt,
+						SRM_RESERVE_MAX_WAIT_NS -
+							elapsed_ns);
+					if (frozen_wait_attempt != UINT_MAX)
+						frozen_wait_attempt++;
+				}
+				err = 0;
+				goto select_srm_path;
+			}
 			if (err) {
+				if (err == ENOMEM)
+					fprintf(stderr,
+						"mlx5: SRM reserve timeout logical_ip=%u path=%u state=%u replacement=%u resv=%llu cons=%llu wqe_cnt=%u\n",
+						qp->srm_logical_ip_idx,
+						post_path_idx,
+						__atomic_load_n(
+							&post_ctrl->path_state,
+							__ATOMIC_ACQUIRE),
+						__atomic_load_n(
+							&post_ctrl->replacement_path,
+							__ATOMIC_ACQUIRE),
+						(unsigned long long)__atomic_load_n(
+							&post_ctrl->resv_idx,
+							__ATOMIC_ACQUIRE),
+						(unsigned long long)__atomic_load_n(
+							&post_ctrl->cons_idx,
+							__ATOMIC_ACQUIRE),
+						post_wq->wqe_cnt);
 				if (bad_wr)
 					*bad_wr = wr;
 				goto out;
@@ -1665,19 +1897,23 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 
 		if (wr->send_flags & IBV_SEND_INLINE && wr->num_sge) {
 			int uninitialized_var(sz);
+			uint32_t inline_bytes = 0;
 
-			err = set_data_inl_seg(qp, wr, seg, &sz, &sg_copy_ptr);
+			err = set_data_inl_seg(qp, wr, seg, &sz, &sg_copy_ptr,
+					      &inline_bytes);
 			if (unlikely(err)) {
 				*bad_wr = wr;
 				mlx5_dbg(fp, MLX5_DBG_QP_SEND,
 					 "inline layout failed, err %d\n", err);
 				goto out;
 			}
+			payload_bytes = inline_bytes;
 			inl = 1;
 			size += sz;
 		} else {
 			dpseg = seg;
 			for (i = sg_copy_ptr.index; i < wr->num_sge; ++i) {
+				payload_bytes += wr->sg_list[i].length;
 				if (unlikely(dpseg == qend)) {
 					seg = mlx5_get_send_wqe_from(post_sq_start,
 								      post_wq, 0);
@@ -1737,7 +1973,10 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		post_wq->cur_post += DIV_ROUND_UP(size * 16, MLX5_SEND_WQE_BB);
 		if (srm_fast)
 			srm_mark_wqe_ready(post_publish_token, post_publish_depth,
-					   qp->usr_rc_cnt, slot, phase_stats);
+					   qp->usr_rc_cnt, slot,
+					   payload_bytes > UINT32_MAX ?
+					   UINT32_MAX : (uint32_t)payload_bytes,
+					   phase_stats);
 		if (phase_stats)
 		{
 			post_publish_start = rdtsc();
