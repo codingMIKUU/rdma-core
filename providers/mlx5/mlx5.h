@@ -476,7 +476,9 @@ struct mlx5_pd {
 
 struct mlx5_sq_ctrl_page {
 	uint64_t resv_idx;
-	uint8_t resv_pad[56];
+	uint32_t farm_lock;
+	uint32_t farm_bf_offset;
+	uint8_t resv_pad[48];
 	uint64_t cons_idx;
 	uint8_t cons_pad[56];
 } __attribute__((aligned(64)));
@@ -503,6 +505,13 @@ struct mlx5_srm_mapping_bundle {
 	size_t sq_map_len;
 	uint64_t *publish_map;
 	size_t publish_map_len;
+	void *farm_uar_map;
+	size_t farm_uar_map_len;
+	void *farm_uar_reg;
+	void *farm_db_map;
+	size_t farm_db_map_len;
+	__be32 *farm_db;
+	uint32_t farm_bf_buf_size;
 };
 
 struct mlx5_parent_domain {

@@ -1122,9 +1122,14 @@ static inline uint32_t mlx5_srm_wr_data_bytes(const struct ibv_send_wr *wr)
 	return bytes > UINT32_MAX ? UINT32_MAX : (uint32_t)bytes;
 }
 
-static inline int srm_reserve_wqe_blocking(struct mlx5_sq_ctrl_page *ctrl,
-					    uint32_t wqe_cnt, uint64_t *slot,
-					    uint64_t *cons_out)
+static inline void srm_farm_unlock(struct mlx5_sq_ctrl_page *ctrl)
+{
+	__atomic_store_n(&ctrl->farm_lock, 0, __ATOMIC_RELEASE);
+}
+
+static inline int srm_farm_reserve_wqe_blocking(
+	struct mlx5_sq_ctrl_page *ctrl, uint32_t wqe_cnt, uint64_t *slot,
+	uint64_t *cons_out)
 {
 	struct srm_reserve_stats *stats = &srm_reserve_stats;
 	uint64_t stat_start = 0;
@@ -1142,25 +1147,30 @@ static inline int srm_reserve_wqe_blocking(struct mlx5_sq_ctrl_page *ctrl,
 		stat_start = rdtsc();
 
 	for (;;) {
-		resv = __atomic_load_n(&ctrl->resv_idx, __ATOMIC_RELAXED);
-		cons = __atomic_load_n(&ctrl->cons_idx, __ATOMIC_ACQUIRE);
-		occupancy = resv - cons;
-		if (stats_enabled && occupancy > stats->max_occupancy)
-			stats->max_occupancy = occupancy;
-		if (resv - cons < limit) {
-			resv = __atomic_fetch_add(&ctrl->resv_idx, 1,
-						  __ATOMIC_RELAXED);
-			if (slot)
-				*slot = resv;
-			if (cons_out)
-				*cons_out = cons;
-			if (stats_enabled) {
-				stats->calls++;
-				stats->cycles += rdtsc() - stat_start;
-				stats->waited += attempt != 0;
-				stats->retries += attempt;
+		if (__atomic_load_n(&ctrl->farm_lock, __ATOMIC_RELAXED) == 0 &&
+		    __atomic_exchange_n(&ctrl->farm_lock, 1,
+					__ATOMIC_ACQUIRE) == 0) {
+			resv = __atomic_load_n(&ctrl->resv_idx,
+					       __ATOMIC_RELAXED);
+			cons = __atomic_load_n(&ctrl->cons_idx,
+					       __ATOMIC_ACQUIRE);
+			occupancy = resv - cons;
+			if (stats_enabled && occupancy > stats->max_occupancy)
+				stats->max_occupancy = occupancy;
+			if (occupancy < limit) {
+				if (slot)
+					*slot = resv;
+				if (cons_out)
+					*cons_out = cons;
+				if (stats_enabled) {
+					stats->calls++;
+					stats->cycles += rdtsc() - stat_start;
+					stats->waited += attempt != 0;
+					stats->retries += attempt;
+				}
+				return 0;
 			}
-			return 0;
+			srm_farm_unlock(ctrl);
 		}
 
 		now_ns = srm_monotonic_ns();
@@ -1183,6 +1193,24 @@ static inline int srm_reserve_wqe_blocking(struct mlx5_sq_ctrl_page *ctrl,
 		if (attempt != UINT_MAX)
 			attempt++;
 	}
+}
+
+static inline void srm_farm_ring_db(
+	struct mlx5_srm_mapping_bundle *mapping,
+	struct mlx5_sq_ctrl_page *ctrl_page, uint32_t cur_post,
+	struct mlx5_wqe_ctrl_seg *ctrl)
+{
+	uint32_t bf_offset = ctrl_page->farm_bf_offset;
+
+	udma_to_device_barrier();
+	mapping->farm_db[MLX5_SND_DBR] = htobe32(cur_post & 0xffff);
+	udma_to_device_barrier();
+
+	mmio_wc_start();
+	mmio_write64_be(mapping->farm_uar_reg + bf_offset,
+			*(__be64 *)ctrl);
+	mmio_flush_writes();
+	ctrl_page->farm_bf_offset = bf_offset ^ mapping->farm_bf_buf_size;
 }
 
 static inline void srm_mark_wqe_ready(uint64_t *publish_token,
@@ -1319,6 +1347,8 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	uint64_t post_publish_start = 0;
 	uint64_t cleanup_start = 0;
 	uint64_t cleanup_done = 0;
+	bool farm_locked = false;
+	struct mlx5_sq_ctrl_page *farm_locked_ctrl = NULL;
 	bf = qp->bf;
 	qend = qp->sq.qend;
 	fp = to_mctx(ibqp->context)->dbg_fp;
@@ -1350,6 +1380,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		uint64_t *post_publish_token = qp->sq_publish_token;
 		uint32_t post_publish_depth = qp->sq_publish_depth;
 		uint32_t post_kernel_qpn = qp->srm_kernel_qpn;
+		struct mlx5_srm_mapping_bundle *post_mapping = qp->srm_mapping;
 
 		if (MLX5_SRM_ENABLE_LARGE_KERNEL_QP && srm_fast &&
 		    mlx5_srm_wr_data_bytes(wr) > MLX5_SRM_LARGE_MSG_THRESHOLD) {
@@ -1359,6 +1390,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			post_publish_token = qp->srm_large_sq_publish_token;
 			post_publish_depth = qp->srm_large_sq_publish_depth;
 			post_kernel_qpn = qp->srm_large_kernel_qpn;
+			post_mapping = qp->srm_large_mapping;
 		}
 
 		if (srm_fast) {
@@ -1367,14 +1399,16 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 				srm_reserve_stats.pre_reserve_cycles +=
 					reserve_start - iter_start;
 			}
-			err = srm_reserve_wqe_blocking(post_ctrl,
-						       post_wq->wqe_cnt,
-						       &slot, &cons);
+			err = srm_farm_reserve_wqe_blocking(post_ctrl,
+							    post_wq->wqe_cnt,
+							    &slot, &cons);
 			if (err) {
 				if (bad_wr)
 					*bad_wr = wr;
 				goto out;
 			}
+			farm_locked = true;
+			farm_locked_ctrl = post_ctrl;
 			if (phase_stats)
 				reserve_done = rdtsc();
 			post_wq->cur_post = slot;
@@ -1738,6 +1772,15 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		if (srm_fast)
 			srm_mark_wqe_ready(post_publish_token, post_publish_depth,
 					   qp->usr_rc_cnt, slot, phase_stats);
+		if (srm_fast) {
+			__atomic_store_n(&post_ctrl->resv_idx, slot + 1,
+					 __ATOMIC_RELEASE);
+			srm_farm_ring_db(post_mapping, post_ctrl,
+					 post_wq->cur_post, ctrl);
+			srm_farm_unlock(post_ctrl);
+			farm_locked = false;
+			farm_locked_ctrl = NULL;
+		}
 		if (phase_stats)
 		{
 			post_publish_start = rdtsc();
@@ -1771,6 +1814,8 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	}
 
 out:
+	if (farm_locked)
+		srm_farm_unlock(farm_locked_ctrl);
 	if (phase_stats)
 		cleanup_start = rdtsc();
 	qp->fm_cache = next_fence;

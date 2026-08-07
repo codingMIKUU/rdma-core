@@ -3478,6 +3478,8 @@ static void mlx5_srm_release_mapping(struct mlx5_context *ctx,
 			}
 			munmap(bundle->sq_map, bundle->sq_map_len);
 			munmap(bundle->publish_map, bundle->publish_map_len);
+			munmap(bundle->farm_uar_map, bundle->farm_uar_map_len);
+			munmap(bundle->farm_db_map, bundle->farm_db_map_len);
 			free(bundle);
 		}
 		pthread_mutex_unlock(&ctx->srm_mapping_mutex);
@@ -3513,6 +3515,8 @@ void mlx5_srm_release_mappings(struct mlx5_context *ctx)
 		ctx->srm_mapping_bundles = bundle->next;
 		munmap(bundle->sq_map, bundle->sq_map_len);
 		munmap(bundle->publish_map, bundle->publish_map_len);
+		munmap(bundle->farm_uar_map, bundle->farm_uar_map_len);
+		munmap(bundle->farm_db_map, bundle->farm_db_map_len);
 		free(bundle);
 	}
 	if (ctx->srm_ctrl_map) {
@@ -3535,10 +3539,14 @@ static int mlx5_srm_acquire_mapping(struct mlx5_context *ctx,
 	size_t publish_bytes;
 	void *sq_map = MAP_FAILED;
 	void *publish_map = MAP_FAILED;
+	void *farm_uar_map = MAP_FAILED;
+	void *farm_db_map = MAP_FAILED;
 
 	if (!resp->kernel_qpn || !resp->kernel_sq_wqe_cnt ||
 	    !resp->sq_mmap_len || !resp->sq_state_mmap_len ||
 	    !resp->publish_mmap_len || !resp->publish_depth ||
+	    !resp->farm_uar_mmap_len || !resp->farm_db_mmap_len ||
+	    !resp->farm_bf_buf_size ||
 	    (resp->publish_depth & (resp->publish_depth - 1)) ||
 	    resp->kernel_sq_wqe_shift >= 8U * sizeof(size_t) ||
 	    resp->kernel_sq_wqe_cnt > (SIZE_MAX >> resp->kernel_sq_wqe_shift)) {
@@ -3551,6 +3559,11 @@ static int mlx5_srm_acquire_mapping(struct mlx5_context *ctx,
 	publish_bytes = (size_t)resp->publish_depth * sizeof(uint64_t);
 	if (kernel_sq_bytes > resp->sq_mmap_len ||
 	    publish_bytes > resp->publish_mmap_len ||
+	    resp->farm_uar_reg_offset > resp->farm_uar_mmap_len ||
+	    (size_t)resp->farm_bf_buf_size + sizeof(uint64_t) >
+		resp->farm_uar_mmap_len - resp->farm_uar_reg_offset ||
+	    resp->farm_db_offset + 2 * sizeof(__be32) >
+		resp->farm_db_mmap_len ||
 	    resp->sq_state_slot_idx >=
 		resp->sq_state_mmap_len / sizeof(*ctrl_base)) {
 		errno = EINVAL;
@@ -3568,7 +3581,10 @@ static int mlx5_srm_acquire_mapping(struct mlx5_context *ctx,
 	if (bundle) {
 		if (bundle->sq_map_len != resp->sq_mmap_len ||
 		    bundle->publish_map_len != resp->publish_mmap_len ||
-		    bundle->publish_depth != resp->publish_depth) {
+		    bundle->publish_depth != resp->publish_depth ||
+		    bundle->farm_uar_map_len != resp->farm_uar_mmap_len ||
+		    bundle->farm_db_map_len != resp->farm_db_mmap_len ||
+		    bundle->farm_bf_buf_size != resp->farm_bf_buf_size) {
 			errno = EPROTO;
 			goto err_unlock;
 		}
@@ -3604,9 +3620,23 @@ static int mlx5_srm_acquire_mapping(struct mlx5_context *ctx,
 	if (publish_map == MAP_FAILED)
 		goto err_sq;
 
+	farm_uar_map = mmap(NULL, resp->farm_uar_mmap_len,
+			     PROT_READ | PROT_WRITE, MAP_SHARED,
+			     ctx->ibv_ctx.context.cmd_fd,
+			     resp->farm_uar_mmap_offset);
+	if (farm_uar_map == MAP_FAILED)
+		goto err_publish;
+
+	farm_db_map = mmap(NULL, resp->farm_db_mmap_len,
+			    PROT_READ | PROT_WRITE, MAP_SHARED,
+			    ctx->ibv_ctx.context.cmd_fd,
+			    resp->farm_db_mmap_offset);
+	if (farm_db_map == MAP_FAILED)
+		goto err_uar;
+
 	bundle = calloc(1, sizeof(*bundle));
 	if (!bundle)
-		goto err_publish;
+		goto err_db;
 
 	bundle->kernel_qpn = resp->kernel_qpn;
 	bundle->slot_idx = resp->sq_state_slot_idx;
@@ -3616,6 +3646,13 @@ static int mlx5_srm_acquire_mapping(struct mlx5_context *ctx,
 	bundle->sq_map_len = resp->sq_mmap_len;
 	bundle->publish_map = publish_map;
 	bundle->publish_map_len = resp->publish_mmap_len;
+	bundle->farm_uar_map = farm_uar_map;
+	bundle->farm_uar_map_len = resp->farm_uar_mmap_len;
+	bundle->farm_uar_reg = farm_uar_map + resp->farm_uar_reg_offset;
+	bundle->farm_db_map = farm_db_map;
+	bundle->farm_db_map_len = resp->farm_db_mmap_len;
+	bundle->farm_db = farm_db_map + resp->farm_db_offset;
+	bundle->farm_bf_buf_size = resp->farm_bf_buf_size;
 	bundle->next = ctx->srm_mapping_bundles;
 	ctx->srm_mapping_bundles = bundle;
 
@@ -3632,11 +3669,16 @@ attach:
 	qp->sq_publish_depth = bundle->publish_depth;
 	qp->srm_fast_ready = qp->hollow_rc && qp->sender_side &&
 		qp->sq_start && qp->sq_ctrl && qp->sq_publish_token &&
+		bundle->farm_uar_reg && bundle->farm_db &&
 		qp->sq_publish_depth && qp->sq.wrid &&
 		qp->sq_metadata_cnt >= qp->sq.wqe_cnt;
 	pthread_mutex_unlock(&ctx->srm_mapping_mutex);
 	return 0;
 
+err_db:
+	munmap(farm_db_map, resp->farm_db_mmap_len);
+err_uar:
+	munmap(farm_uar_map, resp->farm_uar_mmap_len);
 err_publish:
 	munmap(publish_map, resp->publish_mmap_len);
 err_sq:
@@ -3849,7 +3891,8 @@ int __mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 			MLX5_IB_MODIFY_QP_RESP_MASK_SQ_MMAP |
 			MLX5_IB_MODIFY_QP_RESP_MASK_SQ_STATE_MMAP |
 			MLX5_IB_MODIFY_QP_RESP_MASK_PUBLISH_MMAP |
-			MLX5_IB_MODIFY_QP_RESP_MASK_KERNEL_QP_INFO;
+			MLX5_IB_MODIFY_QP_RESP_MASK_KERNEL_QP_INFO |
+			MLX5_IB_MODIFY_QP_RESP_MASK_FARM_DB;
 
 		if ((resp.drv_payload.comp_mask & mapping_mask) &&
 		    (resp.drv_payload.comp_mask & mapping_mask) != mapping_mask) {
