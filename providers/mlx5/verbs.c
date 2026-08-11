@@ -3541,6 +3541,7 @@ static int mlx5_srm_acquire_mapping(struct mlx5_context *ctx,
 	void *publish_map = MAP_FAILED;
 	void *farm_uar_map = MAP_FAILED;
 	void *farm_db_map = MAP_FAILED;
+	int saved_errno = 0;
 
 	if (!resp->kernel_qpn || !resp->kernel_sq_wqe_cnt ||
 	    !resp->sq_mmap_len || !resp->sq_state_mmap_len ||
@@ -3598,6 +3599,12 @@ static int mlx5_srm_acquire_mapping(struct mlx5_context *ctx,
 					 ctx->ibv_ctx.context.cmd_fd,
 					 resp->sq_state_mmap_offset);
 		if (ctx->srm_ctrl_map == MAP_FAILED) {
+			saved_errno = errno;
+			fprintf(stderr,
+				"mlx5 FARM: ctrl mmap failed: %s offset=%#llx len=%u\n",
+				strerror(saved_errno),
+				(unsigned long long)resp->sq_state_mmap_offset,
+				resp->sq_state_mmap_len);
 			ctx->srm_ctrl_map = NULL;
 			goto err_unlock;
 		}
@@ -3611,28 +3618,60 @@ static int mlx5_srm_acquire_mapping(struct mlx5_context *ctx,
 		      MAP_SHARED, ctx->ibv_ctx.context.cmd_fd,
 		      resp->sq_mmap_offset);
 	if (sq_map == MAP_FAILED)
+	{
+		saved_errno = errno;
+		fprintf(stderr,
+			"mlx5 FARM: SQ mmap failed: %s offset=%#llx len=%u\n",
+			strerror(saved_errno),
+			(unsigned long long)resp->sq_mmap_offset,
+			resp->sq_mmap_len);
 		goto err_unlock;
+	}
 
 	publish_map = mmap(NULL, resp->publish_mmap_len,
 			   PROT_READ | PROT_WRITE, MAP_SHARED,
 			   ctx->ibv_ctx.context.cmd_fd,
 			   resp->publish_mmap_offset);
 	if (publish_map == MAP_FAILED)
+	{
+		saved_errno = errno;
+		fprintf(stderr,
+			"mlx5 FARM: publish mmap failed: %s offset=%#llx len=%u\n",
+			strerror(saved_errno),
+			(unsigned long long)resp->publish_mmap_offset,
+			resp->publish_mmap_len);
 		goto err_sq;
+	}
 
 	farm_uar_map = mmap(NULL, resp->farm_uar_mmap_len,
 			     PROT_READ | PROT_WRITE, MAP_SHARED,
 			     ctx->ibv_ctx.context.cmd_fd,
 			     resp->farm_uar_mmap_offset);
 	if (farm_uar_map == MAP_FAILED)
+	{
+		saved_errno = errno;
+		fprintf(stderr,
+			"mlx5 FARM: UAR mmap failed: %s offset=%#llx len=%u\n",
+			strerror(saved_errno),
+			(unsigned long long)resp->farm_uar_mmap_offset,
+			resp->farm_uar_mmap_len);
 		goto err_publish;
+	}
 
 	farm_db_map = mmap(NULL, resp->farm_db_mmap_len,
 			    PROT_READ | PROT_WRITE, MAP_SHARED,
 			    ctx->ibv_ctx.context.cmd_fd,
 			    resp->farm_db_mmap_offset);
 	if (farm_db_map == MAP_FAILED)
+	{
+		saved_errno = errno;
+		fprintf(stderr,
+			"mlx5 FARM: DB mmap failed: %s offset=%#llx len=%u\n",
+			strerror(saved_errno),
+			(unsigned long long)resp->farm_db_mmap_offset,
+			resp->farm_db_mmap_len);
 		goto err_uar;
+	}
 
 	bundle = calloc(1, sizeof(*bundle));
 	if (!bundle)
@@ -3685,6 +3724,8 @@ err_sq:
 	munmap(sq_map, resp->sq_mmap_len);
 err_unlock:
 	pthread_mutex_unlock(&ctx->srm_mapping_mutex);
+	if (saved_errno)
+		errno = saved_errno;
 	return errno;
 }
 

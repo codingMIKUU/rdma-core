@@ -55,6 +55,9 @@
 #define SRM_BACKOFF_MAX_NS 1000ULL
 #define SRM_RESERVE_MAX_WAIT_NS 100000000ULL
 
+/* Keep SQ-full backoff enabled; this switch controls lock contention only. */
+#define SRM_FARM_ENABLE_LOCK_BACKOFF 0
+
 static const uint32_t mlx5_ib_opcode[] = {
 	[IBV_WR_SEND]			= MLX5_OPCODE_SEND,
 	[IBV_WR_SEND_WITH_INV]		= MLX5_OPCODE_SEND_INVAL,
@@ -1140,6 +1143,7 @@ static inline int srm_farm_reserve_wqe_blocking(
 	uint64_t limit;
 	uint64_t occupancy;
 	unsigned int attempt = 0;
+	bool lock_acquired;
 	int stats_enabled = srm_stats_is_enabled();
 
 	limit = ((uint64_t)wqe_cnt * 2) / 3;
@@ -1147,9 +1151,11 @@ static inline int srm_farm_reserve_wqe_blocking(
 		stat_start = rdtsc();
 
 	for (;;) {
-		if (__atomic_load_n(&ctrl->farm_lock, __ATOMIC_RELAXED) == 0 &&
-		    __atomic_exchange_n(&ctrl->farm_lock, 1,
-					__ATOMIC_ACQUIRE) == 0) {
+		lock_acquired =
+			__atomic_load_n(&ctrl->farm_lock, __ATOMIC_RELAXED) == 0 &&
+			__atomic_exchange_n(&ctrl->farm_lock, 1,
+					    __ATOMIC_ACQUIRE) == 0;
+		if (lock_acquired) {
 			resv = __atomic_load_n(&ctrl->resv_idx,
 					       __ATOMIC_RELAXED);
 			cons = __atomic_load_n(&ctrl->cons_idx,
@@ -1172,6 +1178,15 @@ static inline int srm_farm_reserve_wqe_blocking(
 			}
 			srm_farm_unlock(ctrl);
 		}
+
+#if !SRM_FARM_ENABLE_LOCK_BACKOFF
+		/* A busy producer lock is expected to be short-lived. */
+		if (!lock_acquired) {
+			if (stats_enabled && attempt != UINT_MAX)
+				attempt++;
+			continue;
+		}
+#endif
 
 		now_ns = srm_monotonic_ns();
 		if (!start_ns)
