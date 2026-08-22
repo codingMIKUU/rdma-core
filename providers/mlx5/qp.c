@@ -1185,7 +1185,8 @@ static inline int srm_reserve_wqe_blocking(struct mlx5_sq_ctrl_page *ctrl,
 	}
 }
 
-static inline void srm_mark_wqe_ready(uint64_t *publish_token,
+static inline void srm_mark_wqe_ready(struct mlx5_sq_ctrl_page *ctrl,
+				      uint64_t *publish_token,
 				      uint32_t publish_depth,
 				      uint32_t usr_rc_cnt, uint64_t slot,
 				      int phase_stats)
@@ -1207,6 +1208,18 @@ static inline void srm_mark_wqe_ready(uint64_t *publish_token,
 	}
 
 	__atomic_store_n(&publish_token[slot & mask], token, __ATOMIC_RELEASE);
+
+#if MLX5_SRM_ENABLE_READY_FASTPATH
+	/*
+	 * Every reservation contributes exactly once after its WQE and publish
+	 * token are visible.  ACQ_REL chains concurrent producers so an acquire
+	 * load that observes ready_idx == resv_idx also observes every completed
+	 * WQE in that reservation snapshot.
+	 */
+	__atomic_fetch_add(&ctrl->ready_idx, 1, __ATOMIC_ACQ_REL);
+#else
+	(void)ctrl;
+#endif
 
 	if (phase_stats)
 		srm_reserve_stats.ready_store_cycles += rdtsc() - before_store;
@@ -1736,7 +1749,8 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			qp->sq.wqe_head[idx] = qp->sq.head + nreq;
 		post_wq->cur_post += DIV_ROUND_UP(size * 16, MLX5_SEND_WQE_BB);
 		if (srm_fast)
-			srm_mark_wqe_ready(post_publish_token, post_publish_depth,
+			srm_mark_wqe_ready(post_ctrl, post_publish_token,
+					   post_publish_depth,
 					   qp->usr_rc_cnt, slot, phase_stats);
 		if (phase_stats)
 		{

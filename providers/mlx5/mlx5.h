@@ -476,12 +476,16 @@ struct mlx5_pd {
 
 struct mlx5_sq_ctrl_page {
 	uint64_t resv_idx;
-	uint8_t resv_pad[56];
+	uint64_t ready_idx;
+	uint8_t resv_pad[48];
 	uint64_t cons_idx;
 	uint8_t cons_pad[56];
 } __attribute__((aligned(64)));
 _Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 128,
 	       "hollow RC ctrl ABI must occupy two cachelines");
+
+/* Must match MLX5_SRM_ENABLE_READY_FASTPATH in the kernel scheduler.h. */
+#define MLX5_SRM_ENABLE_READY_FASTPATH 1
 
 #define MLX5_SRM_PUBLISH_USR_BITS 16
 #define MLX5_SRM_PUBLISH_USR_MASK ((1ULL << MLX5_SRM_PUBLISH_USR_BITS) - 1)
