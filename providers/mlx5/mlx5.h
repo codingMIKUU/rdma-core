@@ -480,12 +480,50 @@ struct mlx5_sq_ctrl_page {
 	uint8_t resv_pad[48];
 	uint64_t cons_idx;
 	uint8_t cons_pad[56];
+	uint64_t db_tail;
+	uint32_t db_owner;
+	uint32_t flags;
+	uint32_t bf_offset;
+	uint32_t direct_db_batch;
+	uint32_t direct_stats_attempts;
+	uint32_t direct_stats_not_head;
+	uint32_t direct_stats_owner_busy;
+	uint32_t direct_stats_owner_acquired;
+	uint32_t direct_stats_no_pending;
+	uint32_t direct_stats_scan_calls;
+	uint32_t direct_stats_scan_ready_wqes;
+	uint32_t direct_stats_no_ready;
+	uint32_t direct_stats_credit_stalls;
+	uint32_t direct_stats_partial_credit;
+	uint64_t issued_total;
+	uint64_t completed_total;
+	uint64_t credit_limit;
+	uint32_t direct_stats_db_calls;
+	uint32_t direct_stats_db_wqes;
+	uint32_t direct_stats_db_max;
+	/* Must keep the shared slot page-contained in the kernel pool. */
+	uint8_t credit_pad[28];
 } __attribute__((aligned(64)));
-_Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 128,
-	       "hollow RC ctrl ABI must occupy two cachelines");
+_Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 256,
+	       "hollow RC ctrl ABI must occupy four cachelines");
+
+#define MLX5_SRM_DB_OWNER_FREE   0U
+#define MLX5_SRM_DB_OWNER_USER   1U
+#define MLX5_SRM_DB_OWNER_KERNEL 2U
+#define MLX5_SRM_CTRL_F_DIRECT_DB_STATS (1U << 0)
 
 /* Must match MLX5_SRM_ENABLE_READY_FASTPATH in the kernel scheduler.h. */
-#define MLX5_SRM_ENABLE_READY_FASTPATH 1
+#define MLX5_SRM_ENABLE_READY_FASTPATH 0
+
+/* Direct user MMIO is the FARM fast path; the syscall experiment stays off. */
+#define MLX5_SRM_ENABLE_DIRECT_USER_DB 1
+
+/* Must be a positive power of two; change and rebuild rdma-core to tune. */
+#define MLX5_SRM_DIRECT_DB_HELP_STRIDE 2U
+_Static_assert(MLX5_SRM_DIRECT_DB_HELP_STRIDE > 0 &&
+	       !(MLX5_SRM_DIRECT_DB_HELP_STRIDE &
+		 (MLX5_SRM_DIRECT_DB_HELP_STRIDE - 1)),
+	       "Hollow RC direct DB help stride must be a power of two");
 
 #define MLX5_SRM_PUBLISH_USR_BITS 16
 #define MLX5_SRM_PUBLISH_USR_MASK ((1ULL << MLX5_SRM_PUBLISH_USR_BITS) - 1)
@@ -507,6 +545,15 @@ struct mlx5_srm_mapping_bundle {
 	size_t sq_map_len;
 	uint64_t *publish_map;
 	size_t publish_map_len;
+	void *farm_uar_map;
+	size_t farm_uar_map_len;
+	void *farm_uar_reg;
+	void *farm_db_map;
+	size_t farm_db_map_len;
+	__be32 *farm_db;
+	struct mlx5_sq_ctrl_page *farm_credit_ctrl;
+	uint32_t farm_bf_buf_size;
+	uint32_t farm_direct_db_batch;
 };
 
 struct mlx5_parent_domain {

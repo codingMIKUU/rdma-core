@@ -43,6 +43,7 @@
 #include <util/compiler.h>
 
 #include "mlx5.h"
+#include "mlx5-abi.h"
 #include "mlx5_ifc.h"
 #include "mlx5_trace.h"
 #include "wqe.h"
@@ -53,7 +54,8 @@
 #define SRM_BACKOFF_YIELD_RETRIES 0
 #define SRM_BACKOFF_BASE_NS 500ULL
 #define SRM_BACKOFF_MAX_NS 1000ULL
-#define SRM_RESERVE_MAX_WAIT_NS 100000000ULL
+#define SRM_RESERVE_MAX_WAIT_NS 5000000000ULL
+#define MLX5_SRM_DIRECT_DB_STATS_FLUSH_WINDOW (1ULL << 5)
 
 static const uint32_t mlx5_ib_opcode[] = {
 	[IBV_WR_SEND]			= MLX5_OPCODE_SEND,
@@ -99,15 +101,99 @@ struct srm_reserve_stats {
 	uint64_t last_report_ns;
 };
 
+struct srm_direct_db_stats {
+	struct mlx5_sq_ctrl_page *sink;
+	uint64_t attempts;
+	uint64_t not_head;
+	uint64_t owner_busy;
+	uint64_t owner_acquired;
+	uint64_t no_pending;
+	uint64_t scan_calls;
+	uint64_t scan_ready_wqes;
+	uint64_t no_ready;
+	uint64_t credit_stalls;
+	uint64_t partial_credit;
+	uint64_t db_calls;
+	uint64_t db_wqes;
+	uint64_t db_max;
+};
+
 static pthread_once_t srm_stats_once = PTHREAD_ONCE_INIT;
 static int srm_stats_enabled;
 static __thread struct srm_reserve_stats srm_reserve_stats;
+static __thread struct srm_direct_db_stats srm_direct_db_stats;
 
 static void srm_stats_init(void)
 {
 	const char *value = getenv("MLX5_SRM_STATS");
 
 	srm_stats_enabled = value && atoi(value) != 0;
+}
+
+static void srm_flush_direct_db_stats(struct srm_direct_db_stats *stats)
+{
+	struct mlx5_sq_ctrl_page *sink = stats->sink;
+	uint32_t maximum;
+	uint32_t observed;
+
+	if (!sink || !stats->attempts)
+		return;
+
+#define SRM_DIRECT_STATS_ADD(member) \
+	__atomic_fetch_add(&sink->direct_stats_##member, \
+			   (uint32_t)stats->member, __ATOMIC_RELAXED)
+	SRM_DIRECT_STATS_ADD(attempts);
+	SRM_DIRECT_STATS_ADD(not_head);
+	SRM_DIRECT_STATS_ADD(owner_busy);
+	SRM_DIRECT_STATS_ADD(owner_acquired);
+	SRM_DIRECT_STATS_ADD(no_pending);
+	SRM_DIRECT_STATS_ADD(scan_calls);
+	SRM_DIRECT_STATS_ADD(scan_ready_wqes);
+	SRM_DIRECT_STATS_ADD(no_ready);
+	SRM_DIRECT_STATS_ADD(credit_stalls);
+	SRM_DIRECT_STATS_ADD(partial_credit);
+	SRM_DIRECT_STATS_ADD(db_calls);
+	SRM_DIRECT_STATS_ADD(db_wqes);
+#undef SRM_DIRECT_STATS_ADD
+
+	maximum = (uint32_t)stats->db_max;
+	observed = __atomic_load_n(&sink->direct_stats_db_max,
+				   __ATOMIC_RELAXED);
+	while (maximum > observed &&
+	       !__atomic_compare_exchange_n(&sink->direct_stats_db_max,
+					    &observed, maximum, false,
+					    __ATOMIC_RELAXED,
+					    __ATOMIC_RELAXED))
+		;
+
+	memset(stats, 0, sizeof(*stats));
+	stats->sink = sink;
+}
+
+static inline int srm_direct_db_stats_begin(
+	struct mlx5_srm_mapping_bundle *mapping,
+	struct mlx5_sq_ctrl_page *ctrl_page,
+	struct srm_direct_db_stats *stats)
+{
+	struct mlx5_sq_ctrl_page *sink = mapping->farm_credit_ctrl;
+	uint32_t flags = __atomic_load_n(&ctrl_page->flags,
+					 __ATOMIC_RELAXED);
+
+	if (!(flags & MLX5_SRM_CTRL_F_DIRECT_DB_STATS)) {
+		if (unlikely(stats->sink || stats->attempts))
+			memset(stats, 0, sizeof(*stats));
+		return 0;
+	}
+
+	if (unlikely(stats->sink != sink)) {
+		memset(stats, 0, sizeof(*stats));
+		stats->sink = sink;
+	}
+	if (unlikely(stats->attempts ==
+		     MLX5_SRM_DIRECT_DB_STATS_FLUSH_WINDOW))
+		srm_flush_direct_db_stats(stats);
+	stats->attempts++;
+	return 1;
 }
 
 static inline int srm_stats_is_enabled(void)
@@ -1123,7 +1209,10 @@ static inline uint32_t mlx5_srm_wr_data_bytes(const struct ibv_send_wr *wr)
 }
 
 static inline int srm_reserve_wqe_blocking(struct mlx5_sq_ctrl_page *ctrl,
-					    uint32_t wqe_cnt, uint64_t *slot,
+					    uint32_t wqe_cnt,
+					    uint32_t ctrl_slot_idx,
+					    uint32_t kernel_qpn,
+					    uint64_t *slot,
 					    uint64_t *cons_out)
 {
 	struct srm_reserve_stats *stats = &srm_reserve_stats;
@@ -1134,6 +1223,7 @@ static inline int srm_reserve_wqe_blocking(struct mlx5_sq_ctrl_page *ctrl,
 	uint64_t cons;
 	uint64_t limit;
 	uint64_t occupancy;
+	int64_t distance;
 	unsigned int attempt = 0;
 	int stats_enabled = srm_stats_is_enabled();
 
@@ -1142,12 +1232,42 @@ static inline int srm_reserve_wqe_blocking(struct mlx5_sq_ctrl_page *ctrl,
 		stat_start = rdtsc();
 
 	for (;;) {
-		resv = __atomic_load_n(&ctrl->resv_idx, __ATOMIC_RELAXED);
+		/*
+		 * Sample the consumer first.  The signed modular distance remains
+		 * valid across a u64 wrap as long as the live window is below 2^63.
+		 * It also distinguishes a real producer cursor regression from a
+		 * legitimate wrap instead of turning it into a near-U64_MAX queue.
+		 */
 		cons = __atomic_load_n(&ctrl->cons_idx, __ATOMIC_ACQUIRE);
-		occupancy = resv - cons;
+		resv = __atomic_load_n(&ctrl->resv_idx, __ATOMIC_ACQUIRE);
+		distance = (int64_t)(resv - cons);
+		if (unlikely(distance < 0)) {
+			static unsigned int repair_reports;
+			uint64_t expected = resv;
+
+			if (__atomic_compare_exchange_n(&ctrl->resv_idx, &expected,
+							cons, 0, __ATOMIC_ACQ_REL,
+							__ATOMIC_ACQUIRE)) {
+				unsigned int report = __atomic_fetch_add(
+					&repair_reports, 1, __ATOMIC_RELAXED);
+
+				if (report < 16)
+					fprintf(stderr,
+						"SRM reserve cursor repair: slot=%u "
+						"kernel_qpn=%u ctrl=%p resv=%llu "
+						"cons=%llu lag=%llu\n",
+						ctrl_slot_idx, kernel_qpn,
+						(void *)ctrl,
+						(unsigned long long)resv,
+						(unsigned long long)cons,
+						(unsigned long long)(cons - resv));
+			}
+			continue;
+		}
+		occupancy = (uint64_t)distance;
 		if (stats_enabled && occupancy > stats->max_occupancy)
 			stats->max_occupancy = occupancy;
-		if (resv - cons < limit) {
+		if (occupancy < limit) {
 			resv = __atomic_fetch_add(&ctrl->resv_idx, 1,
 						  __ATOMIC_RELAXED);
 			if (slot)
@@ -1167,6 +1287,27 @@ static inline int srm_reserve_wqe_blocking(struct mlx5_sq_ctrl_page *ctrl,
 		if (!start_ns)
 			start_ns = now_ns;
 		else if (now_ns - start_ns >= SRM_RESERVE_MAX_WAIT_NS) {
+			static unsigned int timeout_reports;
+			unsigned int report = __atomic_fetch_add(&timeout_reports, 1,
+								    __ATOMIC_RELAXED);
+
+			if (report < 16)
+				fprintf(stderr,
+					"SRM reserve timeout: slot=%u kernel_qpn=%u "
+					"ctrl=%p wqe_cnt=%u resv=%llu "
+					"cons=%llu occupancy=%llu limit=%llu "
+					"ready=%llu db_tail=%llu db_owner=%u\n",
+					ctrl_slot_idx, kernel_qpn, (void *)ctrl,
+					wqe_cnt, (unsigned long long)resv,
+					(unsigned long long)cons,
+					(unsigned long long)occupancy,
+					(unsigned long long)limit,
+					(unsigned long long)__atomic_load_n(
+						&ctrl->ready_idx, __ATOMIC_ACQUIRE),
+					(unsigned long long)__atomic_load_n(
+						&ctrl->db_tail, __ATOMIC_ACQUIRE),
+					__atomic_load_n(&ctrl->db_owner,
+							__ATOMIC_ACQUIRE));
 			if (stats_enabled) {
 				stats->calls++;
 				stats->cycles += rdtsc() - stat_start;
@@ -1223,6 +1364,197 @@ static inline void srm_mark_wqe_ready(struct mlx5_sq_ctrl_page *ctrl,
 
 	if (phase_stats)
 		srm_reserve_stats.ready_store_cycles += rdtsc() - before_store;
+}
+
+static inline uint32_t
+srm_claim_direct_db_credit(struct mlx5_sq_ctrl_page *credit,
+			   uint32_t requested)
+{
+	uint64_t issued;
+	uint64_t completed;
+	uint64_t limit;
+	uint64_t outstanding;
+	uint32_t granted;
+
+	while (requested) {
+		issued = __atomic_load_n(&credit->issued_total, __ATOMIC_ACQUIRE);
+		completed = __atomic_load_n(&credit->completed_total,
+					    __ATOMIC_ACQUIRE);
+		limit = __atomic_load_n(&credit->credit_limit, __ATOMIC_ACQUIRE);
+		if (unlikely(completed > issued || !limit))
+			return 0;
+		outstanding = issued - completed;
+		if (outstanding >= limit)
+			return 0;
+		granted = min_t(uint64_t, requested, limit - outstanding);
+		if (__atomic_compare_exchange_n(&credit->issued_total, &issued,
+						issued + granted, false,
+						__ATOMIC_ACQ_REL,
+						__ATOMIC_ACQUIRE))
+			return granted;
+	}
+
+	return 0;
+}
+
+static inline void
+srm_release_direct_db_credit(struct mlx5_sq_ctrl_page *credit,
+			     uint32_t released)
+{
+	if (released)
+		__atomic_fetch_sub(&credit->issued_total, released,
+				   __ATOMIC_ACQ_REL);
+}
+
+static inline void srm_direct_ring_db(
+	struct mlx5_srm_mapping_bundle *mapping,
+	struct mlx5_sq_ctrl_page *ctrl_page, uint64_t new_tail,
+	struct mlx5_wqe_ctrl_seg *last_ctrl)
+{
+	uint32_t bf_offset = __atomic_load_n(&ctrl_page->bf_offset,
+					 __ATOMIC_RELAXED);
+
+	udma_to_device_barrier();
+	mapping->farm_db[MLX5_SND_DBR] = htobe32((uint32_t)new_tail);
+	udma_to_device_barrier();
+
+	mmio_wc_start();
+	mmio_write64_be(mapping->farm_uar_reg + bf_offset,
+			*(__be64 *)last_ctrl);
+	mmio_flush_writes();
+	__atomic_store_n(&ctrl_page->bf_offset,
+			 bf_offset ^ mapping->farm_bf_buf_size,
+			 __ATOMIC_RELAXED);
+}
+
+static inline void srm_try_direct_user_db(
+	struct mlx5_srm_mapping_bundle *mapping,
+	struct mlx5_sq_ctrl_page *ctrl_page, uint64_t *publish_token,
+	uint32_t publish_depth, struct mlx5_wq *wq, uint32_t kernel_qpn,
+	uint64_t published_slot)
+{
+	struct srm_direct_db_stats *stats = &srm_direct_db_stats;
+	struct mlx5_wqe_ctrl_seg *last_ctrl = NULL;
+	uint64_t tail;
+	uint64_t resv;
+	int64_t pending;
+	uint32_t max_batch;
+	uint32_t claimed;
+	uint32_t sent = 0;
+	uint32_t expected = MLX5_SRM_DB_OWNER_FREE;
+	int stats_enabled;
+
+	if (unlikely(!mapping || !mapping->farm_credit_ctrl ||
+		     !mapping->farm_uar_reg || !mapping->farm_db))
+		return;
+	stats_enabled = srm_direct_db_stats_begin(mapping, ctrl_page, stats);
+
+	/* Only the producer that closes the current head gap attempts ownership. */
+	tail = __atomic_load_n(&ctrl_page->db_tail, __ATOMIC_ACQUIRE);
+	resv = __atomic_load_n(&ctrl_page->resv_idx, __ATOMIC_ACQUIRE);
+	/*
+	 * Preserve the immediate head-producer path, but let later producers
+	 * periodically help drain this KQP.  resv_idx is per KQP, so one out of
+	 * every four reservation frontiers becomes a userspace DB candidate.
+	 */
+	if (published_slot != tail) {
+		if (stats_enabled)
+			stats->not_head++;
+		if (resv & (MLX5_SRM_DIRECT_DB_HELP_STRIDE - 1))
+			return;
+	}
+	if (!__atomic_compare_exchange_n(&ctrl_page->db_owner, &expected,
+					     MLX5_SRM_DB_OWNER_USER, false,
+					     __ATOMIC_ACQUIRE,
+					     __ATOMIC_RELAXED)) {
+		if (stats_enabled)
+			stats->owner_busy++;
+		return;
+	}
+	if (stats_enabled)
+		stats->owner_acquired++;
+
+	tail = __atomic_load_n(&ctrl_page->db_tail, __ATOMIC_ACQUIRE);
+	resv = __atomic_load_n(&ctrl_page->resv_idx, __ATOMIC_ACQUIRE);
+	pending = (int64_t)(resv - tail);
+	if (unlikely(pending <= 0)) {
+		if (stats_enabled)
+			stats->no_pending++;
+		goto out_unlock;
+	}
+
+	max_batch = min_t(uint64_t, mapping->farm_direct_db_batch,
+			  (uint64_t)pending);
+	/*
+	 * Reserve shared outstanding credit before touching publish tokens or
+	 * WQEs.  The old order scanned a ready prefix first and then discovered
+	 * that the worker window was full, wasting the whole scan while holding
+	 * db_owner.  As in the kernel fallback path, unused credit is returned
+	 * after the scan.
+	 */
+	claimed = srm_claim_direct_db_credit(mapping->farm_credit_ctrl,
+					     max_batch);
+	if (!claimed) {
+		if (stats_enabled)
+			stats->credit_stalls++;
+		goto out_unlock;
+	}
+	if (claimed < max_batch && stats_enabled)
+		stats->partial_credit++;
+
+	if (stats_enabled)
+		stats->scan_calls++;
+	while (sent < claimed) {
+		uint64_t post = tail + sent;
+		uint32_t idx = post & (wq->wqe_cnt - 1);
+		uint64_t token = __atomic_load_n(
+			&publish_token[idx & (publish_depth - 1)],
+			__ATOMIC_ACQUIRE);
+		struct mlx5_wqe_ctrl_seg *wqe_ctrl;
+		uint32_t opmod_idx_opcode;
+		uint32_t qpn_ds;
+
+		if (((token >> MLX5_SRM_PUBLISH_USR_BITS) &
+		     MLX5_SRM_PUBLISH_SEQ_MASK) !=
+		    ((post + 1) & MLX5_SRM_PUBLISH_SEQ_MASK))
+			break;
+		wqe_ctrl = mapping->sq_map +
+			((size_t)idx << wq->wqe_shift);
+		opmod_idx_opcode = be32toh(
+			__atomic_load_n(&wqe_ctrl->opmod_idx_opcode,
+					__ATOMIC_RELAXED));
+		qpn_ds = be32toh(__atomic_load_n(&wqe_ctrl->qpn_ds,
+						 __ATOMIC_RELAXED));
+		if (unlikely((uint16_t)(opmod_idx_opcode >> 8) !=
+			     (uint16_t)post || (qpn_ds >> 8) != kernel_qpn))
+			break;
+		last_ctrl = wqe_ctrl;
+		sent++;
+	}
+	if (stats_enabled)
+		stats->scan_ready_wqes += sent;
+	if (!sent) {
+		if (stats_enabled)
+			stats->no_ready++;
+		srm_release_direct_db_credit(mapping->farm_credit_ctrl, claimed);
+		goto out_unlock;
+	}
+	if (sent < claimed)
+		srm_release_direct_db_credit(mapping->farm_credit_ctrl,
+					     claimed - sent);
+
+	srm_direct_ring_db(mapping, ctrl_page, tail + sent, last_ctrl);
+	__atomic_store_n(&ctrl_page->db_tail, tail + sent, __ATOMIC_RELEASE);
+	if (stats_enabled) {
+		stats->db_calls++;
+		stats->db_wqes += sent;
+		if (sent > stats->db_max)
+			stats->db_max = sent;
+	}
+
+out_unlock:
+	__atomic_store_n(&ctrl_page->db_owner, MLX5_SRM_DB_OWNER_FREE,
+			 __ATOMIC_RELEASE);
 }
 
 //dosen't write bf reg
@@ -1363,6 +1695,8 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		uint64_t *post_publish_token = qp->sq_publish_token;
 		uint32_t post_publish_depth = qp->sq_publish_depth;
 		uint32_t post_kernel_qpn = qp->srm_kernel_qpn;
+		uint32_t post_ctrl_slot_idx = qp->sq_ctrl_slot_idx;
+		struct mlx5_srm_mapping_bundle *post_mapping = qp->srm_mapping;
 
 		if (MLX5_SRM_ENABLE_LARGE_KERNEL_QP && srm_fast &&
 		    mlx5_srm_wr_data_bytes(wr) > MLX5_SRM_LARGE_MSG_THRESHOLD) {
@@ -1372,6 +1706,8 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			post_publish_token = qp->srm_large_sq_publish_token;
 			post_publish_depth = qp->srm_large_sq_publish_depth;
 			post_kernel_qpn = qp->srm_large_kernel_qpn;
+			post_ctrl_slot_idx = qp->srm_large_sq_ctrl_slot_idx;
+			post_mapping = qp->srm_large_mapping;
 		}
 
 		if (srm_fast) {
@@ -1382,6 +1718,8 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			}
 			err = srm_reserve_wqe_blocking(post_ctrl,
 						       post_wq->wqe_cnt,
+						       post_ctrl_slot_idx,
+						       post_kernel_qpn,
 						       &slot, &cons);
 			if (err) {
 				if (bad_wr)
@@ -1460,6 +1798,9 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			 MLX5_WQE_CTRL_CQ_UPDATE : 0) |
 			(wr->send_flags & IBV_SEND_SOLICITED ?
 			 MLX5_WQE_CTRL_SOLICITED : 0);
+		/* Shared issued/completed credit requires one CQE per Hollow RC WQE. */
+		if (srm_fast)
+			ctrl->fm_ce_se |= MLX5_WQE_CTRL_CQ_UPDATE;
 
 		seg += sizeof *ctrl;
 		size = sizeof *ctrl / 16;
@@ -1752,6 +2093,11 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			srm_mark_wqe_ready(post_ctrl, post_publish_token,
 					   post_publish_depth,
 					   qp->usr_rc_cnt, slot, phase_stats);
+		if (MLX5_SRM_ENABLE_DIRECT_USER_DB && srm_fast)
+			srm_try_direct_user_db(post_mapping, post_ctrl,
+					   post_publish_token,
+					   post_publish_depth, post_wq,
+					   post_kernel_qpn, slot);
 		if (phase_stats)
 		{
 			post_publish_start = rdtsc();
