@@ -55,7 +55,7 @@
 #define SRM_BACKOFF_BASE_NS 500ULL
 #define SRM_BACKOFF_MAX_NS 1000ULL
 #define SRM_RESERVE_MAX_WAIT_NS 5000000000ULL
-#define MLX5_SRM_DIRECT_DB_STATS_FLUSH_WINDOW (1ULL << 5)
+#define MLX5_SRM_DIRECT_DB_STATS_FLUSH_WINDOW (1ULL << 20)
 
 static const uint32_t mlx5_ib_opcode[] = {
 	[IBV_WR_SEND]			= MLX5_OPCODE_SEND,
@@ -1438,11 +1438,13 @@ static inline void srm_try_direct_user_db(
 	uint64_t tail;
 	uint64_t resv;
 	int64_t pending;
+	uint64_t target_tail = 0;
 	uint32_t max_batch;
 	uint32_t claimed;
 	uint32_t sent = 0;
 	uint32_t expected = MLX5_SRM_DB_OWNER_FREE;
 	int stats_enabled;
+	bool require_full_prefix;
 
 	if (unlikely(!mapping || !mapping->farm_credit_ctrl ||
 		     !mapping->farm_uar_reg || !mapping->farm_db))
@@ -1452,15 +1454,17 @@ static inline void srm_try_direct_user_db(
 	/* Only the producer that closes the current head gap attempts ownership. */
 	tail = __atomic_load_n(&ctrl_page->db_tail, __ATOMIC_ACQUIRE);
 	resv = __atomic_load_n(&ctrl_page->resv_idx, __ATOMIC_ACQUIRE);
+	require_full_prefix = published_slot != tail;
 	/*
 	 * Preserve the immediate head-producer path, but let later producers
-	 * periodically help drain this KQP.  resv_idx is per KQP, so one out of
-	 * every four reservation frontiers becomes a userspace DB candidate.
+	 * periodically help drain this KQP.  Qualify a helper using its own
+	 * reservation endpoint rather than the concurrently moving resv_idx.
 	 */
-	if (published_slot != tail) {
+	if (require_full_prefix) {
 		if (stats_enabled)
 			stats->not_head++;
-		if (resv & (MLX5_SRM_DIRECT_DB_HELP_STRIDE - 1))
+		if ((published_slot + 1) &
+		    (MLX5_SRM_DIRECT_DB_HELP_STRIDE - 1))
 			return;
 	}
 	if (!__atomic_compare_exchange_n(&ctrl_page->db_owner, &expected,
@@ -1483,8 +1487,27 @@ static inline void srm_try_direct_user_db(
 		goto out_unlock;
 	}
 
-	max_batch = min_t(uint64_t, mapping->farm_direct_db_batch,
-			  (uint64_t)pending);
+	if (require_full_prefix) {
+		int64_t target_pending =
+			(int64_t)((published_slot + 1) - tail);
+
+		/*
+		 * A stride helper is useful only when it can close the whole prefix
+		 * through its own reservation.  Never let it ring a short DB that
+		 * steals part of the kernel's accumulated batch.
+		 */
+		if (unlikely(target_pending <= 0 ||
+			     (uint64_t)target_pending > UINT32_MAX)) {
+			if (stats_enabled)
+				stats->no_pending++;
+			goto out_unlock;
+		}
+		target_tail = published_slot + 1;
+		max_batch = (uint32_t)target_pending;
+	} else {
+		max_batch = min_t(uint64_t, mapping->farm_direct_db_batch,
+				  (uint64_t)pending);
+	}
 	/*
 	 * Reserve shared outstanding credit before touching publish tokens or
 	 * WQEs.  The old order scanned a ready prefix first and then discovered
@@ -1499,8 +1522,15 @@ static inline void srm_try_direct_user_db(
 			stats->credit_stalls++;
 		goto out_unlock;
 	}
-	if (claimed < max_batch && stats_enabled)
-		stats->partial_credit++;
+	if (claimed < max_batch) {
+		if (stats_enabled)
+			stats->partial_credit++;
+		if (require_full_prefix) {
+			srm_release_direct_db_credit(mapping->farm_credit_ctrl,
+						     claimed);
+			goto out_unlock;
+		}
+	}
 
 	if (stats_enabled)
 		stats->scan_calls++;
@@ -1539,12 +1569,23 @@ static inline void srm_try_direct_user_db(
 		srm_release_direct_db_credit(mapping->farm_credit_ctrl, claimed);
 		goto out_unlock;
 	}
+	if (require_full_prefix && sent != claimed) {
+		/* A hole before the helper's own slot: publish nothing. */
+		srm_release_direct_db_credit(mapping->farm_credit_ctrl, claimed);
+		goto out_unlock;
+	}
 	if (sent < claimed)
 		srm_release_direct_db_credit(mapping->farm_credit_ctrl,
 					     claimed - sent);
 
-	srm_direct_ring_db(mapping, ctrl_page, tail + sent, last_ctrl);
-	__atomic_store_n(&ctrl_page->db_tail, tail + sent, __ATOMIC_RELEASE);
+	if (require_full_prefix)
+		assert(tail + sent == target_tail);
+	srm_direct_ring_db(mapping, ctrl_page,
+			   require_full_prefix ? target_tail : tail + sent,
+			   last_ctrl);
+	__atomic_store_n(&ctrl_page->db_tail,
+			 require_full_prefix ? target_tail : tail + sent,
+			 __ATOMIC_RELEASE);
 	if (stats_enabled) {
 		stats->db_calls++;
 		stats->db_wqes += sent;
