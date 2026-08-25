@@ -1839,9 +1839,6 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			 MLX5_WQE_CTRL_CQ_UPDATE : 0) |
 			(wr->send_flags & IBV_SEND_SOLICITED ?
 			 MLX5_WQE_CTRL_SOLICITED : 0);
-		/* Shared issued/completed credit requires one CQE per Hollow RC WQE. */
-		if (srm_fast)
-			ctrl->fm_ce_se |= MLX5_WQE_CTRL_CQ_UPDATE;
 
 		seg += sizeof *ctrl;
 		size = sizeof *ctrl / 16;
