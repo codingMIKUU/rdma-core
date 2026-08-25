@@ -501,8 +501,11 @@ struct mlx5_sq_ctrl_page {
 	uint32_t direct_stats_db_calls;
 	uint32_t direct_stats_db_wqes;
 	uint32_t direct_stats_db_max;
+	uint64_t completion_error_idx;
+	uint32_t completion_error_status;
+	uint32_t completion_error_vendor;
 	/* Must keep the shared slot page-contained in the kernel pool. */
-	uint8_t credit_pad[28];
+	uint8_t credit_pad[8];
 } __attribute__((aligned(64)));
 _Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 256,
 	       "hollow RC ctrl ABI must occupy four cachelines");
@@ -519,7 +522,7 @@ _Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 256,
 #define MLX5_SRM_ENABLE_DIRECT_USER_DB 1
 
 /* Must be a positive power of two; change and rebuild rdma-core to tune. */
-#define MLX5_SRM_DIRECT_DB_HELP_STRIDE 2U
+#define MLX5_SRM_DIRECT_DB_HELP_STRIDE 16U
 _Static_assert(MLX5_SRM_DIRECT_DB_HELP_STRIDE > 0 &&
 	       !(MLX5_SRM_DIRECT_DB_HELP_STRIDE &
 		 (MLX5_SRM_DIRECT_DB_HELP_STRIDE - 1)),
@@ -610,6 +613,9 @@ struct mlx5_cq {
 	int				cached_opcode;
 	struct mlx5dv_clock_info	last_clock_info;
 	struct ibv_pd			*parent_domain;
+	/* QPs waiting for a synthetic Hollow RC completion. */
+	struct mlx5_qp		       *srm_pending_head;
+	struct mlx5_qp		       *srm_pending_tail;
 };
 
 struct mlx5_tag_entry {
@@ -861,6 +867,15 @@ struct mlx5_qp {
 	uint8_t hollow_rc;
 	uint8_t srm_fast_ready;
 	uint8_t srm_large_fast_ready;
+	struct mlx5_cq *srm_completion_cq;
+	struct mlx5_qp *srm_completion_next;
+	struct mlx5_sq_ctrl_page *srm_completion_ctrl;
+	uint64_t srm_completion_idx;
+	uint64_t srm_completion_wr_id;
+	uint32_t srm_completion_byte_len;
+	enum ibv_wc_opcode srm_completion_opcode;
+	uint8_t srm_completion_pending;
+	uint8_t srm_completion_queued;
 	uint32_t srm_num_level;
 	uint32_t srm_num_sched;
 	uint32_t srm_max_xrc_qp_per_srm;

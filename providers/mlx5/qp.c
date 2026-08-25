@@ -1208,6 +1208,60 @@ static inline uint32_t mlx5_srm_wr_data_bytes(const struct ibv_send_wr *wr)
 	return bytes > UINT32_MAX ? UINT32_MAX : (uint32_t)bytes;
 }
 
+static inline enum ibv_wc_opcode
+mlx5_srm_wc_opcode(enum ibv_wr_opcode opcode)
+{
+	switch (opcode) {
+	case IBV_WR_RDMA_WRITE:
+	case IBV_WR_RDMA_WRITE_WITH_IMM:
+		return IBV_WC_RDMA_WRITE;
+	case IBV_WR_RDMA_READ:
+		return IBV_WC_RDMA_READ;
+	case IBV_WR_ATOMIC_CMP_AND_SWP:
+		return IBV_WC_COMP_SWAP;
+	case IBV_WR_ATOMIC_FETCH_AND_ADD:
+		return IBV_WC_FETCH_ADD;
+	case IBV_WR_BIND_MW:
+		return IBV_WC_BIND_MW;
+	case IBV_WR_LOCAL_INV:
+		return IBV_WC_LOCAL_INV;
+	default:
+		return IBV_WC_SEND;
+	}
+}
+
+static inline int mlx5_srm_completion_slot_busy(struct mlx5_qp *qp)
+{
+	return __atomic_load_n(&qp->srm_completion_pending,
+			       __ATOMIC_ACQUIRE);
+}
+
+static inline void mlx5_srm_queue_completion(
+	struct mlx5_qp *qp, struct mlx5_sq_ctrl_page *ctrl, uint64_t slot,
+	uint64_t wr_id, const struct ibv_send_wr *wr)
+{
+	struct mlx5_cq *cq = to_mcq(qp->ibv_qp->send_cq);
+
+	mlx5_spin_lock(&cq->lock);
+	/* Hollow RC fast posting is single-producer per logical QP.  The caller
+	 * rejects a second signaled marker until this one has been polled. */
+	qp->srm_completion_cq = cq;
+	qp->srm_completion_ctrl = ctrl;
+	qp->srm_completion_idx = slot;
+	qp->srm_completion_wr_id = wr_id;
+	qp->srm_completion_byte_len = mlx5_srm_wr_data_bytes(wr);
+	qp->srm_completion_opcode = mlx5_srm_wc_opcode(wr->opcode);
+	qp->srm_completion_next = NULL;
+	qp->srm_completion_pending = 1;
+	if (cq->srm_pending_tail)
+		cq->srm_pending_tail->srm_completion_next = qp;
+	else
+		cq->srm_pending_head = qp;
+	cq->srm_pending_tail = qp;
+	qp->srm_completion_queued = 1;
+	mlx5_spin_unlock(&cq->lock);
+}
+
 static inline int srm_reserve_wqe_blocking(struct mlx5_sq_ctrl_page *ctrl,
 					    uint32_t wqe_cnt,
 					    uint32_t ctrl_slot_idx,
@@ -1750,6 +1804,15 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			post_ctrl_slot_idx = qp->srm_large_sq_ctrl_slot_idx;
 			post_mapping = qp->srm_large_mapping;
 		}
+		if (srm_fast && (wr->send_flags & IBV_SEND_SIGNALED) &&
+		    unlikely(mlx5_srm_completion_slot_busy(qp))) {
+			/* The fixed-window Hollow RC API keeps at most one signaled
+			 * completion outstanding per logical QP. */
+			err = EBUSY;
+			if (bad_wr)
+				*bad_wr = wr;
+			goto out;
+		}
 
 		if (srm_fast) {
 			if (phase_stats) {
@@ -2133,9 +2196,11 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 					   qp->usr_rc_cnt, slot, phase_stats);
 		if (MLX5_SRM_ENABLE_DIRECT_USER_DB && srm_fast)
 			srm_try_direct_user_db(post_mapping, post_ctrl,
-					   post_publish_token,
-					   post_publish_depth, post_wq,
-					   post_kernel_qpn, slot);
+					       post_publish_token,
+					       post_publish_depth, post_wq,
+					       post_kernel_qpn, slot);
+		if (srm_fast && (wr->send_flags & IBV_SEND_SIGNALED))
+			mlx5_srm_queue_completion(qp, post_ctrl, slot, wr_id, wr);
 		if (phase_stats)
 		{
 			post_publish_start = rdtsc();
