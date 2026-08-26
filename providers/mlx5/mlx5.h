@@ -531,7 +531,7 @@ _Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 512,
 #define MLX5_SRM_ENABLE_DIRECT_USER_DB 1
 
 /* Must be a positive power of two; change and rebuild rdma-core to tune. */
-#define MLX5_SRM_DIRECT_DB_HELP_STRIDE 1U
+#define MLX5_SRM_DIRECT_DB_HELP_STRIDE 4U
 _Static_assert(MLX5_SRM_DIRECT_DB_HELP_STRIDE > 0 &&
 	       !(MLX5_SRM_DIRECT_DB_HELP_STRIDE &
 		 (MLX5_SRM_DIRECT_DB_HELP_STRIDE - 1)),
