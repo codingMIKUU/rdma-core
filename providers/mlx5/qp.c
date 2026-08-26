@@ -1481,20 +1481,6 @@ static inline void srm_direct_ring_db(
 			 __ATOMIC_RELAXED);
 }
 
-static inline void
-srm_publish_kernel_hot_hint(struct mlx5_srm_mapping_bundle *mapping)
-{
-	/*
-	 * The low 16 bits identify the global KQP/control slot.  The upper bits
-	 * change on every fallback so repeated hints for the same IP are visible
-	 * without an atomic read/modify/write or a syscall.
-	 */
-	uint64_t hint = (rdtsc() << 16) | (mapping->slot_idx & 0xffffU);
-
-	__atomic_store_n(&mapping->farm_credit_ctrl->latest_hot_hint, hint,
-			 __ATOMIC_RELEASE);
-}
-
 static inline void srm_try_direct_user_db(
 	struct mlx5_srm_mapping_bundle *mapping,
 	struct mlx5_sq_ctrl_page *ctrl_page, uint64_t *publish_token,
@@ -1513,7 +1499,6 @@ static inline void srm_try_direct_user_db(
 	uint32_t expected = MLX5_SRM_DB_OWNER_FREE;
 	int stats_enabled;
 	bool require_full_prefix;
-	bool notify_kernel_hot = false;
 
 	if (unlikely(!mapping || !mapping->farm_credit_ctrl ||
 		     !mapping->farm_uar_reg || !mapping->farm_db))
@@ -1641,7 +1626,6 @@ static inline void srm_try_direct_user_db(
 	if (require_full_prefix && sent != claimed) {
 		/* A hole before the helper's own slot: publish nothing. */
 		srm_release_direct_db_credit(mapping->farm_credit_ctrl, claimed);
-		notify_kernel_hot = true;
 		goto out_unlock;
 	}
 	if (sent < claimed)
@@ -1666,10 +1650,6 @@ static inline void srm_try_direct_user_db(
 out_unlock:
 	__atomic_store_n(&ctrl_page->db_owner, MLX5_SRM_DB_OWNER_FREE,
 			 __ATOMIC_RELEASE);
-	/* Publish only after releasing db_owner so the scheduler never observes
-	 * a freshly-hot IP that is still owned by this userspace producer. */
-	if (notify_kernel_hot)
-		srm_publish_kernel_hot_hint(mapping);
 }
 
 //dosen't write bf reg
