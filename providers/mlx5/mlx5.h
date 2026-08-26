@@ -506,9 +506,18 @@ struct mlx5_sq_ctrl_page {
 	uint32_t completion_error_vendor;
 	/* Must keep the shared slot page-contained in the kernel pool. */
 	uint8_t credit_pad[8];
+	/*
+	 * Per-worker latest-hot mailbox.  Only the worker credit slot uses this
+	 * cacheline; keeping it separate prevents fallback hints from invalidating
+	 * reservation, completion, owner, or credit state.
+	 */
+	uint64_t latest_hot_hint;
+	uint8_t hot_hint_pad[56];
+	/* A power-of-two stride keeps every control slot within one mmap page. */
+	uint8_t slot_pad[192];
 } __attribute__((aligned(64)));
-_Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 256,
-	       "hollow RC ctrl ABI must occupy four cachelines");
+_Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 512,
+	       "hollow RC ctrl ABI must occupy eight cachelines");
 
 #define MLX5_SRM_DB_OWNER_FREE   0U
 #define MLX5_SRM_DB_OWNER_USER   1U
@@ -522,7 +531,7 @@ _Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 256,
 #define MLX5_SRM_ENABLE_DIRECT_USER_DB 1
 
 /* Must be a positive power of two; change and rebuild rdma-core to tune. */
-#define MLX5_SRM_DIRECT_DB_HELP_STRIDE 16U
+#define MLX5_SRM_DIRECT_DB_HELP_STRIDE 1U
 _Static_assert(MLX5_SRM_DIRECT_DB_HELP_STRIDE > 0 &&
 	       !(MLX5_SRM_DIRECT_DB_HELP_STRIDE &
 		 (MLX5_SRM_DIRECT_DB_HELP_STRIDE - 1)),
