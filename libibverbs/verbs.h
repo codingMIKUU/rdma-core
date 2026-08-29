@@ -1052,6 +1052,10 @@ struct ibv_qp_init_attr_ex {
 	union ibv_gid gid;
 };
 
+/* Compile-time capability marker for applications that require the custom
+ * Hollow RC logical-QP/shared-SQ ABI above. */
+#define IBV_HOLLOW_RC_ABI_VERSION 1
+
 enum ibv_qp_open_attr_mask {
 	IBV_QP_OPEN_ATTR_NUM		= 1 << 0,
 	IBV_QP_OPEN_ATTR_XRCD	        = 1 << 1,
@@ -3577,8 +3581,20 @@ static inline int ibv_post_recv(struct ibv_qp *qp, struct ibv_recv_wr *wr,
 /**
  * ibv_create_ah - Create an address handle.
  */
-struct ibv_ah *ibv_create_ah(struct ibv_pd *pd, struct ibv_ah_attr *attr,struct ibv_xrcd *xrcd,
-					struct ibv_qp_info *local_qp_info,struct ibv_qp_info *remote_qp_info);
+struct ibv_ah *ibv_create_ah(struct ibv_pd *pd, struct ibv_ah_attr *attr);
+
+/**
+ * ibv_create_ah_srm - Create an address handle and run the SRM/XRC setup
+ * extension used by the Hollow RC test programs.
+ *
+ * This is deliberately separate from ibv_create_ah() so applications using
+ * the standard verbs ABI do not have to pass SRM-private arguments.
+ */
+struct ibv_ah *ibv_create_ah_srm(struct ibv_pd *pd,
+				  struct ibv_ah_attr *attr,
+				  struct ibv_xrcd *xrcd,
+				  struct ibv_qp_info *local_qp_info,
+				  struct ibv_qp_info *remote_qp_info);
 
 /**
  * ibv_init_ah_from_wc - Initializes address handle attributes from a

@@ -1068,16 +1068,60 @@ static inline int mlx5_srm_poll_watermarks(struct mlx5_cq *cq, int ne,
 
 	while (qp && npolled < ne) {
 		struct mlx5_qp *next = qp->srm_completion_next;
-		struct mlx5_sq_ctrl_page *ctrl = qp->srm_completion_ctrl;
-		uint64_t target = qp->srm_completion_idx + 1;
-		uint64_t completed;
-		int ready;
+		uint64_t head = __atomic_load_n(&qp->srm_completion_head,
+						__ATOMIC_ACQUIRE);
+		uint64_t tail = qp->srm_completion_tail;
 
-		completed = __atomic_load_n(&ctrl->cons_idx, __ATOMIC_ACQUIRE);
-		/* Signed modular comparison is valid while the live SQ window is
-		 * below 2^63 entries and remains correct across u64 wrap. */
-		ready = (int64_t)(completed - target) >= 0;
-		if (!qp->srm_completion_pending || ready) {
+		while (tail != head && npolled < ne) {
+			struct mlx5_srm_completion_marker *marker;
+			struct mlx5_sq_ctrl_page *ctrl;
+			struct ibv_wc *cur;
+			uint64_t completed;
+			uint64_t error_idx;
+			uint64_t target;
+
+			marker = &qp->srm_completion_ring[
+				tail & (qp->srm_completion_capacity - 1)];
+			ctrl = marker->ctrl;
+			target = marker->idx + 1;
+			completed = __atomic_load_n(&ctrl->cons_idx,
+						    __ATOMIC_ACQUIRE);
+			/* Signed modular comparison is valid while the live SQ window
+			 * is below 2^63 entries and remains correct across u64 wrap. */
+			if ((int64_t)(completed - target) < 0)
+				break;
+
+			cur = &wc[npolled++];
+			memset(cur, 0, sizeof(*cur));
+			cur->wr_id = marker->wr_id;
+			cur->opcode = marker->opcode;
+			cur->qp_num = qp->verbs_qp.qp.qp_num;
+			if (cur->opcode == IBV_WC_RDMA_READ)
+				cur->byte_len = marker->byte_len;
+
+			error_idx = __atomic_load_n(&ctrl->completion_error_idx,
+						    __ATOMIC_RELAXED);
+			if (unlikely(error_idx == target)) {
+				cur->status = (enum ibv_wc_status)__atomic_load_n(
+					&ctrl->completion_error_status,
+					__ATOMIC_RELAXED);
+				cur->vendor_err = __atomic_load_n(
+					&ctrl->completion_error_vendor,
+					__ATOMIC_RELAXED);
+			} else if (unlikely(error_idx != UINT64_MAX &&
+					    (int64_t)(target - error_idx) > 0)) {
+				/* The first failed physical WQE puts the shared RC SQ into
+				 * error; later logical completions are flushed. */
+				cur->status = IBV_WC_WR_FLUSH_ERR;
+			} else {
+				cur->status = IBV_WC_SUCCESS;
+			}
+			tail++;
+			__atomic_store_n(&qp->srm_completion_tail, tail,
+					 __ATOMIC_RELEASE);
+		}
+
+		if (tail == head) {
 			if (prev)
 				prev->srm_completion_next = next;
 			else
@@ -1086,35 +1130,6 @@ static inline int mlx5_srm_poll_watermarks(struct mlx5_cq *cq, int ne,
 				cq->srm_pending_tail = prev;
 			qp->srm_completion_next = NULL;
 			qp->srm_completion_queued = 0;
-
-			if (ready && qp->srm_completion_pending) {
-				struct ibv_wc *cur = &wc[npolled++];
-				uint64_t error_idx;
-
-				memset(cur, 0, sizeof(*cur));
-				cur->wr_id = qp->srm_completion_wr_id;
-				cur->opcode = qp->srm_completion_opcode;
-				cur->qp_num = qp->verbs_qp.qp.qp_num;
-				if (cur->opcode == IBV_WC_RDMA_READ)
-					cur->byte_len = qp->srm_completion_byte_len;
-
-				error_idx = __atomic_load_n(
-					&ctrl->completion_error_idx,
-					__ATOMIC_RELAXED);
-				if (unlikely(error_idx == target)) {
-					cur->status = (enum ibv_wc_status)
-						__atomic_load_n(
-							&ctrl->completion_error_status,
-							__ATOMIC_RELAXED);
-					cur->vendor_err = __atomic_load_n(
-						&ctrl->completion_error_vendor,
-						__ATOMIC_RELAXED);
-				} else {
-					cur->status = IBV_WC_SUCCESS;
-				}
-				__atomic_store_n(&qp->srm_completion_pending, 0,
-						 __ATOMIC_RELEASE);
-			}
 		} else {
 			prev = qp;
 		}

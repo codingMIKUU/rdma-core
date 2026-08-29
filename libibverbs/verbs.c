@@ -739,39 +739,36 @@ LATEST_SYMVER_FUNC(ibv_destroy_qp, 1_1, "IBVERBS_1.1",
 	return get_ops(qp->context)->destroy_qp(qp);
 }
 
-LATEST_SYMVER_FUNC(ibv_create_ah, 1_1, "IBVERBS_1.1",
-		   struct ibv_ah *,
-		   struct ibv_pd *pd, 
-		   struct ibv_ah_attr *attr,
-		   struct ibv_xrcd *xrcd,
-		   struct ibv_qp_info *local_qp_info,
-		   struct ibv_qp_info *remote_qp_info)
+static struct ibv_ah *ibv_create_ah_base(struct ibv_pd *pd,
+					 struct ibv_ah_attr *attr)
 {
-	//pass the check_xrc value to kernel 
 	struct ibv_ah *ah = get_ops(pd->context)->create_ah(pd, attr);
-	
 
 	if (ah) {
 		ah->context = pd->context;
-		ah->pd      = pd;
+		ah->pd = pd;
+	}
+
+	return ah;
+}
+
+static struct ibv_ah *ibv_create_ah_srm_common(
+	struct ibv_pd *pd, struct ibv_ah_attr *attr, struct ibv_xrcd *xrcd,
+	struct ibv_qp_info *local_qp_info,
+	struct ibv_qp_info *remote_qp_info)
+{
+	//pass the check_xrc value to kernel
+	struct ibv_ah *ah = ibv_create_ah_base(pd, attr);
+
+
+	if (ah) {
 		printf("用户态驱动收到的srmc_flags: %u\n", ah->srmc_flags);
 		if (ah->srmc_flags == (uint32_t)-1) {
 			printf("报错srmc_flags: %u\n", ah->srmc_flags);
             return NULL;
-        }
+		}
 		if(local_qp_info!=NULL && ah->srmc_flags>=0){
 			//XRC QP doesn't exists
-			struct ibv_qp_init_attr_ex create_attr;
-    		memset(&create_attr, 0, sizeof(struct ibv_qp_init_attr_ex));
-			struct ibv_qp *qp;
-			struct ibv_qp_info rqi;
-
-			int cq_depth = 256;
-			int sq_depth = 256;
-			int rq_depth = 256;
-			int psn = 3185;
-			int max_rd_atomic = 16;
-			
 			if(attr->check_xrc==1){
 				// //create XRC INI QP
 
@@ -906,6 +903,23 @@ LATEST_SYMVER_FUNC(ibv_create_ah, 1_1, "IBVERBS_1.1",
 	}
 
 	return ah;
+}
+
+LATEST_SYMVER_FUNC(ibv_create_ah, 1_1, "IBVERBS_1.1",
+		   struct ibv_ah *,
+		   struct ibv_pd *pd, struct ibv_ah_attr *attr)
+{
+	return ibv_create_ah_base(pd, attr);
+}
+
+struct ibv_ah *ibv_create_ah_srm(struct ibv_pd *pd,
+				  struct ibv_ah_attr *attr,
+				  struct ibv_xrcd *xrcd,
+				  struct ibv_qp_info *local_qp_info,
+				  struct ibv_qp_info *remote_qp_info)
+{
+	return ibv_create_ah_srm_common(pd, attr, xrcd, local_qp_info,
+					remote_qp_info);
 }
 
 int ibv_query_gid_type(struct ibv_context *context, uint8_t port_num,
@@ -1126,7 +1140,7 @@ struct ibv_ah *ibv_create_ah_from_wc(struct ibv_pd *pd, struct ibv_wc *wc,
 	if (ret)
 		return NULL;
 
-	return ibv_create_ah(pd, &ah_attr,NULL,NULL,NULL);
+	return ibv_create_ah(pd, &ah_attr);
 }
 
 LATEST_SYMVER_FUNC(ibv_destroy_ah, 1_1, "IBVERBS_1.1",

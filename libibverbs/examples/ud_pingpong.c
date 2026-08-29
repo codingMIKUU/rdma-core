@@ -114,7 +114,7 @@ static int pp_connect_ctx(struct pingpong_context *ctx, int port, int my_psn,
 		ah_attr.grh.sgid_index = sgid_idx;
 	}
 
-	ctx->ah = ibv_create_ah(ctx->pd, &ah_attr,NULL,NULL,NULL);
+	ctx->ah = ibv_create_ah(ctx->pd, &ah_attr);
 	if (!ctx->ah) {
 		fprintf(stderr, "Failed to create AH\n");
 		return 1;

@@ -1576,7 +1576,7 @@ static int ds_add_qp_dest(struct ds_qp *qp, union socket_addr *addr,
 	memset(&attr, 0, sizeof attr);
 	attr.dlid = port_attr.lid;
 	attr.port_num = qp->cm_id->port_num;
-	qp->dest.ah = ibv_create_ah(qp->cm_id->pd, &attr,NULL,NULL,NULL);
+	qp->dest.ah = ibv_create_ah(qp->cm_id->pd, &attr);
 	if (!qp->dest.ah)
 		return ERR(ENOMEM);
 
@@ -4380,7 +4380,7 @@ static void udp_svc_create_ah(struct rsocket *rs, struct ds_dest *dest, uint32_t
 
 	fastlock_acquire(&rs->slock);
 	dest->qpn = qpn;
-	dest->ah = ibv_create_ah(dest->qp->cm_id->pd, &attr,NULL,NULL,NULL);
+	dest->ah = ibv_create_ah(dest->qp->cm_id->pd, &attr);
 	fastlock_release(&rs->slock);
 out:
 	rdma_destroy_id(id);

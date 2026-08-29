@@ -312,7 +312,7 @@ static int join_handler(struct cmatest_node *node,
 
 	node->remote_qpn = param->qp_num;
 	node->remote_qkey = param->qkey;
-	node->ah = ibv_create_ah(node->pd, &param->ah_attr,NULL,NULL,NULL);
+	node->ah = ibv_create_ah(node->pd, &param->ah_attr);
 	if (!node->ah) {
 		printf("mckey: failure creating address handle\n");
 		goto err;

@@ -1230,10 +1230,73 @@ mlx5_srm_wc_opcode(enum ibv_wr_opcode opcode)
 	}
 }
 
-static inline int mlx5_srm_completion_slot_busy(struct mlx5_qp *qp)
+static int mlx5_srm_ensure_completion_space(struct mlx5_qp *qp)
 {
-	return __atomic_load_n(&qp->srm_completion_pending,
-			       __ATOMIC_ACQUIRE);
+	struct mlx5_cq *cq = to_mcq(qp->ibv_qp->send_cq);
+	struct mlx5_srm_completion_marker *new_ring;
+	struct mlx5_srm_completion_marker *old_ring;
+	uint32_t old_capacity;
+	uint32_t new_capacity;
+	uint32_t max_capacity;
+	uint64_t head;
+	uint64_t tail;
+	uint64_t pending;
+	uint64_t i;
+
+	head = __atomic_load_n(&qp->srm_completion_head, __ATOMIC_ACQUIRE);
+	tail = __atomic_load_n(&qp->srm_completion_tail, __ATOMIC_ACQUIRE);
+	old_capacity = __atomic_load_n(&qp->srm_completion_capacity,
+				       __ATOMIC_ACQUIRE);
+	if (old_capacity && head - tail < old_capacity)
+		return 0;
+
+	/* Grow lazily so QPs that keep only one marker outstanding do not pay
+	 * for a full physical-SQ-sized array.  The mapped SQ size is a power of
+	 * two, so every ring generation can use a mask rather than division. */
+	max_capacity = qp->sq.wqe_cnt;
+	if (!max_capacity || (max_capacity & (max_capacity - 1)))
+		return EINVAL;
+	if (old_capacity >= max_capacity)
+		return ENOMEM;
+	new_capacity = old_capacity ? old_capacity << 1 : 8;
+	if (new_capacity > max_capacity)
+		new_capacity = max_capacity;
+	if (new_capacity <= old_capacity)
+		return ENOMEM;
+
+	new_ring = calloc(new_capacity, sizeof(*new_ring));
+	if (!new_ring)
+		return ENOMEM;
+
+	/* CQ polling consumes this ring under the same lock.  Recheck after
+	 * taking it because a concurrent poll may already have made room. */
+	mlx5_spin_lock(&cq->lock);
+	head = qp->srm_completion_head;
+	tail = qp->srm_completion_tail;
+	old_capacity = qp->srm_completion_capacity;
+	if (old_capacity && head - tail < old_capacity) {
+		mlx5_spin_unlock(&cq->lock);
+		free(new_ring);
+		return 0;
+	}
+
+	pending = head - tail;
+	if (unlikely(pending > old_capacity || pending >= new_capacity)) {
+		mlx5_spin_unlock(&cq->lock);
+		free(new_ring);
+		return ENOMEM;
+	}
+	old_ring = qp->srm_completion_ring;
+	for (i = 0; i < pending; i++)
+		new_ring[i] = old_ring[(tail + i) & (old_capacity - 1)];
+	qp->srm_completion_ring = new_ring;
+	qp->srm_completion_tail = 0;
+	qp->srm_completion_head = pending;
+	__atomic_store_n(&qp->srm_completion_capacity, new_capacity,
+			 __ATOMIC_RELEASE);
+	mlx5_spin_unlock(&cq->lock);
+	free(old_ring);
+	return 0;
 }
 
 static inline void mlx5_srm_queue_completion(
@@ -1241,24 +1304,32 @@ static inline void mlx5_srm_queue_completion(
 	uint64_t wr_id, const struct ibv_send_wr *wr)
 {
 	struct mlx5_cq *cq = to_mcq(qp->ibv_qp->send_cq);
+	struct mlx5_srm_completion_marker *marker;
+	uint64_t head;
 
 	mlx5_spin_lock(&cq->lock);
-	/* Hollow RC fast posting is single-producer per logical QP.  The caller
-	 * rejects a second signaled marker until this one has been polled. */
+	/* Hollow RC fast posting is single-producer per logical QP.  CQ polling
+	 * is serialized with this producer while the marker and list are updated. */
 	qp->srm_completion_cq = cq;
-	qp->srm_completion_ctrl = ctrl;
-	qp->srm_completion_idx = slot;
-	qp->srm_completion_wr_id = wr_id;
-	qp->srm_completion_byte_len = mlx5_srm_wr_data_bytes(wr);
-	qp->srm_completion_opcode = mlx5_srm_wc_opcode(wr->opcode);
-	qp->srm_completion_next = NULL;
-	qp->srm_completion_pending = 1;
-	if (cq->srm_pending_tail)
-		cq->srm_pending_tail->srm_completion_next = qp;
-	else
-		cq->srm_pending_head = qp;
-	cq->srm_pending_tail = qp;
-	qp->srm_completion_queued = 1;
+	head = qp->srm_completion_head;
+	marker = &qp->srm_completion_ring[
+		head & (qp->srm_completion_capacity - 1)];
+	marker->ctrl = ctrl;
+	marker->idx = slot;
+	marker->wr_id = wr_id;
+	marker->byte_len = mlx5_srm_wr_data_bytes(wr);
+	marker->opcode = mlx5_srm_wc_opcode(wr->opcode);
+	__atomic_store_n(&qp->srm_completion_head, head + 1,
+			 __ATOMIC_RELEASE);
+	if (!qp->srm_completion_queued) {
+		qp->srm_completion_next = NULL;
+		if (cq->srm_pending_tail)
+			cq->srm_pending_tail->srm_completion_next = qp;
+		else
+			cq->srm_pending_head = qp;
+		cq->srm_pending_tail = qp;
+		qp->srm_completion_queued = 1;
+	}
 	mlx5_spin_unlock(&cq->lock);
 }
 
@@ -1812,6 +1883,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		uint32_t post_kernel_qpn = qp->srm_kernel_qpn;
 		uint32_t post_ctrl_slot_idx = qp->sq_ctrl_slot_idx;
 		struct mlx5_srm_mapping_bundle *post_mapping = qp->srm_mapping;
+		bool srm_signaled;
 
 		if (MLX5_SRM_ENABLE_LARGE_KERNEL_QP && srm_fast &&
 		    mlx5_srm_wr_data_bytes(wr) > MLX5_SRM_LARGE_MSG_THRESHOLD) {
@@ -1824,11 +1896,11 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			post_ctrl_slot_idx = qp->srm_large_sq_ctrl_slot_idx;
 			post_mapping = qp->srm_large_mapping;
 		}
-		if (srm_fast && (wr->send_flags & IBV_SEND_SIGNALED) &&
-		    unlikely(mlx5_srm_completion_slot_busy(qp))) {
-			/* The fixed-window Hollow RC API keeps at most one signaled
-			 * completion outstanding per logical QP. */
-			err = EBUSY;
+		srm_signaled = srm_fast &&
+			((wr->send_flags & IBV_SEND_SIGNALED) ||
+			 (qp->sq_signal_bits & MLX5_WQE_CTRL_CQ_UPDATE));
+		if (srm_signaled &&
+		    unlikely((err = mlx5_srm_ensure_completion_space(qp)))) {
 			if (bad_wr)
 				*bad_wr = wr;
 			goto out;
@@ -2219,7 +2291,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 					       post_publish_token,
 					       post_publish_depth, post_wq,
 					       post_kernel_qpn, slot);
-		if (srm_fast && (wr->send_flags & IBV_SEND_SIGNALED))
+		if (srm_signaled)
 			mlx5_srm_queue_completion(qp, post_ctrl, slot, wr_id, wr);
 		if (phase_stats)
 		{

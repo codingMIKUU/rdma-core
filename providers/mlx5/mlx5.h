@@ -519,6 +519,17 @@ struct mlx5_sq_ctrl_page {
 _Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 512,
 	       "hollow RC ctrl ABI must occupy eight cachelines");
 
+/* Metadata for one signaled WR on a Hollow RC logical QP.  The kernel only
+ * publishes the shared physical SQ completion cursor; userspace uses this
+ * marker to reconstruct the logical completion. */
+struct mlx5_srm_completion_marker {
+	struct mlx5_sq_ctrl_page *ctrl;
+	uint64_t idx;
+	uint64_t wr_id;
+	uint32_t byte_len;
+	enum ibv_wc_opcode opcode;
+};
+
 #define MLX5_SRM_DB_OWNER_FREE   0U
 #define MLX5_SRM_DB_OWNER_USER   1U
 #define MLX5_SRM_DB_OWNER_KERNEL 2U
@@ -878,12 +889,10 @@ struct mlx5_qp {
 	uint8_t srm_large_fast_ready;
 	struct mlx5_cq *srm_completion_cq;
 	struct mlx5_qp *srm_completion_next;
-	struct mlx5_sq_ctrl_page *srm_completion_ctrl;
-	uint64_t srm_completion_idx;
-	uint64_t srm_completion_wr_id;
-	uint32_t srm_completion_byte_len;
-	enum ibv_wc_opcode srm_completion_opcode;
-	uint8_t srm_completion_pending;
+	struct mlx5_srm_completion_marker *srm_completion_ring;
+	uint64_t srm_completion_head;
+	uint64_t srm_completion_tail;
+	uint32_t srm_completion_capacity;
 	uint8_t srm_completion_queued;
 	uint32_t srm_num_level;
 	uint32_t srm_num_sched;

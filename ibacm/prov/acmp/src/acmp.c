@@ -437,8 +437,7 @@ acmp_alloc_send(struct acmp_ep *ep, struct acmp_dest *dest, size_t size)
 	}
 
 	if (!dest->ah) {
-		msg->ah = ibv_create_ah(ep->port->dev->pd, &dest->av, NULL,
-					NULL, NULL);
+		msg->ah = ibv_create_ah(ep->port->dev->pd, &dest->av);
 		if (!msg->ah) {
 			acm_log(0, "ERROR - unable to create ah\n");
 			goto err2;
@@ -727,8 +726,7 @@ static void acmp_process_join_resp(struct acm_sa_mad *sa_mad)
 	acmp_record_mc_av(ep->port, mc_rec, dest);
 
 	if (index == 0) {
-		dest->ah = ibv_create_ah(ep->port->dev->pd, &dest->av, NULL,
-					 NULL, NULL);
+		dest->ah = ibv_create_ah(ep->port->dev->pd, &dest->av);
 		if (!dest->ah) {
 			acm_log(0, "ERROR - unable to create ah\n");
 			goto out;

@@ -3243,7 +3243,10 @@ static void mlx5_srm_remove_pending_completion(struct mlx5_qp *qp)
 	}
 	qp->srm_completion_next = NULL;
 	qp->srm_completion_queued = 0;
-	qp->srm_completion_pending = 0;
+	__atomic_store_n(&qp->srm_completion_tail,
+			 __atomic_load_n(&qp->srm_completion_head,
+					 __ATOMIC_ACQUIRE),
+			 __ATOMIC_RELEASE);
 	mlx5_spin_unlock(&cq->lock);
 }
 
@@ -3312,6 +3315,8 @@ int mlx5_destroy_qp(struct ibv_qp *ibqp)
 			mlx5_free_qp_buf(ctx, qp);
 	}
 free:
+	free(qp->srm_completion_ring);
+	qp->srm_completion_ring = NULL;
 	if (qp->srm_mapping) {
 		mlx5_srm_release_mapping(ctx, qp);
 	} else if (qp->sq_mmap_buf) {
@@ -4014,6 +4019,7 @@ int __mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 	if (!ret		       &&
 	    (attr_mask & IBV_QP_STATE) &&
 	    attr->qp_state == IBV_QPS_RESET) {
+		mlx5_srm_remove_pending_completion(mqp);
 		if (qp->recv_cq) {
 			mlx5_cq_clean(to_mcq(qp->recv_cq), mqp->rsc.rsn,
 				      qp->srq ? to_msrq(qp->srq) : NULL);

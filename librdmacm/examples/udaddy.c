@@ -335,7 +335,7 @@ static int resolved_handler(struct cmatest_node *node,
 {
 	node->remote_qpn = event->param.ud.qp_num;
 	node->remote_qkey = event->param.ud.qkey;
-	node->ah = ibv_create_ah(node->pd, &event->param.ud.ah_attr,NULL,NULL,NULL);
+	node->ah = ibv_create_ah(node->pd, &event->param.ud.ah_attr);
 	if (!node->ah) {
 		printf("udaddy: failure creating address handle\n");
 		goto err;
