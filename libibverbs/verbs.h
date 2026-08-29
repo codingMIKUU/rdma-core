@@ -773,8 +773,17 @@ struct ibv_ah_attr {
 	uint8_t			static_rate;
 	uint8_t			is_global;
 	uint8_t			port_num;
-	uint8_t 	    check_xrc;// if 1, for xrc ini qp ;if 2, for xrc tgt qp 
-	uint32_t 		dqpn;
+};
+
+/*
+ * SRM-private address-handle parameters.  Keep these outside ibv_ah_attr:
+ * ibv_ah_attr is part of the public verbs ABI and is embedded in ibv_qp_attr.
+ */
+struct ibv_srm_ah_attr {
+	struct ibv_ah_attr ah_attr;
+	uint8_t check_xrc; /* 1: XRC initiator, 2: XRC target */
+	uint8_t reserved[3];
+	uint32_t dqpn;
 };
 
 enum ibv_srq_attr_mask {
@@ -1866,7 +1875,6 @@ struct ibv_ah {
 	struct ibv_context     *context;
 	struct ibv_pd	       *pd;  		
 	uint32_t		handle;
-	int 		srmc_flags;
 };
 
 enum ibv_flow_flags {
@@ -3591,7 +3599,7 @@ struct ibv_ah *ibv_create_ah(struct ibv_pd *pd, struct ibv_ah_attr *attr);
  * the standard verbs ABI do not have to pass SRM-private arguments.
  */
 struct ibv_ah *ibv_create_ah_srm(struct ibv_pd *pd,
-				  struct ibv_ah_attr *attr,
+				  struct ibv_srm_ah_attr *attr,
 				  struct ibv_xrcd *xrcd,
 				  struct ibv_qp_info *local_qp_info,
 				  struct ibv_qp_info *remote_qp_info);

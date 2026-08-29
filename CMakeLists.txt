@@ -83,7 +83,7 @@ set(PACKAGE_VERSION "56.0")
 # When this is changed the values in these files need changing too:
 #   debian/control
 #   debian/libibverbs1.symbols
-set(IBVERBS_PABI_VERSION "34")
+set(IBVERBS_PABI_VERSION "35")
 set(IBVERBS_PROVIDER_SUFFIX "-rdmav${IBVERBS_PABI_VERSION}.so")
 
 #-------------------------

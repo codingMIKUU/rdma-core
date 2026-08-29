@@ -1424,6 +1424,9 @@ int mlx5_store_mkey(struct mlx5_context *ctx, uint32_t mkeyn,
 		    struct mlx5_mkey *mkey);
 void mlx5_clear_mkey(struct mlx5_context *ctx, uint32_t mkeyn);
 struct ibv_ah *mlx5_create_ah(struct ibv_pd *pd, struct ibv_ah_attr *attr);
+struct ibv_ah *mlx5_create_ah_srm(struct ibv_pd *pd,
+				  struct ibv_srm_ah_attr *attr,
+				  uint32_t *srmc_flags);
 int mlx5_destroy_ah(struct ibv_ah *ah);
 int mlx5_alloc_av(struct mlx5_pd *pd, struct ibv_ah_attr *attr,
 		   struct mlx5_ah *ah);

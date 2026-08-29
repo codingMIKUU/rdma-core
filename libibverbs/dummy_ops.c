@@ -122,6 +122,14 @@ static struct ibv_ah *create_ah(struct ibv_pd *pd, struct ibv_ah_attr *attr)
 	return NULL;
 }
 
+static struct ibv_ah *create_ah_srm(struct ibv_pd *pd,
+				    struct ibv_srm_ah_attr *attr,
+				    uint32_t *srmc_flags)
+{
+	errno = EOPNOTSUPP;
+	return NULL;
+}
+
 static struct ibv_counters *create_counters(struct ibv_context *context,
 					    struct ibv_counters_init_attr *init_attr)
 {
@@ -522,6 +530,7 @@ const struct verbs_context_ops verbs_dummy_ops = {
 	close_xrcd,
 	cq_event,
 	create_ah,
+	create_ah_srm,
 	create_counters,
 	create_cq,
 	create_cq_ex,

@@ -806,12 +806,14 @@ int ibv_cmd_post_srq_recv(struct ibv_srq *srq, struct ibv_recv_wr *wr,
 	return ret;
 }
 
-int ibv_cmd_create_ah(struct ibv_pd *pd, struct ibv_ah *ah,
-		      struct ibv_ah_attr *attr,
-		      struct ib_uverbs_create_ah_resp *resp,
-		      size_t resp_size)
+static int ibv_cmd_create_ah_common(struct ibv_pd *pd, struct ibv_ah *ah,
+				    struct ibv_ah_attr *attr,
+				    uint8_t check_xrc, uint32_t dqpn,
+				    uint32_t *srmc_flags,
+				    struct ib_uverbs_create_ah_resp *resp,
+				    size_t resp_size)
 {
-	struct ibv_create_ah      cmd;
+	struct ibv_create_ah cmd = {};
 	int ret;
 
 	cmd.user_handle            = (uintptr_t) ah;
@@ -823,14 +825,13 @@ int ibv_cmd_create_ah(struct ibv_pd *pd, struct ibv_ah *ah,
 	cmd.attr.static_rate       = attr->static_rate;
 	cmd.attr.is_global         = attr->is_global;
 	cmd.attr.port_num          = attr->port_num;
-	cmd.attr.reserved          = 0;
+	cmd.attr.reserved          = check_xrc;
+	cmd.attr.dqpn              = dqpn;
 	cmd.attr.grh.flow_label    = attr->grh.flow_label;
 	cmd.attr.grh.sgid_index    = attr->grh.sgid_index;
 	cmd.attr.grh.hop_limit     = attr->grh.hop_limit;
 	cmd.attr.grh.traffic_class = attr->grh.traffic_class;
 	cmd.attr.grh.reserved      = 0;
-	cmd.attr.reserved 		   = attr->check_xrc;//use reserved for xrc check
-	cmd.attr.dqpn              = attr->dqpn;	//use dqpn for xrc tgt kernel qp 
 	memcpy(cmd.attr.grh.dgid, attr->grh.dgid.raw, 16);
 
 	ret = execute_cmd_write(pd->context, IB_USER_VERBS_CMD_CREATE_AH, &cmd,
@@ -840,9 +841,30 @@ int ibv_cmd_create_ah(struct ibv_pd *pd, struct ibv_ah *ah,
 
 	ah->handle  = resp->ah_handle;
 	ah->context = pd->context;
-	ah->srmc_flags = resp->srmc_flags;
+	if (srmc_flags)
+		*srmc_flags = resp->srmc_flags;
 
 	return 0;
+}
+
+int ibv_cmd_create_ah(struct ibv_pd *pd, struct ibv_ah *ah,
+		      struct ibv_ah_attr *attr,
+		      struct ib_uverbs_create_ah_resp *resp,
+		      size_t resp_size)
+{
+	return ibv_cmd_create_ah_common(pd, ah, attr, 0, 0, NULL, resp,
+					resp_size);
+}
+
+int ibv_cmd_create_ah_srm(struct ibv_pd *pd, struct ibv_ah *ah,
+			  struct ibv_srm_ah_attr *attr,
+			  uint32_t *srmc_flags,
+			  struct ib_uverbs_create_ah_resp *resp,
+			  size_t resp_size)
+{
+	return ibv_cmd_create_ah_common(pd, ah, &attr->ah_attr,
+					attr->check_xrc, attr->dqpn, srmc_flags,
+					resp, resp_size);
 }
 
 int ibv_cmd_attach_mcast(struct ibv_qp *qp, const union ibv_gid *gid, uint16_t lid)

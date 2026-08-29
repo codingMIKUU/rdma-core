@@ -4238,7 +4238,9 @@ static void mlx5_ah_set_udp_sport(struct mlx5_ah *ah,
 	ah->av.rlid = htobe16(sport);
 }
 
-struct ibv_ah *mlx5_create_ah(struct ibv_pd *pd, struct ibv_ah_attr *attr)
+static struct ibv_ah *mlx5_create_ah_common(
+	struct ibv_pd *pd, struct ibv_ah_attr *attr,
+	struct ibv_srm_ah_attr *srm_attr, uint32_t *srmc_flags)
 {
 	struct mlx5_context *ctx = to_mctx(pd->context);
 	struct ibv_port_attr port_attr;
@@ -4309,8 +4311,15 @@ struct ibv_ah *mlx5_create_ah(struct ibv_pd *pd, struct ibv_ah_attr *attr)
 		if (ctx->cmds_supp_uhw & MLX5_USER_CMDS_SUPP_UHW_CREATE_AH) {
 			struct mlx5_create_ah_resp resp = {};
 
-			if (ibv_cmd_create_ah(pd, &ah->ibv_ah, attr, &resp.ibv_resp, sizeof(resp)))
+			if (srm_attr) {
+				if (ibv_cmd_create_ah_srm(pd, &ah->ibv_ah, srm_attr,
+						      srmc_flags, &resp.ibv_resp,
+						      sizeof(resp)))
+					goto err;
+			} else if (ibv_cmd_create_ah(pd, &ah->ibv_ah, attr,
+						     &resp.ibv_resp, sizeof(resp))) {
 				goto err;
+			}
 
 			ah->kern_ah = true;
 			memcpy(ah->av.rmac, resp.dmac, ETHERNET_LL_SIZE);
@@ -4328,6 +4337,18 @@ struct ibv_ah *mlx5_create_ah(struct ibv_pd *pd, struct ibv_ah_attr *attr)
 err:
 	free(ah);
 	return NULL;
+}
+
+struct ibv_ah *mlx5_create_ah(struct ibv_pd *pd, struct ibv_ah_attr *attr)
+{
+	return mlx5_create_ah_common(pd, attr, NULL, NULL);
+}
+
+struct ibv_ah *mlx5_create_ah_srm(struct ibv_pd *pd,
+				  struct ibv_srm_ah_attr *attr,
+				  uint32_t *srmc_flags)
+{
+	return mlx5_create_ah_common(pd, &attr->ah_attr, attr, srmc_flags);
 }
 
 int mlx5_destroy_ah(struct ibv_ah *ah)

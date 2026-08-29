@@ -336,6 +336,9 @@ struct verbs_context_ops {
 	void (*cq_event)(struct ibv_cq *cq);
 	struct ibv_ah *(*create_ah)(struct ibv_pd *pd,
 				    struct ibv_ah_attr *attr);
+	struct ibv_ah *(*create_ah_srm)(struct ibv_pd *pd,
+					struct ibv_srm_ah_attr *attr,
+					uint32_t *srmc_flags);
 	struct ibv_counters *(*create_counters)(struct ibv_context *context,
 						struct ibv_counters_init_attr *init_attr);
 	struct ibv_cq *(*create_cq)(struct ibv_context *context, int cqe,
@@ -659,6 +662,11 @@ int ibv_cmd_create_ah(struct ibv_pd *pd, struct ibv_ah *ah,
 		      struct ibv_ah_attr *attr,
 		      struct ib_uverbs_create_ah_resp *resp,
 		      size_t resp_size);
+int ibv_cmd_create_ah_srm(struct ibv_pd *pd, struct ibv_ah *ah,
+			  struct ibv_srm_ah_attr *attr,
+			  uint32_t *srmc_flags,
+			  struct ib_uverbs_create_ah_resp *resp,
+			  size_t resp_size);
 int ibv_cmd_destroy_ah(struct ibv_ah *ah);
 int ibv_cmd_attach_mcast(struct ibv_qp *qp, const union ibv_gid *gid, uint16_t lid);
 int ibv_cmd_detach_mcast(struct ibv_qp *qp, const union ibv_gid *gid, uint16_t lid);

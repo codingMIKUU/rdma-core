@@ -125,6 +125,7 @@ static const struct verbs_context_ops mlx5_ctx_common_ops = {
 	.post_send     = mlx5_post_send,
 	.post_recv     = mlx5_post_recv,
 	.create_ah     = mlx5_create_ah,
+	.create_ah_srm = mlx5_create_ah_srm,
 	.destroy_ah    = mlx5_destroy_ah,
 	.attach_mcast  = mlx5_attach_mcast,
 	.detach_mcast  = mlx5_detach_mcast,

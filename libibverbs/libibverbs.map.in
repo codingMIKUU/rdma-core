@@ -182,6 +182,7 @@ IBVERBS_PRIVATE_@IBVERBS_PABI_VERSION@ {
 		ibv_cmd_attach_mcast;
 		ibv_cmd_close_xrcd;
 		ibv_cmd_create_ah;
+		ibv_cmd_create_ah_srm;
 		ibv_cmd_create_counters;
 		ibv_cmd_create_cq;
 		ibv_cmd_create_cq_ex;
