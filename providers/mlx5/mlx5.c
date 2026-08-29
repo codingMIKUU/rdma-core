@@ -279,10 +279,6 @@ int32_t mlx5_store_uidx(struct mlx5_context *ctx, void *rsc)
 
 	++ctx->uidx_table[tind].refcnt;
 	ctx->uidx_table[tind].table[uidx & MLX5_UIDX_TABLE_MASK] = rsc;
-	fprintf(stderr,
-		"mlx5: uidx store uidx=%d rsc=%p table=%p refcnt=%d\n",
-		uidx, rsc, (void *)ctx->uidx_table[tind].table,
-		ctx->uidx_table[tind].refcnt);
 	ret = uidx;
 
 out:

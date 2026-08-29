@@ -121,9 +121,15 @@ static void read_config(void)
 
 	conf_dir = opendir(IBV_CONFIG_DIR);
 	if (!conf_dir) {
-		fprintf(stderr,
-			PFX "Warning: couldn't open config directory '%s'.\n",
-			IBV_CONFIG_DIR);
+		/* An explicitly selected provider does not need libibverbs.d.
+		 * Keep warning for setuid callers, where provider environment
+		 * variables are intentionally ignored below.
+		 */
+		if (getuid() != geteuid() ||
+		    (!getenv("RDMAV_DRIVERS") && !getenv("IBV_DRIVERS")))
+			fprintf(stderr,
+				PFX "Warning: couldn't open config directory '%s'.\n",
+				IBV_CONFIG_DIR);
 		return;
 	}
 
