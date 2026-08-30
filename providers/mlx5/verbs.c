@@ -3922,6 +3922,13 @@ int __mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 		ret = ibv_cmd_modify_qp(qp, attr, attr_mask,
 					&cmd, sizeof(cmd));
 	}
+	if (ret && mqp->hollow_rc) {
+		fprintf(stderr,
+			"SRM modify kernel command failed: usr_qpn=%u state=%d "
+			"mask=0x%x ret=%d errno=%d (%s)\n",
+			qp->qp_num, attr->qp_state, attr_mask, ret, errno,
+			strerror(errno));
+	}
 
 	if (!ret && mqp->set_ece) {
 		mqp->set_ece = 0;
@@ -3942,9 +3949,21 @@ int __mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 			return errno;
 		}
 		if ((resp.drv_payload.comp_mask & mapping_mask) &&
-		    !mqp->srm_mapping &&
-		    mlx5_srm_acquire_mapping(context, mqp, &resp.drv_payload))
-			return errno;
+		    !mqp->srm_mapping) {
+			int mapping_ret = mlx5_srm_acquire_mapping(
+				context, mqp, &resp.drv_payload);
+
+			if (mapping_ret) {
+				fprintf(stderr,
+					"SRM userspace mapping failed: usr_qpn=%u "
+					"kernel_qpn=%u comp_mask=0x%llx ret=%d "
+					"errno=%d (%s)\n",
+					qp->qp_num, resp.drv_payload.kernel_qpn,
+					(unsigned long long)resp.drv_payload.comp_mask,
+					mapping_ret, errno, strerror(errno));
+				return mapping_ret;
+			}
+		}
 	}
 
 	if (!ret && (resp.drv_payload.comp_mask &
@@ -3954,10 +3973,18 @@ int __mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 		uint32_t wqe_cnt = resp.drv_payload.kernel_sq_wqe_cnt;
 
 		if (!mqp->sq_start || !mqp->sq_mmap_len) {
+			fprintf(stderr,
+				"SRM kernel SQ validation failed: usr_qpn=%u "
+				"missing SQ mapping start=%p len=%zu\n",
+				qp->qp_num, mqp->sq_start, mqp->sq_mmap_len);
 			errno = EINVAL;
 			return errno;
 		}
 		if (!wqe_cnt) {
+			fprintf(stderr,
+				"SRM kernel SQ validation failed: usr_qpn=%u "
+				"kernel_qpn=%u wqe_cnt=0\n",
+				qp->qp_num, resp.drv_payload.kernel_qpn);
 			errno = EINVAL;
 			return errno;
 		}
@@ -3968,6 +3995,11 @@ int __mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 		}
 		kernel_sq_bytes = (size_t)wqe_cnt << wqe_shift;
 		if (kernel_sq_bytes > mqp->sq_mmap_len) {
+			fprintf(stderr,
+				"SRM kernel SQ validation failed: usr_qpn=%u "
+				"kernel_qpn=%u bytes=%zu mmap_len=%zu\n",
+				qp->qp_num, resp.drv_payload.kernel_qpn,
+				kernel_sq_bytes, mqp->sq_mmap_len);
 			errno = EINVAL;
 			return errno;
 		}
