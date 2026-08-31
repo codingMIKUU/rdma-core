@@ -36,9 +36,12 @@
 #include <pthread.h>
 #include <string.h>
 #include <errno.h>
+#include <unistd.h>
 
 #include "mlx5.h"
 #include "wqe.h"
+
+static int srm_srq_debug_printed;
 
 static void *get_wqe(struct mlx5_srq *srq, int n)
 {
@@ -316,6 +319,15 @@ int mlx5_post_srq_recv(struct ibv_srq *ibsrq,
 		udma_to_device_barrier();
 
 		*srq->db = htobe32(srq->counter);
+
+		if (getenv("MLX5_SRM_WQE_DEBUG") &&
+		    !__atomic_exchange_n(&srm_srq_debug_printed, 1,
+		                         __ATOMIC_RELAXED))
+			fprintf(stderr,
+				"HOLLOW_SRQ_POST_IDENTITY pid=%d srqn=%u posted=%d counter=%u db=%u head=%d tail=%d max=%d nwqes=%u\n",
+				getpid(), srq->srqn, nreq, srq->counter,
+				be32toh(*srq->db), srq->head, srq->tail,
+				srq->max, srq->nwqes);
 	}
 
 	mlx5_spin_unlock(&srq->lock);
