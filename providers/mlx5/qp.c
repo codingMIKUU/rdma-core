@@ -1829,7 +1829,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	struct mlx5_bf *bf;
 	void *qend;
 	uint32_t mlx5_opcode;
-	struct mlx5_wqe_xrc_seg *xrc;
+	struct mlx5_wqe_xrc_seg *xrc = NULL;
 	uint8_t fence;
 	uint8_t next_fence;
 	uint32_t max_tso = 0;
