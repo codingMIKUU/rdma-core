@@ -1148,13 +1148,7 @@ static inline int poll_cq(struct ibv_cq *ibcq, int ne,
 	struct mlx5_cq *cq = to_mcq(ibcq);
 	struct mlx5_resource *rsc = NULL;
 	struct mlx5_srq *srq = NULL;
-	int npolled = 0;
-	int synthetic;
-	int quota;
-	int limit;
-	int prefer_synth;
-	int hardware = 0;
-	int synthetic_total = 0;
+	int npolled;
 	int err = CQ_OK;
 
 	if (cq->stall_enable) {
@@ -1168,86 +1162,14 @@ static inline int poll_cq(struct ibv_cq *ibcq, int ne,
 	}
 
 	mlx5_spin_lock(&cq->lock);
-	/*
-	 * The same CQ can contain both synthetic Hollow RC send completions
-	 * and real XRC-SRQ receive CQEs.  Always draining either source first
-	 * can starve the other when the caller's result array is filled on each
-	 * poll.  Reserve half of a poll batch for the preferred source, then
-	 * give the other source the remaining slots.  If one source is empty,
-	 * the final fallback lets the active source use the whole batch.
-	 */
-	prefer_synth = cq->srm_poll_prefer_synth && cq->srm_pending_head;
-	quota = (ne + 1) / 2;
+	npolled = mlx5_srm_poll_watermarks(cq, ne, wc);
 
-	if (prefer_synth && quota > 0) {
-		synthetic = mlx5_srm_poll_watermarks(cq, quota, wc);
-		npolled += synthetic;
-		synthetic_total += synthetic;
-		if (synthetic)
-			err = CQ_OK;
-	} else {
-		limit = quota;
-		while (npolled < limit) {
-			err = mlx5_poll_one(cq, &rsc, &srq, wc + npolled,
-					    cqe_ver);
-			if (err != CQ_OK)
-				break;
-			npolled++;
-			hardware++;
-		}
-		if (err == CQ_POLL_ERR)
-			goto out_unlock;
+	for (; npolled < ne; ++npolled) {
+		err = mlx5_poll_one(cq, &rsc, &srq, wc + npolled, cqe_ver);
+		if (err != CQ_OK)
+			break;
 	}
 
-	if (prefer_synth) {
-		while (npolled < ne) {
-			err = mlx5_poll_one(cq, &rsc, &srq, wc + npolled,
-					    cqe_ver);
-			if (err != CQ_OK)
-				break;
-			npolled++;
-			hardware++;
-		}
-		if (err == CQ_POLL_ERR)
-			goto out_unlock;
-	} else {
-		synthetic = mlx5_srm_poll_watermarks(cq, ne - npolled,
-						     wc + npolled);
-		npolled += synthetic;
-		synthetic_total += synthetic;
-		if (synthetic)
-			err = CQ_OK;
-	}
-
-	/* Let the first source consume unused capacity left by the second. */
-	if (npolled < ne) {
-		if (prefer_synth) {
-			synthetic = mlx5_srm_poll_watermarks(cq, ne - npolled,
-							     wc + npolled);
-			npolled += synthetic;
-			synthetic_total += synthetic;
-			if (synthetic)
-				err = CQ_OK;
-		} else {
-			while (npolled < ne) {
-				err = mlx5_poll_one(cq, &rsc, &srq,
-						    wc + npolled, cqe_ver);
-				if (err != CQ_OK)
-					break;
-				npolled++;
-				hardware++;
-			}
-		}
-	}
-
-	if (hardware && synthetic_total)
-		cq->srm_poll_prefer_synth = !prefer_synth;
-	else if (hardware)
-		cq->srm_poll_prefer_synth = 1;
-	else if (synthetic_total)
-		cq->srm_poll_prefer_synth = 0;
-
-out_unlock:
 	update_cons_index(cq);
 
 	mlx5_spin_unlock(&cq->lock);
