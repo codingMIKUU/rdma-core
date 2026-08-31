@@ -39,6 +39,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <time.h>
+#include <unistd.h>
 #include <util/mmio.h>
 #include <util/compiler.h>
 
@@ -56,6 +57,8 @@
 #define SRM_BACKOFF_MAX_NS 1000ULL
 #define SRM_RESERVE_MAX_WAIT_NS 5000000000ULL
 #define MLX5_SRM_DIRECT_DB_STATS_FLUSH_WINDOW (1ULL << 20)
+
+static int srm_wqe_debug_printed;
 
 static const uint32_t mlx5_ib_opcode[] = {
 	[IBV_WR_SEND]			= MLX5_OPCODE_SEND,
@@ -2266,6 +2269,19 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			else if (qp->sender_side && qp->srm_kernel_qpn_valid)
 				wqe_qpn = qp->srm_kernel_qpn;
 			ctrl->qpn_ds = htobe32(size | (wqe_qpn << 8));
+			if (srm_fast && xrc_wqe && xrc &&
+			    !__atomic_load_n(&srm_wqe_debug_printed,
+			                     __ATOMIC_RELAXED) &&
+			    getenv("MLX5_SRM_WQE_DEBUG") &&
+			    !__atomic_exchange_n(&srm_wqe_debug_printed, 1,
+			                         __ATOMIC_RELAXED))
+				fprintf(stderr,
+					"HOLLOW_WQE_IDENTITY pid=%d logical_qpn=%u kernel_qpn=%u opcode=%d ds=%d wr_srqn=%u wqe_srqn=%u slot=%llu\n",
+					getpid(), ibqp->qp_num, wqe_qpn,
+					wr->opcode, size,
+					wr->qp_type.xrc.remote_srqn,
+					be32toh(xrc->xrc_srqn),
+					(unsigned long long)slot);
 		}
 
 		if (unlikely(qp->wq_sig))
