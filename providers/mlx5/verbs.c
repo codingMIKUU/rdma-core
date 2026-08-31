@@ -4873,6 +4873,7 @@ struct ibv_srq *mlx5_create_srq_ex(struct ibv_context *context,
 	}
 
 	msrq->srqn = resp.srqn;
+	msrq->srq_type = attr->srq_type;
 	msrq->rsc.type = MLX5_RSC_TYPE_XSRQ;
 	msrq->rsc.rsn = ctx->cqe_version ? cmd.uidx : resp.srqn;
 

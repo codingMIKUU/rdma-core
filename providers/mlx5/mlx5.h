@@ -661,6 +661,7 @@ struct mlx5_srq {
 	struct mlx5_spinlock		lock;
 	uint64_t		       *wrid;
 	uint32_t			srqn;
+	enum ibv_srq_type		srq_type;
 	int				max;
 	int				max_gs;
 	int				wqe_shift;

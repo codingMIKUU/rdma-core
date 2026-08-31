@@ -41,7 +41,7 @@
 #include "mlx5.h"
 #include "wqe.h"
 
-static int srm_srq_debug_printed;
+static unsigned int srm_srq_debug_mask;
 
 static void *get_wqe(struct mlx5_srq *srq, int n)
 {
@@ -320,9 +320,14 @@ int mlx5_post_srq_recv(struct ibv_srq *ibsrq,
 
 		*srq->db = htobe32(srq->counter);
 
-		if (getenv("MLX5_SRM_WQE_DEBUG") &&
-		    !__atomic_exchange_n(&srm_srq_debug_printed, 1,
-		                         __ATOMIC_RELAXED))
+		if (srq->srq_type == IBV_SRQT_XRC &&
+		    getenv("MLX5_SRM_WQE_DEBUG") &&
+		    ((srq->counter == nreq &&
+		      !(__atomic_fetch_or(&srm_srq_debug_mask, 1,
+		                         __ATOMIC_RELAXED) & 1)) ||
+		     (srq->counter >= 64 && srq->counter - nreq < 64 &&
+		      !(__atomic_fetch_or(&srm_srq_debug_mask, 2,
+		                         __ATOMIC_RELAXED) & 2))))
 			fprintf(stderr,
 				"HOLLOW_SRQ_POST_IDENTITY pid=%d srqn=%u posted=%d counter=%u db=%u head=%d tail=%d max=%d nwqes=%u\n",
 				getpid(), srq->srqn, nreq, srq->counter,
