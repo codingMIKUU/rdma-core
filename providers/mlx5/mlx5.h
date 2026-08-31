@@ -636,6 +636,12 @@ struct mlx5_cq {
 	/* QPs waiting for a synthetic Hollow RC completion. */
 	struct mlx5_qp		       *srm_pending_head;
 	struct mlx5_qp		       *srm_pending_tail;
+	/*
+	 * A Hollow RC CQ may also carry real receive CQEs from an XRC SRQ.
+	 * Alternate the first CQE source so a stream of synthetic send
+	 * completions cannot starve those hardware receive completions.
+	 */
+	uint8_t				srm_poll_prefer_synth;
 };
 
 struct mlx5_tag_entry {
