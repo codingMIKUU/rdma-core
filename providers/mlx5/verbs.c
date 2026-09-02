@@ -3512,8 +3512,12 @@ static void mlx5_srm_release_mapping(struct mlx5_context *ctx,
 			}
 			munmap(bundle->sq_map, bundle->sq_map_len);
 			munmap(bundle->publish_map, bundle->publish_map_len);
-			munmap(bundle->farm_uar_map, bundle->farm_uar_map_len);
-			munmap(bundle->farm_db_map, bundle->farm_db_map_len);
+			if (bundle->farm_uar_map && bundle->farm_uar_map_len)
+				munmap(bundle->farm_uar_map,
+				       bundle->farm_uar_map_len);
+			if (bundle->farm_db_map && bundle->farm_db_map_len)
+				munmap(bundle->farm_db_map,
+				       bundle->farm_db_map_len);
 			free(bundle);
 		}
 		pthread_mutex_unlock(&ctx->srm_mapping_mutex);
@@ -3538,6 +3542,7 @@ static void mlx5_srm_release_mapping(struct mlx5_context *ctx,
 	qp->srm_large_sq_publish_token = NULL;
 	qp->srm_large_sq_publish_depth = 0;
 	qp->srm_large_fast_ready = 0;
+	qp->srm_large_msg_threshold = 0;
 }
 
 void mlx5_srm_release_mappings(struct mlx5_context *ctx)
@@ -3549,8 +3554,10 @@ void mlx5_srm_release_mappings(struct mlx5_context *ctx)
 		ctx->srm_mapping_bundles = bundle->next;
 		munmap(bundle->sq_map, bundle->sq_map_len);
 		munmap(bundle->publish_map, bundle->publish_map_len);
-		munmap(bundle->farm_uar_map, bundle->farm_uar_map_len);
-		munmap(bundle->farm_db_map, bundle->farm_db_map_len);
+		if (bundle->farm_uar_map && bundle->farm_uar_map_len)
+			munmap(bundle->farm_uar_map, bundle->farm_uar_map_len);
+		if (bundle->farm_db_map && bundle->farm_db_map_len)
+			munmap(bundle->farm_db_map, bundle->farm_db_map_len);
 		free(bundle);
 	}
 	if (ctx->srm_ctrl_map) {
@@ -3560,8 +3567,6 @@ void mlx5_srm_release_mappings(struct mlx5_context *ctx)
 	}
 	pthread_mutex_unlock(&ctx->srm_mapping_mutex);
 }
-
-#define MLX5_SRM_ENABLE_LARGE_KERNEL_QP 0
 
 static int mlx5_srm_acquire_mapping(struct mlx5_context *ctx,
 				    struct mlx5_qp *qp,
@@ -3742,6 +3747,7 @@ static int mlx5_srm_acquire_large_mapping(struct mlx5_context *ctx,
 	void *publish_map = MAP_FAILED;
 
 	if (!resp->large_kernel_qpn || !resp->large_kernel_sq_wqe_cnt ||
+	    !resp->large_msg_threshold ||
 	    !resp->large_sq_mmap_len || !resp->sq_state_mmap_len ||
 	    !resp->large_publish_mmap_len || !resp->large_publish_depth ||
 	    (resp->large_publish_depth & (resp->large_publish_depth - 1)) ||
@@ -4042,9 +4048,20 @@ int __mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 				resp.drv_payload.large_kernel_qpn;
 			mqp->srm_large_kernel_qpn_valid =
 				resp.drv_payload.large_kernel_qpn ? 1 : 0;
+			mqp->srm_large_msg_threshold =
+				resp.drv_payload.large_msg_threshold;
+			fprintf(stderr,
+				"SRM_LARGE_KERNEL_SQ qpn=%u wqe_cnt=%u max_post=%u wqe_shift=%u max_gs=%u threshold=%u\n",
+				mqp->srm_large_kernel_qpn,
+				mqp->srm_large_sq.wqe_cnt,
+				mqp->srm_large_sq.max_post,
+				mqp->srm_large_sq.wqe_shift,
+				mqp->srm_large_sq.max_gs,
+				mqp->srm_large_msg_threshold);
 		} else {
 			mqp->srm_large_kernel_qpn = 0;
 			mqp->srm_large_kernel_qpn_valid = 0;
+			mqp->srm_large_msg_threshold = 0;
 		}
 		}
 

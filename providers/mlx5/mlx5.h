@@ -541,6 +541,9 @@ struct mlx5_srm_completion_marker {
 /* Direct user MMIO is the FARM fast path; the syscall experiment stays off. */
 #define MLX5_SRM_ENABLE_DIRECT_USER_DB 1
 
+/* The kernel returns the actual split threshold with the large-KQP mapping. */
+#define MLX5_SRM_ENABLE_LARGE_KERNEL_QP 1
+
 /* Must be a positive power of two; change and rebuild rdma-core to tune. */
 #define MLX5_SRM_DIRECT_DB_HELP_STRIDE 4U
 _Static_assert(MLX5_SRM_DIRECT_DB_HELP_STRIDE > 0 &&
@@ -874,6 +877,7 @@ struct mlx5_qp {
 	uint32_t		srm_kernel_qpn;
 	uint8_t			srm_large_kernel_qpn_valid;
 	uint32_t		srm_large_kernel_qpn;
+	uint32_t		srm_large_msg_threshold;
 
 
 	/*

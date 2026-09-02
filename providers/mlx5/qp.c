@@ -1197,9 +1197,6 @@ static inline void srm_queue_backoff(unsigned int attempt,
 	clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
 }
 
-#define MLX5_SRM_ENABLE_LARGE_KERNEL_QP 0
-#define MLX5_SRM_LARGE_MSG_THRESHOLD (10U * 1024U)
-
 static inline uint32_t mlx5_srm_wr_data_bytes(const struct ibv_send_wr *wr)
 {
 	uint64_t bytes = 0;
@@ -1889,7 +1886,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		bool srm_signaled;
 
 		if (MLX5_SRM_ENABLE_LARGE_KERNEL_QP && srm_fast &&
-		    mlx5_srm_wr_data_bytes(wr) > MLX5_SRM_LARGE_MSG_THRESHOLD) {
+		    mlx5_srm_wr_data_bytes(wr) >= qp->srm_large_msg_threshold) {
 			post_wq = &qp->srm_large_sq;
 			post_sq_start = qp->srm_large_sq_start;
 			post_ctrl = qp->srm_large_sq_ctrl;
