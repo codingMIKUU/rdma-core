@@ -1835,8 +1835,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	bool xrc_wqe;
 
 	uint64_t wr_id;
-	bool srm_fast = qp->srm_fast_ready &&
-		(!MLX5_SRM_ENABLE_LARGE_KERNEL_QP || qp->srm_large_fast_ready);
+	bool srm_fast = qp->srm_fast_ready;
 	bool lock_sq = !srm_fast;
 	int phase_stats =
 		qp->hollow_rc && qp->sender_side && srm_stats_is_enabled();
@@ -1885,7 +1884,8 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		struct mlx5_srm_mapping_bundle *post_mapping = qp->srm_mapping;
 		bool srm_signaled;
 
-		if (MLX5_SRM_ENABLE_LARGE_KERNEL_QP && srm_fast &&
+		if (srm_fast && qp->srm_large_fast_ready &&
+		    qp->srm_large_msg_threshold &&
 		    mlx5_srm_wr_data_bytes(wr) >= qp->srm_large_msg_threshold) {
 			post_wq = &qp->srm_large_sq;
 			post_sq_start = qp->srm_large_sq_start;

@@ -4028,9 +4028,12 @@ int __mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 		if (mqp->sq_start)
 			mqp->sq.qend = mqp->sq_start + kernel_sq_bytes;
 
-		if (MLX5_SRM_ENABLE_LARGE_KERNEL_QP) {
+		if (resp.drv_payload.large_kernel_qpn ||
+		    resp.drv_payload.large_kernel_sq_wqe_cnt ||
+		    resp.drv_payload.large_msg_threshold) {
 			if (!resp.drv_payload.large_kernel_qpn ||
-			    !resp.drv_payload.large_kernel_sq_wqe_cnt) {
+			    !resp.drv_payload.large_kernel_sq_wqe_cnt ||
+			    !resp.drv_payload.large_msg_threshold) {
 				errno = EINVAL;
 				return errno;
 			}

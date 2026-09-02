@@ -541,8 +541,11 @@ struct mlx5_srm_completion_marker {
 /* Direct user MMIO is the FARM fast path; the syscall experiment stays off. */
 #define MLX5_SRM_ENABLE_DIRECT_USER_DB 1
 
-/* The kernel returns the actual split threshold with the large-KQP mapping. */
-#define MLX5_SRM_ENABLE_LARGE_KERNEL_QP 1
+/*
+ * Large-KQP support is negotiated from the kernel modify-QP response.  One
+ * rdma-core build therefore works with both the default single-KQP kernel and
+ * a kernel built with size-aware dual KQPs enabled.
+ */
 
 /* Must be a positive power of two; change and rebuild rdma-core to tune. */
 #define MLX5_SRM_DIRECT_DB_HELP_STRIDE 4U
