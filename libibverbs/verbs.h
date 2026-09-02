@@ -832,6 +832,8 @@ struct ibv_srq_init_attr_ex {
 	struct ibv_xrcd	       *xrcd;
 	struct ibv_cq	       *cq;
 	struct ibv_tm_cap	tm_cap;
+	/* Custom mlx5 extension: select Hollow RC shared-PD handling. */
+	uint8_t			hollow_rc;
 };
 
 enum ibv_wq_type {
@@ -1063,7 +1065,7 @@ struct ibv_qp_init_attr_ex {
 
 /* Compile-time capability marker for applications that require the custom
  * Hollow RC logical-QP/shared-SQ ABI above. */
-#define IBV_HOLLOW_RC_ABI_VERSION 1
+#define IBV_HOLLOW_RC_ABI_VERSION 2
 
 enum ibv_qp_open_attr_mask {
 	IBV_QP_OPEN_ATTR_NUM		= 1 << 0,

@@ -4809,7 +4809,9 @@ struct ibv_srq *mlx5_create_srq_ex(struct ibv_context *context,
 	cmd.db_addr  = (uintptr_t)msrq->db;
 	msrq->wq_sig = srq_sig_enabled();
 	if (msrq->wq_sig)
-		cmd.flags = MLX5_SRQ_FLAG_SIGNATURE;
+		cmd.flags |= MLX5_SRQ_FLAG_SIGNATURE;
+	if (attr->hollow_rc)
+		cmd.flags |= MLX5_SRQ_FLAG_HOLLOW_RC;
 
 	attr->attr.max_sge = msrq->max_gs;
 	if (ctx->cqe_version) {
