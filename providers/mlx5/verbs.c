@@ -4775,6 +4775,7 @@ struct ibv_srq *mlx5_create_srq_ex(struct ibv_context *context,
 	if (!msrq)
 		return NULL;
 	msrq->srq_type = attr->srq_type;
+	msrq->hollow_rc = attr->hollow_rc;
 
 	ibsrq = (struct ibv_srq *)&msrq->vsrq;
 
@@ -4898,8 +4899,7 @@ struct ibv_srq *mlx5_create_srq_ex(struct ibv_context *context,
 	msrq->srqn = resp.srqn;
 	msrq->rsc.type = MLX5_RSC_TYPE_XSRQ;
 	msrq->rsc.rsn = ctx->cqe_version ? cmd.uidx : resp.srqn;
-	if (attr->srq_type == IBV_SRQT_XRC &&
-	    getenv("MLX5_SRM_WQE_DEBUG"))
+	if (msrq->hollow_rc && ctx->srm_wqe_debug)
 		fprintf(stderr,
 			"HOLLOW_SRQ_CREATE_IDENTITY pid=%d srqn=%u type=%d max=%d nwqes=%u\n",
 			getpid(), msrq->srqn, msrq->srq_type,

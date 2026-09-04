@@ -2269,7 +2269,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			if (srm_fast && xrc_wqe && xrc &&
 			    !__atomic_load_n(&srm_wqe_debug_printed,
 			                     __ATOMIC_RELAXED) &&
-			    getenv("MLX5_SRM_WQE_DEBUG") &&
+			    to_mctx(ibqp->context)->srm_wqe_debug &&
 			    !__atomic_exchange_n(&srm_wqe_debug_printed, 1,
 			                         __ATOMIC_RELAXED))
 				fprintf(stderr,

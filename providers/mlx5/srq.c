@@ -320,8 +320,8 @@ int mlx5_post_srq_recv(struct ibv_srq *ibsrq,
 
 		*srq->db = htobe32(srq->counter);
 
-		if (srq->srq_type == IBV_SRQT_XRC &&
-		    getenv("MLX5_SRM_WQE_DEBUG") &&
+		if (srq->hollow_rc &&
+		    to_mctx(ibsrq->context)->srm_wqe_debug &&
 		    ((srq->counter == nreq &&
 		      !(__atomic_fetch_or(&srm_srq_debug_mask, 1,
 		                         __ATOMIC_RELAXED) & 1)) ||

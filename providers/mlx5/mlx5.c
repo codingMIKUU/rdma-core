@@ -602,6 +602,13 @@ static void mlx5_read_env(struct ibv_device *ibdev, struct mlx5_context *ctx)
 {
 	char *env_value;
 
+	/*
+	 * Diagnostics are consulted from the SEND and SRQ-post hot paths.
+	 * Cache the process environment once when the context is opened instead
+	 * of calling getenv() for every WQE or receive repost.
+	 */
+	ctx->srm_wqe_debug = getenv("MLX5_SRM_WQE_DEBUG") != NULL;
+
 	env_value = getenv("MLX5_STALL_CQ_POLL");
 	if (env_value)
 		/* check if cq stall is enforced by user */

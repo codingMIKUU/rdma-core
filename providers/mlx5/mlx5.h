@@ -368,6 +368,7 @@ struct mlx5_context {
 	unsigned			max_srq_recv_wr;
 	int				num_ports;
 	int				stall_enable;
+	uint8_t				srm_wqe_debug;
 	int				stall_adaptive_enable;
 	int				stall_cycles;
 	struct mlx5_bf		       *bfs;
@@ -668,6 +669,7 @@ struct mlx5_srq {
 	uint64_t		       *wrid;
 	uint32_t			srqn;
 	enum ibv_srq_type		srq_type;
+	uint8_t				hollow_rc;
 	int				max;
 	int				max_gs;
 	int				wqe_shift;
