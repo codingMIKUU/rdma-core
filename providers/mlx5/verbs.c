@@ -3745,6 +3745,11 @@ static int mlx5_srm_acquire_large_mapping(struct mlx5_context *ctx,
 	size_t publish_bytes;
 	void *sq_map = MAP_FAILED;
 	void *publish_map = MAP_FAILED;
+	void *farm_uar_map = MAP_FAILED;
+	void *farm_db_map = MAP_FAILED;
+	bool direct_db = resp->comp_mask &
+		MLX5_IB_MODIFY_QP_RESP_MASK_LARGE_FARM_DB;
+	int saved_errno;
 
 	if (!resp->large_kernel_qpn || !resp->large_kernel_sq_wqe_cnt ||
 	    !resp->large_msg_threshold ||
@@ -3769,6 +3774,28 @@ static int mlx5_srm_acquire_large_mapping(struct mlx5_context *ctx,
 		return errno;
 	}
 
+	/* Old kernels keep the large lane on kernel DB; do not infer its DBR
+	 * or UAR from the small lane.  New kernels explicitly export this lane. */
+	if (direct_db &&
+	    (resp->response_length <
+		offsetof(struct mlx5_ib_modify_qp_resp, large_farm_reserved) +
+			sizeof(resp->large_farm_reserved) ||
+	     !resp->large_farm_uar_mmap_len ||
+	     !resp->large_farm_db_mmap_len ||
+	     !resp->large_farm_bf_buf_size ||
+	     !resp->large_farm_direct_db_batch ||
+	     resp->large_farm_uar_reg_offset > resp->large_farm_uar_mmap_len ||
+	     (size_t)resp->large_farm_bf_buf_size + sizeof(uint64_t) >
+		resp->large_farm_uar_mmap_len - resp->large_farm_uar_reg_offset ||
+	     resp->large_farm_db_offset > resp->large_farm_db_mmap_len ||
+	     2 * sizeof(__be32) >
+		resp->large_farm_db_mmap_len - resp->large_farm_db_offset ||
+	     resp->large_farm_credit_slot_idx >=
+		resp->sq_state_mmap_len / sizeof(*ctrl_base))) {
+		errno = EINVAL;
+		return errno;
+	}
+
 	pthread_mutex_lock(&ctx->srm_mapping_mutex);
 	for (bundle = ctx->srm_mapping_bundles; bundle;
 	     bundle = bundle->next) {
@@ -3780,7 +3807,20 @@ static int mlx5_srm_acquire_large_mapping(struct mlx5_context *ctx,
 	if (bundle) {
 		if (bundle->sq_map_len != resp->large_sq_mmap_len ||
 		    bundle->publish_map_len != resp->large_publish_mmap_len ||
-		    bundle->publish_depth != resp->large_publish_depth) {
+		    bundle->publish_depth != resp->large_publish_depth ||
+		    !!bundle->farm_credit_ctrl != direct_db ||
+		    (direct_db &&
+		     (bundle->farm_uar_map_len != resp->large_farm_uar_mmap_len ||
+		      bundle->farm_db_map_len != resp->large_farm_db_mmap_len ||
+		      bundle->farm_uar_reg !=
+			bundle->farm_uar_map + resp->large_farm_uar_reg_offset ||
+		      (void *)bundle->farm_db !=
+			bundle->farm_db_map + resp->large_farm_db_offset ||
+		      bundle->farm_credit_ctrl !=
+			&((struct mlx5_sq_ctrl_page *)ctx->srm_ctrl_map)
+			 [resp->large_farm_credit_slot_idx] ||
+		      bundle->farm_bf_buf_size != resp->large_farm_bf_buf_size ||
+		      bundle->farm_direct_db_batch != resp->large_farm_direct_db_batch))) {
 			errno = EPROTO;
 			goto err_unlock;
 		}
@@ -3814,11 +3854,26 @@ static int mlx5_srm_acquire_large_mapping(struct mlx5_context *ctx,
 			   ctx->ibv_ctx.context.cmd_fd,
 			   resp->large_publish_mmap_offset);
 	if (publish_map == MAP_FAILED)
-		goto err_sq;
+		goto err_unlock;
+
+	if (direct_db) {
+		farm_uar_map = mmap(NULL, resp->large_farm_uar_mmap_len,
+				    PROT_READ | PROT_WRITE, MAP_SHARED,
+				    ctx->ibv_ctx.context.cmd_fd,
+				    resp->large_farm_uar_mmap_offset);
+		if (farm_uar_map == MAP_FAILED)
+			goto err_unlock;
+		farm_db_map = mmap(NULL, resp->large_farm_db_mmap_len,
+				   PROT_READ | PROT_WRITE, MAP_SHARED,
+				   ctx->ibv_ctx.context.cmd_fd,
+				   resp->large_farm_db_mmap_offset);
+		if (farm_db_map == MAP_FAILED)
+			goto err_unlock;
+	}
 
 	bundle = calloc(1, sizeof(*bundle));
 	if (!bundle)
-		goto err_publish;
+		goto err_unlock;
 
 	bundle->kernel_qpn = resp->large_kernel_qpn;
 	bundle->slot_idx = resp->large_sq_state_slot_idx;
@@ -3828,6 +3883,19 @@ static int mlx5_srm_acquire_large_mapping(struct mlx5_context *ctx,
 	bundle->sq_map_len = resp->large_sq_mmap_len;
 	bundle->publish_map = publish_map;
 	bundle->publish_map_len = resp->large_publish_mmap_len;
+	if (direct_db) {
+		bundle->farm_uar_map = farm_uar_map;
+		bundle->farm_uar_map_len = resp->large_farm_uar_mmap_len;
+		bundle->farm_uar_reg = farm_uar_map + resp->large_farm_uar_reg_offset;
+		bundle->farm_db_map = farm_db_map;
+		bundle->farm_db_map_len = resp->large_farm_db_mmap_len;
+		bundle->farm_db = farm_db_map + resp->large_farm_db_offset;
+		bundle->farm_credit_ctrl =
+			&((struct mlx5_sq_ctrl_page *)ctx->srm_ctrl_map)
+			 [resp->large_farm_credit_slot_idx];
+		bundle->farm_bf_buf_size = resp->large_farm_bf_buf_size;
+		bundle->farm_direct_db_batch = resp->large_farm_direct_db_batch;
+	}
 	bundle->next = ctx->srm_mapping_bundles;
 	ctx->srm_mapping_bundles = bundle;
 
@@ -3856,13 +3924,19 @@ attach:
 	pthread_mutex_unlock(&ctx->srm_mapping_mutex);
 	return 0;
 
-err_publish:
-	munmap(publish_map, resp->large_publish_mmap_len);
-err_sq:
-	munmap(sq_map, resp->large_sq_mmap_len);
 err_unlock:
+	saved_errno = errno;
+	if (farm_db_map != MAP_FAILED)
+		munmap(farm_db_map, resp->large_farm_db_mmap_len);
+	if (farm_uar_map != MAP_FAILED)
+		munmap(farm_uar_map, resp->large_farm_uar_mmap_len);
+	if (publish_map != MAP_FAILED)
+		munmap(publish_map, resp->large_publish_mmap_len);
+	if (sq_map != MAP_FAILED)
+		munmap(sq_map, resp->large_sq_mmap_len);
 	pthread_mutex_unlock(&ctx->srm_mapping_mutex);
-	return errno;
+	errno = saved_errno;
+	return saved_errno;
 }
 
 int __mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
@@ -4054,13 +4128,15 @@ int __mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 			mqp->srm_large_msg_threshold =
 				resp.drv_payload.large_msg_threshold;
 			fprintf(stderr,
-				"SRM_LARGE_KERNEL_SQ qpn=%u wqe_cnt=%u max_post=%u wqe_shift=%u max_gs=%u threshold=%u\n",
+				"SRM_LARGE_KERNEL_SQ qpn=%u wqe_cnt=%u max_post=%u wqe_shift=%u max_gs=%u threshold=%u user_db=%u\n",
 				mqp->srm_large_kernel_qpn,
 				mqp->srm_large_sq.wqe_cnt,
 				mqp->srm_large_sq.max_post,
 				mqp->srm_large_sq.wqe_shift,
 				mqp->srm_large_sq.max_gs,
-				mqp->srm_large_msg_threshold);
+				mqp->srm_large_msg_threshold,
+				MLX5_SRM_ENABLE_DIRECT_USER_DB &&
+				!!mqp->srm_large_mapping->farm_credit_ctrl);
 		} else {
 			mqp->srm_large_kernel_qpn = 0;
 			mqp->srm_large_kernel_qpn_valid = 0;
