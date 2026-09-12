@@ -533,6 +533,19 @@ _Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 512,
 #endif
 #define MLX5_SRM_TIMING_REPORT_WQES 1000000U
 
+/*
+ * Print immediately when a Hollow RC post first has to wait for shared-SQ
+ * space.  Keep this off in performance builds: stderr I/O is deliberately
+ * outside the benchmark hot path unless the diagnostic is requested.
+ */
+#ifndef MLX5_SRM_ENABLE_RESERVE_BACKOFF_LOG
+#define MLX5_SRM_ENABLE_RESERVE_BACKOFF_LOG 0
+#endif
+#if MLX5_SRM_ENABLE_RESERVE_BACKOFF_LOG != 0 && \
+	MLX5_SRM_ENABLE_RESERVE_BACKOFF_LOG != 1
+#error "MLX5_SRM_ENABLE_RESERVE_BACKOFF_LOG must be 0 or 1"
+#endif
+
 /* Optional debug metadata follows the unchanged publish-token array.
  * CPU-only mmap memory, never part of a hardware WQE. */
 struct mlx5_srm_wqe_timestamp {

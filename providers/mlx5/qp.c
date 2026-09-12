@@ -82,6 +82,9 @@ static inline uint64_t rdtsc() {
 
 #if MLX5_SRM_ENABLE_WQE_TIMING
 struct mlx5_srm_wqe_timing_stats {
+	uint64_t post_calls;
+	uint64_t post_wqes;
+	uint64_t post_excl_db_cycles;
 	uint64_t cqe_wqes;
 	uint64_t post_to_cqe_cycles;
 	uint64_t missing_timestamps;
@@ -122,6 +125,22 @@ static inline struct mlx5_srm_wqe_timestamp *
 mlx5_srm_timestamp_array(uint64_t *publish, uint32_t depth)
 {
 	return (void *)((char *)publish + MLX5_SRM_TIMING_OFFSET(depth));
+}
+
+static inline void mlx5_srm_timing_record_post(uint64_t start,
+						uint64_t direct_db_cycles,
+						uint32_t wqes)
+{
+	struct mlx5_srm_wqe_timing_stats *stats = &srm_wqe_timing_stats;
+	uint64_t total_cycles;
+
+	if (!start || !wqes)
+		return;
+	total_cycles = mlx5_srm_timing_rdtsc() - start;
+	stats->post_calls++;
+	stats->post_wqes += wqes;
+	stats->post_excl_db_cycles += total_cycles >= direct_db_cycles ?
+		total_cycles - direct_db_cycles : 0;
 }
 
 /* Snapshot before ringing: a CQ poller may recycle a physical slot as soon
@@ -210,8 +229,12 @@ void mlx5_srm_timing_complete(uint64_t post_tsc_sum, uint32_t wqes,
 		return;
 
 	fprintf(stderr,
-		"SRM_WQE_TIMING algorithm=qpswitch pid=%d thread=%lu cqe_wqes=%llu post_to_cqe_cycles=%llu post_to_cqe_avg_cycles=%.2f missing_timestamps=%llu invalid_timestamps=%llu error_wqes=%llu\n",
+		"SRM_WQE_TIMING algorithm=qpswitch pid=%d thread=%lu post_calls=%llu post_wqes=%llu post_excl_db_avg_cycles=%.2f cqe_wqes=%llu post_to_cqe_cycles=%llu post_to_cqe_avg_cycles=%.2f missing_timestamps=%llu invalid_timestamps=%llu error_wqes=%llu\n",
 		getpid(), (unsigned long)pthread_self(),
+		(unsigned long long)stats->post_calls,
+		(unsigned long long)stats->post_wqes,
+		stats->post_calls ?
+			(double)stats->post_excl_db_cycles / stats->post_calls : 0.0,
 		(unsigned long long)stats->cqe_wqes,
 		(unsigned long long)stats->post_to_cqe_cycles,
 		stats->cqe_wqes ?
@@ -1585,6 +1608,27 @@ static inline int srm_reserve_wqe_blocking(struct mlx5_sq_ctrl_page *ctrl,
 			return 0;
 		}
 
+#if MLX5_SRM_ENABLE_RESERVE_BACKOFF_LOG
+		if (unlikely(attempt == 0))
+			fprintf(stderr,
+				"SRM_RESERVE_BACKOFF algorithm=qpswitch reason=sq_full "
+				"pid=%d thread=%lu slot=%u kernel_qpn=%u ctrl=%p "
+				"wqe_cnt=%u resv=%llu cons=%llu occupancy=%llu "
+				"limit=%llu ready=%llu db_tail=%llu db_owner=%u\n",
+				getpid(), (unsigned long)pthread_self(),
+				ctrl_slot_idx, kernel_qpn, (void *)ctrl, wqe_cnt,
+				(unsigned long long)resv,
+				(unsigned long long)cons,
+				(unsigned long long)occupancy,
+				(unsigned long long)limit,
+				(unsigned long long)__atomic_load_n(
+					&ctrl->ready_idx, __ATOMIC_ACQUIRE),
+				(unsigned long long)__atomic_load_n(
+					&ctrl->db_tail, __ATOMIC_ACQUIRE),
+				__atomic_load_n(&ctrl->db_owner,
+						__ATOMIC_ACQUIRE));
+#endif
+
 		now_ns = srm_monotonic_ns();
 		if (!start_ns)
 			start_ns = now_ns;
@@ -1747,7 +1791,11 @@ static inline void srm_try_direct_user_db(
 	struct mlx5_srm_mapping_bundle *mapping,
 	struct mlx5_sq_ctrl_page *ctrl_page, uint64_t *publish_token,
 	uint32_t publish_depth, struct mlx5_wq *wq, uint32_t kernel_qpn,
-	uint64_t published_slot)
+	uint64_t published_slot
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	, uint64_t *post_direct_db_cycles
+#endif
+	)
 {
 	struct srm_direct_db_stats *stats = &srm_direct_db_stats;
 	struct mlx5_wqe_ctrl_seg *last_ctrl = NULL;
@@ -1764,6 +1812,7 @@ static inline void srm_try_direct_user_db(
 	bool notify_kernel_hot = false;
 #if MLX5_SRM_ENABLE_WQE_TIMING
 	struct mlx5_srm_db_timing_batch timing_batch = {0};
+	uint64_t db_start_tsc = 0;
 	uint64_t db_done_tsc = 0;
 #endif
 
@@ -1905,12 +1954,15 @@ static inline void srm_try_direct_user_db(
 #if MLX5_SRM_ENABLE_WQE_TIMING
 	timing_batch = mlx5_srm_timing_db_snapshot(publish_token, publish_depth,
 						  tail, sent);
+	db_start_tsc = mlx5_srm_timing_rdtsc();
 #endif
 	srm_direct_ring_db(mapping, ctrl_page,
 			   require_full_prefix ? target_tail : tail + sent,
 			   last_ctrl);
 #if MLX5_SRM_ENABLE_WQE_TIMING
 	db_done_tsc = mlx5_srm_timing_rdtsc();
+	if (post_direct_db_cycles)
+		*post_direct_db_cycles += db_done_tsc - db_start_tsc;
 #endif
 	__atomic_store_n(&ctrl_page->db_tail,
 			 require_full_prefix ? target_tail : tail + sent,
@@ -2031,6 +2083,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	bool xrc_wqe;
 #if MLX5_SRM_ENABLE_WQE_TIMING
 	bool wqe_timing = qp->hollow_rc && qp->sender_side && qp->srm_fast_ready;
+	uint64_t wqe_timing_direct_db_cycles = 0;
 #endif
 
 	uint64_t wr_id;
@@ -2524,7 +2577,11 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			srm_try_direct_user_db(post_mapping, post_ctrl,
 					       post_publish_token,
 					       post_publish_depth, post_wq,
-					       post_kernel_qpn, slot);
+					       post_kernel_qpn, slot
+#if MLX5_SRM_ENABLE_WQE_TIMING
+					       , &wqe_timing_direct_db_cycles
+#endif
+					       );
 		if (srm_signaled && !qp->srm_cq_dispatch)
 			mlx5_srm_queue_completion(qp, post_ctrl, slot, wr_id, wr,
 						  post_wq);
@@ -2587,6 +2644,11 @@ out:
 		srm_reserve_stats.phase_calls += nreq;
 		srm_maybe_report_reserve_stats();
 	}
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	if (wqe_timing)
+		mlx5_srm_timing_record_post(wqe_timing_start,
+					    wqe_timing_direct_db_cycles, nreq);
+#endif
 	return err;
 }
 
