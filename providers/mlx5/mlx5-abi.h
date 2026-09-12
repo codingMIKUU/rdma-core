@@ -91,7 +91,13 @@ struct mlx5_modify_qp {
 	__u32				comp_mask;
 	struct mlx5_ib_burst_info	burst_info;
 	__u32				ece_options;
-	__u8				gid[16];
+	__u64				srm_cq_buf_addr;
+	__u32				srm_cq_buf_size;
+	__u32				srm_cq_depth;
 };
+
+_Static_assert(sizeof(struct mlx5_modify_qp) ==
+	       sizeof(struct ibv_modify_qp_ex) + sizeof(struct mlx5_ib_modify_qp),
+	       "mlx5 modify-QP driver payload must match the kernel ABI");
 
 #endif /* MLX5_ABI_H */

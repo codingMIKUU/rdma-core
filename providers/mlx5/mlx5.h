@@ -520,15 +520,21 @@ struct mlx5_sq_ctrl_page {
 _Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 512,
 	       "hollow RC ctrl ABI must occupy eight cachelines");
 
-/* Metadata for one signaled WR on a Hollow RC logical QP.  The kernel only
- * publishes the shared physical SQ completion cursor; userspace uses this
- * marker to reconstruct the logical completion. */
+/* Immutable WR identity survives reuse of a slot in the shared physical SQ.
+ * Completion readiness comes from either a dispatched CQE or SQ progress. */
 struct mlx5_srm_completion_marker {
 	struct mlx5_sq_ctrl_page *ctrl;
 	uint64_t idx;
 	uint64_t wr_id;
 	uint32_t byte_len;
 	enum ibv_wc_opcode opcode;
+};
+
+/* Only dispatch mode allocates status storage alongside the marker ring. */
+struct mlx5_srm_dispatch_status {
+	uint32_t status;
+	uint32_t vendor_err;
+	uint8_t dispatched;
 };
 
 #define MLX5_SRM_DB_OWNER_FREE   0U
@@ -640,7 +646,16 @@ struct mlx5_cq {
 	int				cached_opcode;
 	struct mlx5dv_clock_info	last_clock_info;
 	struct ibv_pd			*parent_domain;
-	/* QPs waiting for a synthetic Hollow RC completion. */
+	/* Hollow completions use a separate ring from hardware receive CQEs. */
+	struct mlx5_srm_sw_cq       *srm_sw_cq;
+	uint32_t			srm_sw_cq_size;
+	uint32_t			srm_sw_cq_depth;
+	uint8_t				srm_cq_mode_known;
+	uint8_t				srm_cq_dispatch;
+	uint8_t				srm_cq_mode_reported;
+	uint8_t				srm_dispatch_error_reported;
+	struct mlx5_qp		       *srm_attached_head;
+	/* QPs waiting for a Hollow RC completion. */
 	struct mlx5_qp		       *srm_pending_head;
 	struct mlx5_qp		       *srm_pending_tail;
 };
@@ -897,9 +912,17 @@ struct mlx5_qp {
 	uint8_t hollow_rc;
 	uint8_t srm_fast_ready;
 	uint8_t srm_large_fast_ready;
+	uint8_t srm_cq_mode_known;
+	uint8_t srm_cq_mode_legacy;
+	uint8_t srm_cq_dispatch;
+	uint8_t srm_cq_attached;
 	struct mlx5_cq *srm_completion_cq;
+	struct mlx5_qp *srm_attached_next;
 	struct mlx5_qp *srm_completion_next;
 	struct mlx5_srm_completion_marker *srm_completion_ring;
+	struct mlx5_srm_dispatch_status *srm_dispatch_ring;
+	uint64_t srm_dispatch_small_cursor;
+	uint64_t srm_dispatch_large_cursor;
 	uint64_t srm_completion_head;
 	uint64_t srm_completion_tail;
 	uint32_t srm_completion_capacity;

@@ -1500,6 +1500,11 @@ int mlx5_resize_cq(struct ibv_cq *ibcq, int cqe)
 		return EINVAL;
 
 	mlx5_spin_lock(&cq->lock);
+	if (cq->srm_sw_cq) {
+		/* Kernel routes retain this ring and its negotiated capacity. */
+		err = EOPNOTSUPP;
+		goto out;
+	}
 	cq->active_cqes = cq->verbs_cq.cq.cqe;
 	if (cq->active_buf == &cq->buf_a)
 		cq->resize_buf = &cq->buf_b;
@@ -1557,6 +1562,12 @@ int mlx5_destroy_cq(struct ibv_cq *cq)
 	if (ret)
 		return ret;
 
+	if (mcq->srm_sw_cq) {
+		ibv_dofork_range(mcq->srm_sw_cq, mcq->srm_sw_cq_size);
+		/* The kernel may retain pinned pages until a scheduler grace
+		 * period ends.  A dedicated mapping prevents allocator reuse. */
+		munmap(mcq->srm_sw_cq, mcq->srm_sw_cq_size);
+	}
 	mlx5_free_db(to_mctx(cq->context), mcq->dbrec, mcq->parent_domain,
 		     mcq->custom_db);
 	mlx5_free_cq_buf(to_mctx(cq->context), mcq->active_buf);
@@ -3250,6 +3261,26 @@ static void mlx5_srm_remove_pending_completion(struct mlx5_qp *qp)
 	mlx5_spin_unlock(&cq->lock);
 }
 
+static void mlx5_srm_detach_completion_cq(struct mlx5_qp *qp)
+{
+	struct mlx5_cq *cq = qp->srm_completion_cq;
+	struct mlx5_qp **link;
+
+	if (!qp->srm_cq_attached)
+		return;
+	mlx5_spin_lock(&cq->lock);
+	for (link = &cq->srm_attached_head; *link;
+	     link = &(*link)->srm_attached_next) {
+		if (*link == qp) {
+			*link = qp->srm_attached_next;
+			break;
+		}
+	}
+	qp->srm_cq_attached = 0;
+	qp->srm_attached_next = NULL;
+	mlx5_spin_unlock(&cq->lock);
+}
+
 int mlx5_destroy_qp(struct ibv_qp *ibqp)
 {
 	struct mlx5_qp *qp = to_mqp(ibqp);
@@ -3274,6 +3305,7 @@ int mlx5_destroy_qp(struct ibv_qp *ibqp)
 		return ret;
 	}
 	mlx5_srm_remove_pending_completion(qp);
+	mlx5_srm_detach_completion_cq(qp);
 
 	if (qp->skip_kern_qp) {
 		if (!ctx->cqe_version)
@@ -3315,6 +3347,8 @@ int mlx5_destroy_qp(struct ibv_qp *ibqp)
 			mlx5_free_qp_buf(ctx, qp);
 	}
 free:
+	free(qp->srm_dispatch_ring);
+	qp->srm_dispatch_ring = NULL;
 	free(qp->srm_completion_ring);
 	qp->srm_completion_ring = NULL;
 	if (qp->srm_mapping) {
@@ -3939,6 +3973,86 @@ err_unlock:
 	return saved_errno;
 }
 
+static int mlx5_srm_prepare_completion_cq(struct mlx5_qp *qp,
+					  struct mlx5_modify_qp *cmd)
+{
+	struct ibv_cq *ibcq = qp->ibv_qp->send_cq;
+	struct mlx5_cq *cq = to_mcq(ibcq);
+	struct mlx5_srm_sw_cq *ring;
+	size_t page_size = to_mdev(ibcq->context->device)->page_size;
+	size_t bytes;
+	uint32_t depth;
+	int ret = 0;
+
+	if (!qp->srm_cq_mode_known)
+		return EPROTO;
+
+	mlx5_spin_lock(&cq->lock);
+	if (cq->srm_cq_mode_known &&
+	    cq->srm_cq_dispatch != qp->srm_cq_dispatch) {
+		ret = EPROTO;
+		goto out;
+	}
+	if (qp->srm_cq_dispatch && !cq->srm_sw_cq) {
+		depth = (uint32_t)ibcq->cqe + 1;
+		if (!depth || (depth & (depth - 1)) ||
+		    depth > MLX5_SRM_SW_CQ_MAX_DEPTH) {
+			ret = EINVAL;
+			goto out;
+		}
+		bytes = align(sizeof(*ring) + depth * sizeof(ring->entries[0]),
+			      page_size);
+		ring = mmap(NULL, bytes, PROT_READ | PROT_WRITE,
+			    MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+		if (ring == MAP_FAILED) {
+			ret = errno;
+			goto out;
+		}
+		ret = ibv_dontfork_range(ring, bytes);
+		if (ret) {
+			munmap(ring, bytes);
+			goto out;
+		}
+		cq->srm_sw_cq = ring;
+		cq->srm_sw_cq_size = bytes;
+		cq->srm_sw_cq_depth = depth;
+	}
+	cq->srm_cq_mode_known = 1;
+	cq->srm_cq_dispatch = qp->srm_cq_dispatch;
+	if (qp->srm_cq_dispatch) {
+		cmd->srm_cq_buf_addr = (uintptr_t)cq->srm_sw_cq;
+		cmd->srm_cq_buf_size = cq->srm_sw_cq_size;
+		cmd->srm_cq_depth = cq->srm_sw_cq_depth;
+		if (!qp->srm_cq_attached) {
+			qp->srm_completion_cq = cq;
+			qp->srm_attached_next = cq->srm_attached_head;
+			cq->srm_attached_head = qp;
+			qp->srm_cq_attached = 1;
+		}
+	}
+out:
+	mlx5_spin_unlock(&cq->lock);
+	return ret;
+}
+
+static int mlx5_srm_record_cq_mode(struct mlx5_qp *qp, uint32_t mask)
+{
+	bool known = mask & MLX5_IB_MODIFY_QP_RESP_MASK_CQ_MODE;
+	bool dispatch = mask & MLX5_IB_MODIFY_QP_RESP_MASK_CQ_DISPATCH;
+
+	if (dispatch && !known)
+		return EPROTO;
+	if (known && qp->srm_cq_mode_known &&
+	    (qp->srm_cq_mode_legacy || qp->srm_cq_dispatch != dispatch))
+		return EPROTO;
+	if (known || !qp->srm_cq_mode_known) {
+		qp->srm_cq_mode_known = 1;
+		qp->srm_cq_mode_legacy = !known;
+		qp->srm_cq_dispatch = dispatch;
+	}
+	return 0;
+}
+
 int __mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 		   int attr_mask)
 {
@@ -3947,6 +4061,9 @@ int __mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 	struct mlx5_modify_qp_ex_resp resp = {};
 	struct mlx5_qp *mqp = to_mqp(qp);
 	struct mlx5_context *context = to_mctx(qp->context);
+	size_t cmd_ex_size = sizeof(cmd_ex);
+	bool srm_mode_probe = mqp->hollow_rc && !mqp->srm_cq_mode_known &&
+		(attr_mask & IBV_QP_STATE) && attr->qp_state == IBV_QPS_INIT;
 	int ret;
 	__be32 *db;
 
@@ -3955,6 +4072,25 @@ int __mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 
 	if (mqp->rss_qp)
 		return EOPNOTSUPP;
+
+	if (mqp->hollow_rc) {
+		if (mqp->sender_side && qp->send_cq &&
+		    (to_mcq(qp->send_cq)->flags & MLX5_CQ_FLAGS_EXTENDED)) {
+			fprintf(stderr, "Hollow RC completions require ibv_poll_cq; CQEX is unsupported\n");
+			return EOPNOTSUPP;
+		}
+		if (!mqp->srm_cq_mode_legacy)
+			cmd_ex.comp_mask |= MLX5_IB_MODIFY_QP_SRM_CQ_MODE;
+		else
+			cmd_ex_size = offsetof(struct mlx5_modify_qp,
+					       srm_cq_buf_addr);
+		if (mqp->sender_side && (attr_mask & IBV_QP_STATE) &&
+		    attr->qp_state == IBV_QPS_RTR) {
+			ret = mlx5_srm_prepare_completion_cq(mqp, &cmd_ex);
+			if (ret)
+				return ret;
+		}
+	}
 
 	if (mqp->flags & MLX5_QP_FLAGS_USE_UNDERLAY) {
 		if (attr_mask & ~(IBV_QP_STATE | IBV_QP_CUR_STATE))
@@ -3996,8 +4132,18 @@ int __mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 		    attr_mask & IBV_QP_STATE && attr->qp_state == IBV_QPS_INIT)
 			cmd_ex.comp_mask |= MLX5_IB_MODIFY_QP_OOO_DP;
 		ret = ibv_cmd_modify_qp_ex(qp, attr, attr_mask, &cmd_ex.ibv_cmd,
-					   sizeof(cmd_ex), &resp.ibv_resp,
+					   cmd_ex_size, &resp.ibv_resp,
 					   sizeof(resp));
+		/* Old kernels reject the capability bit before changing QP state.
+		 * Retry only this first INIT probe, with the original ABI prefix. */
+		if (ret == EOPNOTSUPP && srm_mode_probe) {
+			cmd_ex.comp_mask &= ~MLX5_IB_MODIFY_QP_SRM_CQ_MODE;
+			memset(&resp, 0, sizeof(resp));
+			ret = ibv_cmd_modify_qp_ex(qp, attr, attr_mask,
+				&cmd_ex.ibv_cmd,
+				offsetof(struct mlx5_modify_qp, srm_cq_buf_addr),
+				&resp.ibv_resp, sizeof(resp));
+		}
 	} else {
 		ret = ibv_cmd_modify_qp(qp, attr, attr_mask,
 					&cmd, sizeof(cmd));
@@ -4013,6 +4159,32 @@ int __mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 	if (!ret && mqp->set_ece) {
 		mqp->set_ece = 0;
 		mqp->get_ece = resp.ece_options;
+	}
+
+	if (!ret && mqp->hollow_rc) {
+		/* A RESET response may have no Hollow payload.  Only INIT probes
+		 * or an explicit mode response establish the cached capability. */
+		if (srm_mode_probe || (resp.drv_payload.comp_mask &
+				      (MLX5_IB_MODIFY_QP_RESP_MASK_CQ_MODE |
+				       MLX5_IB_MODIFY_QP_RESP_MASK_CQ_DISPATCH))) {
+			ret = mlx5_srm_record_cq_mode(mqp,
+						     resp.drv_payload.comp_mask);
+			if (ret)
+				return ret;
+		}
+		if (mqp->sender_side && (attr_mask & IBV_QP_STATE) &&
+		    attr->qp_state == IBV_QPS_RTR) {
+			struct mlx5_cq *cq = to_mcq(qp->send_cq);
+
+			mlx5_spin_lock(&cq->lock);
+			if (!cq->srm_cq_mode_reported) {
+				fprintf(stderr, "HOLLOW_CQ cqn=%u cq_mode=%s\n",
+					cq->cqn, mqp->srm_cq_dispatch ?
+					"dispatch" : "progress");
+				cq->srm_cq_mode_reported = 1;
+			}
+			mlx5_spin_unlock(&cq->lock);
+		}
 	}
 
 	if (!ret && mqp->hollow_rc) {

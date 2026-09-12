@@ -1059,12 +1059,98 @@ static inline int mlx5_poll_one(struct mlx5_cq *cq,
 	return mlx5_parse_cqe(cq, cqe64, cqe, cur_rsc, cur_srq, wc, cqe_ver, 0);
 }
 
+static void mlx5_srm_dispatch_event(struct mlx5_cq *cq,
+				    const struct mlx5_srm_sw_cqe *event)
+{
+	struct mlx5_qp *qp;
+
+	for (qp = cq->srm_attached_head; qp; qp = qp->srm_attached_next) {
+		struct mlx5_sq_ctrl_page *ctrl;
+		uint64_t *cursor;
+		uint64_t tail;
+		uint64_t head;
+
+		if (qp->usr_rc_cnt != event->usr_rc)
+			continue;
+		if (event->kqp_idx == qp->sq_ctrl_slot_idx) {
+			ctrl = qp->sq_ctrl;
+			cursor = &qp->srm_dispatch_small_cursor;
+		} else if (qp->srm_large_fast_ready &&
+			   event->kqp_idx == qp->srm_large_sq_ctrl_slot_idx) {
+			ctrl = qp->srm_large_sq_ctrl;
+			cursor = &qp->srm_dispatch_large_cursor;
+		} else {
+			return;
+		}
+
+		head = qp->srm_completion_head;
+		tail = qp->srm_completion_tail;
+		if ((int64_t)(*cursor - tail) > 0)
+			tail = *cursor;
+		/* Events on each physical SQ are ordered.  Independent lane
+		 * cursors avoid rescanning a signaled backlog for every CQE. */
+		for (; tail != head; tail++) {
+			uint32_t idx = tail & (qp->srm_completion_capacity - 1);
+			struct mlx5_srm_completion_marker *marker =
+				&qp->srm_completion_ring[idx];
+			struct mlx5_srm_dispatch_status *status;
+
+			if (marker->ctrl != ctrl || marker->idx != event->post_idx)
+				continue;
+			status = &qp->srm_dispatch_ring[idx];
+			status->status = event->status;
+			status->vendor_err = event->vendor_err;
+			status->dispatched = 1;
+			*cursor = tail + 1;
+			return;
+		}
+		/* The established Hollow API retains signaled WR identities only.
+		 * Never invent a wr_id for an unsignaled error. */
+		if (event->status != IBV_WC_SUCCESS &&
+		    !cq->srm_dispatch_error_reported) {
+			fprintf(stderr,
+				"Hollow RC CQE has no pending signaled marker: usr_rc=%u kqp=%u post=%llu status=%u vendor=%u\n",
+				event->usr_rc, event->kqp_idx,
+				(unsigned long long)event->post_idx,
+				event->status, event->vendor_err);
+			cq->srm_dispatch_error_reported = 1;
+		}
+		return;
+	}
+	/* Events already published for a destroyed logical QP can be retired. */
+}
+
+static int mlx5_srm_drain_dispatch(struct mlx5_cq *cq)
+{
+	struct mlx5_srm_sw_cq *ring = cq->srm_sw_cq;
+	uint64_t consumer = ring->consumer;
+	uint64_t producer = __atomic_load_n(&ring->producer, __ATOMIC_ACQUIRE);
+	uint64_t count = producer - consumer;
+
+	if (unlikely(count > cq->srm_sw_cq_depth))
+		return CQ_POLL_ERR;
+	/* Sample the producer once: a concurrent kernel producer cannot turn
+	 * this drain into an unbounded loop or starve hardware receive CQEs. */
+	while (count--) {
+		struct mlx5_srm_sw_cqe event =
+			ring->entries[consumer & (cq->srm_sw_cq_depth - 1)];
+
+		mlx5_srm_dispatch_event(cq, &event);
+		consumer++;
+	}
+	__atomic_store_n(&ring->consumer, consumer, __ATOMIC_RELEASE);
+	return CQ_OK;
+}
+
 static inline int mlx5_srm_poll_watermarks(struct mlx5_cq *cq, int ne,
 					   struct ibv_wc *wc)
 {
 	struct mlx5_qp *prev = NULL;
 	struct mlx5_qp *qp = cq->srm_pending_head;
 	int npolled = 0;
+
+	if (ne > 0 && cq->srm_sw_cq && mlx5_srm_drain_dispatch(cq))
+		return CQ_POLL_ERR;
 
 	while (qp && npolled < ne) {
 		struct mlx5_qp *next = qp->srm_completion_next;
@@ -1079,17 +1165,24 @@ static inline int mlx5_srm_poll_watermarks(struct mlx5_cq *cq, int ne,
 			uint64_t completed;
 			uint64_t error_idx;
 			uint64_t target;
+			struct mlx5_srm_dispatch_status *status = NULL;
 
 			marker = &qp->srm_completion_ring[
 				tail & (qp->srm_completion_capacity - 1)];
 			ctrl = marker->ctrl;
 			target = marker->idx + 1;
-			completed = __atomic_load_n(&ctrl->cons_idx,
-						    __ATOMIC_ACQUIRE);
-			/* Signed modular comparison is valid while the live SQ window
-			 * is below 2^63 entries and remains correct across u64 wrap. */
-			if ((int64_t)(completed - target) < 0)
-				break;
+			if (qp->srm_cq_dispatch) {
+				status = &qp->srm_dispatch_ring[
+					tail & (qp->srm_completion_capacity - 1)];
+				if (!status->dispatched)
+					break;
+			} else {
+				completed = __atomic_load_n(&ctrl->cons_idx,
+							    __ATOMIC_ACQUIRE);
+				/* Signed modular comparison remains correct at u64 wrap. */
+				if ((int64_t)(completed - target) < 0)
+					break;
+			}
 
 			cur = &wc[npolled++];
 			memset(cur, 0, sizeof(*cur));
@@ -1099,22 +1192,26 @@ static inline int mlx5_srm_poll_watermarks(struct mlx5_cq *cq, int ne,
 			if (cur->opcode == IBV_WC_RDMA_READ)
 				cur->byte_len = marker->byte_len;
 
-			error_idx = __atomic_load_n(&ctrl->completion_error_idx,
-						    __ATOMIC_RELAXED);
-			if (unlikely(error_idx == target)) {
-				cur->status = (enum ibv_wc_status)__atomic_load_n(
-					&ctrl->completion_error_status,
-					__ATOMIC_RELAXED);
-				cur->vendor_err = __atomic_load_n(
-					&ctrl->completion_error_vendor,
-					__ATOMIC_RELAXED);
-			} else if (unlikely(error_idx != UINT64_MAX &&
-					    (int64_t)(target - error_idx) > 0)) {
-				/* The first failed physical WQE puts the shared RC SQ into
-				 * error; later logical completions are flushed. */
-				cur->status = IBV_WC_WR_FLUSH_ERR;
+			if (status) {
+				cur->status = (enum ibv_wc_status)status->status;
+				cur->vendor_err = status->vendor_err;
 			} else {
-				cur->status = IBV_WC_SUCCESS;
+				error_idx = __atomic_load_n(&ctrl->completion_error_idx,
+							    __ATOMIC_RELAXED);
+				if (unlikely(error_idx == target)) {
+					cur->status = (enum ibv_wc_status)__atomic_load_n(
+						&ctrl->completion_error_status,
+						__ATOMIC_RELAXED);
+					cur->vendor_err = __atomic_load_n(
+						&ctrl->completion_error_vendor,
+						__ATOMIC_RELAXED);
+				} else if (unlikely(error_idx != UINT64_MAX &&
+						    (int64_t)(target - error_idx) > 0)) {
+					/* Later logical WRs on the failed shared SQ flush. */
+					cur->status = IBV_WC_WR_FLUSH_ERR;
+				} else {
+					cur->status = IBV_WC_SUCCESS;
+				}
 			}
 			tail++;
 			__atomic_store_n(&qp->srm_completion_tail, tail,
@@ -1163,6 +1260,10 @@ static inline int poll_cq(struct ibv_cq *ibcq, int ne,
 
 	mlx5_spin_lock(&cq->lock);
 	npolled = mlx5_srm_poll_watermarks(cq, ne, wc);
+	if (npolled < 0) {
+		err = CQ_POLL_ERR;
+		goto out;
+	}
 
 	for (; npolled < ne; ++npolled) {
 		err = mlx5_poll_one(cq, &rsc, &srq, wc + npolled, cqe_ver);
@@ -1170,6 +1271,7 @@ static inline int poll_cq(struct ibv_cq *ibcq, int ne,
 			break;
 	}
 
+out:
 	update_cons_index(cq);
 
 	mlx5_spin_unlock(&cq->lock);

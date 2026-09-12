@@ -1235,6 +1235,8 @@ static int mlx5_srm_ensure_completion_space(struct mlx5_qp *qp)
 	struct mlx5_cq *cq = to_mcq(qp->ibv_qp->send_cq);
 	struct mlx5_srm_completion_marker *new_ring;
 	struct mlx5_srm_completion_marker *old_ring;
+	struct mlx5_srm_dispatch_status *new_status = NULL;
+	struct mlx5_srm_dispatch_status *old_status;
 	uint32_t old_capacity;
 	uint32_t new_capacity;
 	uint32_t max_capacity;
@@ -1267,6 +1269,13 @@ static int mlx5_srm_ensure_completion_space(struct mlx5_qp *qp)
 	new_ring = calloc(new_capacity, sizeof(*new_ring));
 	if (!new_ring)
 		return ENOMEM;
+	if (qp->srm_cq_dispatch) {
+		new_status = calloc(new_capacity, sizeof(*new_status));
+		if (!new_status) {
+			free(new_ring);
+			return ENOMEM;
+		}
+	}
 
 	/* CQ polling consumes this ring under the same lock.  Recheck after
 	 * taking it because a concurrent poll may already have made room. */
@@ -1277,6 +1286,7 @@ static int mlx5_srm_ensure_completion_space(struct mlx5_qp *qp)
 	if (old_capacity && head - tail < old_capacity) {
 		mlx5_spin_unlock(&cq->lock);
 		free(new_ring);
+		free(new_status);
 		return 0;
 	}
 
@@ -1284,18 +1294,33 @@ static int mlx5_srm_ensure_completion_space(struct mlx5_qp *qp)
 	if (unlikely(pending > old_capacity || pending >= new_capacity)) {
 		mlx5_spin_unlock(&cq->lock);
 		free(new_ring);
+		free(new_status);
 		return ENOMEM;
 	}
 	old_ring = qp->srm_completion_ring;
-	for (i = 0; i < pending; i++)
+	old_status = qp->srm_dispatch_ring;
+	for (i = 0; i < pending; i++) {
 		new_ring[i] = old_ring[(tail + i) & (old_capacity - 1)];
+		if (new_status)
+			new_status[i] = old_status[(tail + i) & (old_capacity - 1)];
+	}
 	qp->srm_completion_ring = new_ring;
+	qp->srm_dispatch_ring = new_status;
+	if (new_status) {
+		qp->srm_dispatch_small_cursor =
+			(int64_t)(qp->srm_dispatch_small_cursor - tail) < 0 ? 0 :
+			qp->srm_dispatch_small_cursor - tail;
+		qp->srm_dispatch_large_cursor =
+			(int64_t)(qp->srm_dispatch_large_cursor - tail) < 0 ? 0 :
+			qp->srm_dispatch_large_cursor - tail;
+	}
 	qp->srm_completion_tail = 0;
 	qp->srm_completion_head = pending;
 	__atomic_store_n(&qp->srm_completion_capacity, new_capacity,
 			 __ATOMIC_RELEASE);
 	mlx5_spin_unlock(&cq->lock);
 	free(old_ring);
+	free(old_status);
 	return 0;
 }
 
@@ -1319,6 +1344,9 @@ static inline void mlx5_srm_queue_completion(
 	marker->wr_id = wr_id;
 	marker->byte_len = mlx5_srm_wr_data_bytes(wr);
 	marker->opcode = mlx5_srm_wc_opcode(wr->opcode);
+	if (qp->srm_cq_dispatch)
+		qp->srm_dispatch_ring[
+			head & (qp->srm_completion_capacity - 1)].dispatched = 0;
 	__atomic_store_n(&qp->srm_completion_head, head + 1,
 			 __ATOMIC_RELEASE);
 	if (!qp->srm_completion_queued) {
@@ -2295,6 +2323,10 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		else
 			qp->sq.wqe_head[idx] = qp->sq.head + nreq;
 		post_wq->cur_post += DIV_ROUND_UP(size * 16, MLX5_SEND_WQE_BB);
+		/* A dispatched event may be polled as soon as the token is visible.
+		 * Its immutable marker must already be linked into the CQ. */
+		if (srm_signaled && qp->srm_cq_dispatch)
+			mlx5_srm_queue_completion(qp, post_ctrl, slot, wr_id, wr);
 		if (srm_fast)
 			srm_mark_wqe_ready(post_ctrl, post_publish_token,
 					   post_publish_depth,
@@ -2304,7 +2336,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 					       post_publish_token,
 					       post_publish_depth, post_wq,
 					       post_kernel_qpn, slot);
-		if (srm_signaled)
+		if (srm_signaled && !qp->srm_cq_dispatch)
 			mlx5_srm_queue_completion(qp, post_ctrl, slot, wr_id, wr);
 		if (phase_stats)
 		{
