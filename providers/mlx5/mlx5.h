@@ -520,6 +520,31 @@ struct mlx5_sq_ctrl_page {
 _Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 512,
 	       "hollow RC ctrl ABI must occupy eight cachelines");
 
+/*
+ * Per-WQE post-to-doorbell and post-to-CQE statistics. This is a compile-time
+ * switch so the default build has no timestamp, counter, branch, or storage
+ * overhead on the send/completion hot paths.
+ */
+#ifndef MLX5_SRM_ENABLE_WQE_TIMING
+#define MLX5_SRM_ENABLE_WQE_TIMING 0
+#endif
+#if MLX5_SRM_ENABLE_WQE_TIMING != 0 && MLX5_SRM_ENABLE_WQE_TIMING != 1
+#error "MLX5_SRM_ENABLE_WQE_TIMING must be 0 or 1"
+#endif
+#define MLX5_SRM_TIMING_REPORT_WQES 1000000U
+
+/* Optional debug metadata follows the unchanged publish-token array.
+ * CPU-only mmap memory, never part of a hardware WQE. */
+struct mlx5_srm_wqe_timestamp {
+	uint64_t post_tsc;
+	uint64_t sequence;
+};
+#define MLX5_SRM_TIMING_OFFSET(depth) \
+	(((size_t)(depth) * sizeof(uint64_t) + 15U) & ~(size_t)15U)
+#define MLX5_SRM_TIMING_MAP_BYTES(depth) \
+	(MLX5_SRM_TIMING_OFFSET(depth) + \
+	 (size_t)(depth) * sizeof(struct mlx5_srm_wqe_timestamp))
+
 /* Immutable WR identity survives reuse of a slot in the shared physical SQ.
  * Completion readiness comes from either a dispatched CQE or SQ progress. */
 struct mlx5_srm_completion_marker {
@@ -528,6 +553,10 @@ struct mlx5_srm_completion_marker {
 	uint64_t wr_id;
 	uint32_t byte_len;
 	enum ibv_wc_opcode opcode;
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	uint64_t post_tsc_sum;
+	uint32_t timed_wqes;
+#endif
 };
 
 /* Only dispatch mode allocates status storage alongside the marker ring. */
@@ -541,12 +570,15 @@ struct mlx5_srm_dispatch_status {
 #define MLX5_SRM_DB_OWNER_USER   1U
 #define MLX5_SRM_DB_OWNER_KERNEL 2U
 #define MLX5_SRM_CTRL_F_DIRECT_DB_STATS (1U << 0)
+#define MLX5_SRM_CTRL_F_WQE_TIMING (1U << 1)
 
 /* Must match MLX5_SRM_ENABLE_READY_FASTPATH in the kernel scheduler.h. */
 #define MLX5_SRM_ENABLE_READY_FASTPATH 0
 
 /* Direct user MMIO is the FARM fast path; the syscall experiment stays off. */
+#ifndef MLX5_SRM_ENABLE_DIRECT_USER_DB
 #define MLX5_SRM_ENABLE_DIRECT_USER_DB 1
+#endif
 
 /*
  * Large-KQP support is negotiated from the kernel modify-QP response.  One
@@ -750,6 +782,10 @@ struct mlx5_wq {
 	void			       *qend;
 	uint32_t			*wr_data;
 
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	uint64_t			srm_timing_pending_tsc_sum;
+	uint32_t			srm_timing_pending_wqes;
+#endif
 
 	uint32_t		srm_entries_cap; /* SRM entries capacity */
 };
@@ -1397,6 +1433,10 @@ int mlx5_modify_cq(struct ibv_cq *cq, struct ibv_modify_cq_attr *attr);
 int mlx5_destroy_cq(struct ibv_cq *cq);
 int mlx5_poll_cq(struct ibv_cq *cq, int ne, struct ibv_wc *wc);
 int mlx5_poll_cq_v1(struct ibv_cq *cq, int ne, struct ibv_wc *wc);
+#if MLX5_SRM_ENABLE_WQE_TIMING
+void mlx5_srm_timing_complete(uint64_t post_tsc_sum, uint32_t wqes,
+			       enum ibv_wc_status status);
+#endif
 int mlx5_arm_cq(struct ibv_cq *cq, int solicited);
 void mlx5_cq_event(struct ibv_cq *cq);
 void __mlx5_cq_clean(struct mlx5_cq *cq, uint32_t qpn, struct mlx5_srq *srq);

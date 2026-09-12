@@ -1213,6 +1213,10 @@ static inline int mlx5_srm_poll_watermarks(struct mlx5_cq *cq, int ne,
 					cur->status = IBV_WC_SUCCESS;
 				}
 			}
+#if MLX5_SRM_ENABLE_WQE_TIMING
+			mlx5_srm_timing_complete(marker->post_tsc_sum,
+						 marker->timed_wqes, cur->status);
+#endif
 			tail++;
 			__atomic_store_n(&qp->srm_completion_tail, tail,
 					 __ATOMIC_RELEASE);

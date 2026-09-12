@@ -80,6 +80,149 @@ static inline uint64_t rdtsc() {
   return ((uint64_t)hi << 32) | lo;
 }
 
+#if MLX5_SRM_ENABLE_WQE_TIMING
+struct mlx5_srm_wqe_timing_stats {
+	uint64_t cqe_wqes;
+	uint64_t post_to_cqe_cycles;
+	uint64_t missing_timestamps;
+	uint64_t invalid_timestamps;
+	uint64_t error_wqes;
+	uint32_t report_check_wqes;
+};
+
+static __thread struct mlx5_srm_wqe_timing_stats srm_wqe_timing_stats;
+
+struct mlx5_srm_db_timing_batch {
+	uint64_t post_tsc_sum;
+	uint32_t valid;
+	uint32_t missing;
+	uint32_t invalid;
+};
+
+struct mlx5_srm_db_timing_stats {
+	uint64_t db_calls;
+	uint64_t db_wqes;
+	uint64_t post_to_db_cycles;
+	uint64_t missing;
+	uint64_t invalid;
+	uint64_t checked;
+};
+
+static __thread struct mlx5_srm_db_timing_stats srm_db_timing_stats;
+
+static inline uint64_t mlx5_srm_timing_rdtsc(void)
+{
+	unsigned int lo, hi;
+
+	__asm__ __volatile__("lfence\n\trdtsc" : "=a"(lo), "=d"(hi) :: "memory");
+	return ((uint64_t)hi << 32) | lo;
+}
+
+static inline struct mlx5_srm_wqe_timestamp *
+mlx5_srm_timestamp_array(uint64_t *publish, uint32_t depth)
+{
+	return (void *)((char *)publish + MLX5_SRM_TIMING_OFFSET(depth));
+}
+
+/* Snapshot before ringing: a CQ poller may recycle a physical slot as soon
+ * as the MMIO write reaches the device. Never reread slot metadata afterwards. */
+static inline struct mlx5_srm_db_timing_batch mlx5_srm_timing_db_snapshot(
+	uint64_t *publish, uint32_t depth, uint64_t first, uint32_t count)
+{
+	struct mlx5_srm_db_timing_batch batch = {0};
+	struct mlx5_srm_wqe_timestamp *timestamps =
+		mlx5_srm_timestamp_array(publish, depth);
+	uint64_t now = mlx5_srm_timing_rdtsc();
+	uint32_t n;
+
+	for (n = 0; n < count; n++) {
+		uint64_t slot = first + n;
+		struct mlx5_srm_wqe_timestamp *entry =
+			&timestamps[slot & (depth - 1)];
+		uint64_t sequence = __atomic_load_n(&entry->sequence,
+						   __ATOMIC_ACQUIRE);
+		uint64_t start = __atomic_load_n(&entry->post_tsc,
+						__ATOMIC_RELAXED);
+
+		if (sequence != slot + 1 || !start) {
+			batch.missing++;
+		} else if ((int64_t)(now - start) < 0) {
+			batch.invalid++;
+		} else {
+			batch.valid++;
+			batch.post_tsc_sum += start;
+		}
+	}
+	return batch;
+}
+
+static void mlx5_srm_timing_db_complete(
+	const struct mlx5_srm_db_timing_batch *batch, uint64_t done)
+{
+	struct mlx5_srm_db_timing_stats *stats = &srm_db_timing_stats;
+	uint64_t elapsed = done * batch->valid - batch->post_tsc_sum;
+
+	stats->db_calls++;
+	if ((int64_t)elapsed < 0) {
+		/* A thread may migrate after the snapshot; never print an unsigned
+		 * enormous latency if CPUs expose inconsistent TSC values. */
+		stats->invalid += batch->valid;
+	} else {
+		stats->db_wqes += batch->valid;
+		stats->post_to_db_cycles += elapsed;
+	}
+	stats->missing += batch->missing;
+	stats->invalid += batch->invalid;
+	stats->checked += batch->valid + batch->missing + batch->invalid;
+	if (stats->checked < MLX5_SRM_TIMING_REPORT_WQES)
+		return;
+	fprintf(stderr,
+		"SRM_DB_TIMING algorithm=qpswitch source=user pid=%d thread=%lu db_calls=%llu db_wqes=%llu post_to_db_cycles=%llu post_to_db_avg_cycles=%.2f missing_timestamps=%llu invalid_timestamps=%llu\n",
+		getpid(), (unsigned long)pthread_self(),
+		(unsigned long long)stats->db_calls,
+		(unsigned long long)stats->db_wqes,
+		(unsigned long long)stats->post_to_db_cycles,
+		stats->db_wqes ? (double)stats->post_to_db_cycles / stats->db_wqes : 0.0,
+		(unsigned long long)stats->missing,
+		(unsigned long long)stats->invalid);
+	memset(stats, 0, sizeof(*stats));
+}
+
+void mlx5_srm_timing_complete(uint64_t post_tsc_sum, uint32_t wqes,
+			       enum ibv_wc_status status)
+{
+	struct mlx5_srm_wqe_timing_stats *stats = &srm_wqe_timing_stats;
+	uint64_t now_tsc = mlx5_srm_timing_rdtsc();
+	uint64_t elapsed = now_tsc * wqes - post_tsc_sum;
+
+	if (status != IBV_WC_SUCCESS) {
+		stats->error_wqes += wqes ? wqes : 1;
+	} else if (wqes && (int64_t)elapsed < 0) {
+		stats->invalid_timestamps += wqes;
+	} else if (wqes) {
+		stats->cqe_wqes += wqes;
+		stats->post_to_cqe_cycles += elapsed;
+	} else {
+		stats->missing_timestamps++;
+	}
+	stats->report_check_wqes += wqes ? wqes : 1;
+	if (stats->report_check_wqes < MLX5_SRM_TIMING_REPORT_WQES)
+		return;
+
+	fprintf(stderr,
+		"SRM_WQE_TIMING algorithm=qpswitch pid=%d thread=%lu cqe_wqes=%llu post_to_cqe_cycles=%llu post_to_cqe_avg_cycles=%.2f missing_timestamps=%llu invalid_timestamps=%llu error_wqes=%llu\n",
+		getpid(), (unsigned long)pthread_self(),
+		(unsigned long long)stats->cqe_wqes,
+		(unsigned long long)stats->post_to_cqe_cycles,
+		stats->cqe_wqes ?
+			(double)stats->post_to_cqe_cycles / stats->cqe_wqes : 0.0,
+		(unsigned long long)stats->missing_timestamps,
+		(unsigned long long)stats->invalid_timestamps,
+		(unsigned long long)stats->error_wqes);
+	memset(stats, 0, sizeof(*stats));
+}
+#endif
+
 static inline uint64_t srm_monotonic_ns(void);
 
 struct srm_reserve_stats {
@@ -1326,7 +1469,7 @@ static int mlx5_srm_ensure_completion_space(struct mlx5_qp *qp)
 
 static inline void mlx5_srm_queue_completion(
 	struct mlx5_qp *qp, struct mlx5_sq_ctrl_page *ctrl, uint64_t slot,
-	uint64_t wr_id, const struct ibv_send_wr *wr)
+	uint64_t wr_id, const struct ibv_send_wr *wr, struct mlx5_wq *post_wq)
 {
 	struct mlx5_cq *cq = to_mcq(qp->ibv_qp->send_cq);
 	struct mlx5_srm_completion_marker *marker;
@@ -1344,6 +1487,12 @@ static inline void mlx5_srm_queue_completion(
 	marker->wr_id = wr_id;
 	marker->byte_len = mlx5_srm_wr_data_bytes(wr);
 	marker->opcode = mlx5_srm_wc_opcode(wr->opcode);
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	marker->post_tsc_sum = post_wq->srm_timing_pending_tsc_sum;
+	marker->timed_wqes = post_wq->srm_timing_pending_wqes;
+	post_wq->srm_timing_pending_tsc_sum = 0;
+	post_wq->srm_timing_pending_wqes = 0;
+#endif
 	if (qp->srm_cq_dispatch)
 		qp->srm_dispatch_ring[
 			head & (qp->srm_completion_capacity - 1)].dispatched = 0;
@@ -1613,6 +1762,10 @@ static inline void srm_try_direct_user_db(
 	int stats_enabled;
 	bool require_full_prefix;
 	bool notify_kernel_hot = false;
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	struct mlx5_srm_db_timing_batch timing_batch = {0};
+	uint64_t db_done_tsc = 0;
+#endif
 
 	if (unlikely(!mapping || !mapping->farm_credit_ctrl ||
 		     !mapping->farm_uar_reg || !mapping->farm_db))
@@ -1749,9 +1902,16 @@ static inline void srm_try_direct_user_db(
 
 	if (require_full_prefix)
 		assert(tail + sent == target_tail);
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	timing_batch = mlx5_srm_timing_db_snapshot(publish_token, publish_depth,
+						  tail, sent);
+#endif
 	srm_direct_ring_db(mapping, ctrl_page,
 			   require_full_prefix ? target_tail : tail + sent,
 			   last_ctrl);
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	db_done_tsc = mlx5_srm_timing_rdtsc();
+#endif
 	__atomic_store_n(&ctrl_page->db_tail,
 			 require_full_prefix ? target_tail : tail + sent,
 			 __ATOMIC_RELEASE);
@@ -1765,6 +1925,10 @@ static inline void srm_try_direct_user_db(
 out_unlock:
 	__atomic_store_n(&ctrl_page->db_owner, MLX5_SRM_DB_OWNER_FREE,
 			 __ATOMIC_RELEASE);
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	if (db_done_tsc)
+		mlx5_srm_timing_db_complete(&timing_batch, db_done_tsc);
+#endif
 	/* Publish only after releasing db_owner so the scheduler never observes
 	 * a freshly-hot IP that is still owned by this userspace producer. */
 	if (notify_kernel_hot)
@@ -1835,7 +1999,11 @@ void print_wqe_info(void *seg, size_t size) {
 
 
 static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
-				  struct ibv_send_wr **bad_wr)
+				  struct ibv_send_wr **bad_wr
+#if MLX5_SRM_ENABLE_WQE_TIMING
+				  , uint64_t wqe_timing_start
+#endif
+				  )
 {
 	struct mlx5_qp *qp = to_mqp(ibqp);
 	void *seg;
@@ -1861,6 +2029,9 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	FILE *fp; /* The compiler ignores in non-debug mode */
 	uint32_t imm;
 	bool xrc_wqe;
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	bool wqe_timing = qp->hollow_rc && qp->sender_side && qp->srm_fast_ready;
+#endif
 
 	uint64_t wr_id;
 	bool srm_fast = qp->srm_fast_ready;
@@ -1914,7 +2085,9 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 
 		if (srm_fast && qp->srm_large_fast_ready &&
 		    qp->srm_large_msg_threshold &&
-		    mlx5_srm_wr_data_bytes(wr) >= qp->srm_large_msg_threshold) {
+		    (
+		     mlx5_srm_wr_data_bytes(wr)
+		     >= qp->srm_large_msg_threshold)) {
 			post_wq = &qp->srm_large_sq;
 			post_sq_start = qp->srm_large_sq_start;
 			post_ctrl = qp->srm_large_sq_ctrl;
@@ -2308,7 +2481,6 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 					be32toh(xrc->xrc_srqn),
 					(unsigned long long)slot);
 		}
-
 		if (unlikely(qp->wq_sig))
 			ctrl->signature = wq_sig(ctrl);
 
@@ -2323,10 +2495,27 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		else
 			qp->sq.wqe_head[idx] = qp->sq.head + nreq;
 		post_wq->cur_post += DIV_ROUND_UP(size * 16, MLX5_SEND_WQE_BB);
+#if MLX5_SRM_ENABLE_WQE_TIMING
+		if (wqe_timing) {
+			struct mlx5_srm_wqe_timestamp *entry =
+				&mlx5_srm_timestamp_array(post_publish_token,
+							 post_publish_depth)
+				 [slot & (post_publish_depth - 1)];
+
+			/* Publish before the token: the DB owner must see both fields. */
+			__atomic_store_n(&entry->post_tsc, wqe_timing_start,
+					 __ATOMIC_RELAXED);
+			__atomic_store_n(&entry->sequence, slot + 1,
+					 __ATOMIC_RELEASE);
+			post_wq->srm_timing_pending_tsc_sum += wqe_timing_start;
+			post_wq->srm_timing_pending_wqes++;
+		}
+#endif
 		/* A dispatched event may be polled as soon as the token is visible.
 		 * Its immutable marker must already be linked into the CQ. */
 		if (srm_signaled && qp->srm_cq_dispatch)
-			mlx5_srm_queue_completion(qp, post_ctrl, slot, wr_id, wr);
+			mlx5_srm_queue_completion(qp, post_ctrl, slot, wr_id, wr,
+						  post_wq);
 		if (srm_fast)
 			srm_mark_wqe_ready(post_ctrl, post_publish_token,
 					   post_publish_depth,
@@ -2337,7 +2526,8 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 					       post_publish_depth, post_wq,
 					       post_kernel_qpn, slot);
 		if (srm_signaled && !qp->srm_cq_dispatch)
-			mlx5_srm_queue_completion(qp, post_ctrl, slot, wr_id, wr);
+			mlx5_srm_queue_completion(qp, post_ctrl, slot, wr_id, wr,
+						  post_wq);
 		if (phase_stats)
 		{
 			post_publish_start = rdtsc();
@@ -2397,7 +2587,6 @@ out:
 		srm_reserve_stats.phase_calls += nreq;
 		srm_maybe_report_reserve_stats();
 	}
-
 	return err;
 }
 
@@ -2405,6 +2594,10 @@ int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		   struct ibv_send_wr **bad_wr)
 {
 	struct mlx5_qp *mqp = to_mqp(ibqp);
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	uint64_t timing_start = mqp->hollow_rc && mqp->sender_side ?
+		mlx5_srm_timing_rdtsc() : 0;
+#endif
 	int ret;
 #ifdef MW_DEBUG
 	if (wr->opcode == IBV_WR_BIND_MW) {
@@ -2426,7 +2619,11 @@ int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		return EINVAL;
 	}
 	if (ibqp->qp_type == IBV_QPT_RC) {
-		ret = _mlx5_post_send(ibqp, wr, bad_wr);
+		ret = _mlx5_post_send(ibqp, wr, bad_wr
+#if MLX5_SRM_ENABLE_WQE_TIMING
+				      , timing_start
+#endif
+				      );
 		if (ret)
 			return ret;
 			
@@ -2527,7 +2724,11 @@ int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		return 0;
 	}
 
-	return _mlx5_post_send(ibqp, wr, bad_wr);
+	return _mlx5_post_send(ibqp, wr, bad_wr
+#if MLX5_SRM_ENABLE_WQE_TIMING
+			       , timing_start
+#endif
+			       );
 }
 
 enum {
@@ -5075,7 +5276,11 @@ int mlx5_bind_mw(struct ibv_qp *qp, struct ibv_mw *mw,
 	wr.bind_mw.mw = mw;
 	wr.bind_mw.rkey = ibv_inc_rkey(mw->rkey);
 
-	ret = _mlx5_post_send(qp, &wr, &bad_wr);
+	ret = _mlx5_post_send(qp, &wr, &bad_wr
+#if MLX5_SRM_ENABLE_WQE_TIMING
+			      , 0 /* bind_mw is not a timed Hollow data WR */
+#endif
+			      );
 	if (ret)
 		return ret;
 
