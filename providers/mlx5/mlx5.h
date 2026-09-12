@@ -586,6 +586,23 @@ struct wr_list {
 	uint16_t	next;
 };
 
+/* Compile-time only; enable the matching scheduler.h switch as well. */
+#ifndef MLX5_SRM_ENABLE_WQE_TIMING
+#define MLX5_SRM_ENABLE_WQE_TIMING 0
+#endif
+#if MLX5_SRM_ENABLE_WQE_TIMING != 0 && MLX5_SRM_ENABLE_WQE_TIMING != 1
+#error "MLX5_SRM_ENABLE_WQE_TIMING must be 0 or 1"
+#endif
+#if MLX5_SRM_ENABLE_WQE_TIMING
+struct mlx5_srm_cqe_timing {
+	uint64_t post_tsc_sum;
+	uint32_t wqes;
+	uint32_t pending_cqes;
+	uint32_t lock;
+	bool poisoned;
+};
+#endif
+
 struct mlx5_wq {
 	uint64_t		       *wrid;
 	unsigned		       *wqe_head;
@@ -605,6 +622,12 @@ struct mlx5_wq {
 	int				offset;
 	void			       *qend;
 	uint32_t			*wr_data;
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	struct mlx5_srm_timing_slot *srm_timing_slots;
+	struct mlx5_srm_cqe_timing *srm_cqe_timing;
+	uint64_t			srm_timing_pending_tsc_sum;
+	uint32_t			srm_timing_pending_wqes;
+#endif
 };
 
 struct mlx5_devx_uar {
@@ -1166,6 +1189,9 @@ int mlx5_modify_cq(struct ibv_cq *cq, struct ibv_modify_cq_attr *attr);
 int mlx5_destroy_cq(struct ibv_cq *cq);
 int mlx5_poll_cq(struct ibv_cq *cq, int ne, struct ibv_wc *wc);
 int mlx5_poll_cq_v1(struct ibv_cq *cq, int ne, struct ibv_wc *wc);
+#if MLX5_SRM_ENABLE_WQE_TIMING
+void mlx5_srm_timing_complete_wq(struct mlx5_wq *wq, uint32_t idx, bool error);
+#endif
 int mlx5_arm_cq(struct ibv_cq *cq, int solicited);
 void mlx5_cq_event(struct ibv_cq *cq);
 void __mlx5_cq_clean(struct mlx5_cq *cq, uint32_t qpn, struct mlx5_srq *srq);

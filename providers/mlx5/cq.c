@@ -757,6 +757,10 @@ again:
 			return CQ_POLL_ERR;
 		wq = &mqp->sq;
 		idx = wqe_ctr & (wq->wqe_cnt - 1);
+#if MLX5_SRM_ENABLE_WQE_TIMING
+		if (mqp->ibv_qp && mqp->ibv_qp->qp_type == IBV_QPT_SRM)
+			mlx5_srm_timing_complete_wq(wq, idx, false);
+#endif
 		if (lazy) {
 			uint32_t wc_byte_len;
 
@@ -910,6 +914,10 @@ again:
 				return CQ_POLL_ERR;
 			wq = &mqp->sq;
 			idx = wqe_ctr & (wq->wqe_cnt - 1);
+#if MLX5_SRM_ENABLE_WQE_TIMING
+			if (mqp->ibv_qp && mqp->ibv_qp->qp_type == IBV_QPT_SRM)
+				mlx5_srm_timing_complete_wq(wq, idx, true);
+#endif
 			if (lazy)
 				cq->verbs_cq.cq_ex.wr_id = wq->wrid[idx];
 			else

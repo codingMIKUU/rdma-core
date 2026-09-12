@@ -1966,6 +1966,26 @@ static int mlx5_alloc_qp_buf(struct ibv_context *context,
 			err = -1;
 			goto ex_wrid;
 		}
+#if MLX5_SRM_ENABLE_WQE_TIMING
+		if (attr->qp_type == IBV_QPT_SRM) {
+			size_t timing_bytes = align(qp->sq.wqe_cnt *
+					 sizeof(*qp->sq.srm_timing_slots), req_align);
+			if (posix_memalign((void **)&qp->sq.srm_timing_slots,
+					   req_align, timing_bytes)) {
+				errno = ENOMEM;
+				err = -1;
+				goto ex_wrid;
+			}
+			memset(qp->sq.srm_timing_slots, 0, timing_bytes);
+			qp->sq.srm_cqe_timing = calloc(qp->sq.wqe_cnt,
+						     sizeof(*qp->sq.srm_cqe_timing));
+			if (!qp->sq.srm_cqe_timing) {
+				errno = ENOMEM;
+				err = -1;
+				goto ex_wrid;
+			}
+		}
+#endif
 	}
 
 	if (qp->rq.wqe_cnt) {
@@ -2038,6 +2058,12 @@ static int mlx5_alloc_qp_buf(struct ibv_context *context,
 rq_buf:
 	mlx5_free_actual_buf(to_mctx(context), &qp->buf);
 ex_wrid:
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	free(qp->sq.srm_timing_slots);
+	qp->sq.srm_timing_slots = NULL;
+	free(qp->sq.srm_cqe_timing);
+	qp->sq.srm_cqe_timing = NULL;
+#endif
 	if (qp->rq.wrid)
 		free(qp->rq.wrid);
 
@@ -2070,6 +2096,10 @@ static void mlx5_free_qp_buf(struct mlx5_context *ctx, struct mlx5_qp *qp)
 
 	if (qp->sq.wr_data)
 		free(qp->sq.wr_data);
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	free(qp->sq.srm_timing_slots);
+	free(qp->sq.srm_cqe_timing);
+#endif
 }
 
 int mlx5_set_ece(struct ibv_qp *qp, struct ibv_ece *ece)
@@ -2665,6 +2695,13 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 	cmd.sq_wqe_count = qp->sq.wqe_cnt;
 	cmd.rq_wqe_count = qp->rq.wqe_cnt;
 	cmd.rq_wqe_shift = qp->rq.wqe_shift;
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	if (attr->qp_type == IBV_QPT_SRM) {
+		cmd.srm_timing_addr = (uintptr_t)qp->sq.srm_timing_slots;
+		cmd.srm_timing_count = qp->sq.wqe_cnt;
+		cmd.srm_timing_version = MLX5_SRM_TIMING_ABI_VERSION;
+	}
+#endif
 
 	if (!ctx->cqe_version) {
 		cmd.uidx = 0xffffff;
@@ -2716,6 +2753,14 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 
 	resp_drv = attr->comp_mask & MLX5_CREATE_QP_EX2_COMP_MASK ?
 			&resp_ex.drv_payload : &resp.drv_payload;
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	if (attr->qp_type == IBV_QPT_SRM &&
+	    !(resp_drv->comp_mask & MLX5_IB_CREATE_QP_RESP_MASK_SRM_TIMING)) {
+		fprintf(stderr, "SRM timing requires a matching kernel with MLX5_SRM_ENABLE_WQE_TIMING=1\n");
+		errno = EOPNOTSUPP;
+		goto err_destroy;
+	}
+#endif
 	if (!ctx->cqe_version) {
 		if (qp->sq.wqe_cnt || qp->rq.wqe_cnt) {
 			ret = mlx5_store_qp(ctx, ibqp->qp_num, qp);

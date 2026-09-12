@@ -37,6 +37,7 @@
 #include <string.h>
 #include <errno.h>
 #include <stdio.h>
+#include <unistd.h>
 #include <util/mmio.h>
 #include <util/compiler.h>
 
@@ -61,6 +62,114 @@ static const uint32_t mlx5_ib_opcode[] = {
 	[IBV_WR_TSO]			= MLX5_OPCODE_TSO,
 	[IBV_WR_DRIVER1]		= MLX5_OPCODE_UMR,
 };
+
+#if MLX5_SRM_ENABLE_WQE_TIMING
+#define MLX5_SRM_TIMING_REPORT_WQES 1000000U
+
+struct mlx5_srm_wqe_timing_stats {
+	uint64_t cqe_wqes;
+	uint64_t post_to_cqe_cycles;
+	uint64_t missing_timestamps;
+	uint64_t invalid_timestamps;
+	uint64_t errored_wqes;
+	uint32_t report_check_wqes;
+};
+
+static __thread struct mlx5_srm_wqe_timing_stats srm_wqe_timing_stats;
+
+static inline uint64_t mlx5_srm_timing_rdtsc(void)
+{
+	unsigned int lo, hi;
+
+	__asm__ __volatile__("lfence\n\trdtsc" : "=a"(lo), "=d"(hi) :: "memory");
+	return ((uint64_t)hi << 32) | lo;
+}
+
+static void mlx5_srm_timing_complete(uint64_t post_tsc_sum, uint32_t wqes,
+				     bool error, uint64_t now_tsc)
+{
+	struct mlx5_srm_wqe_timing_stats *stats = &srm_wqe_timing_stats;
+
+	/* Unsigned arithmetic preserves sums across TSC wrap. Negative deltas
+	 * indicate an invalid sample (e.g. unsynchronised CPU TSCs). */
+	if (error) {
+		stats->errored_wqes += wqes ? wqes : 1;
+	} else if (wqes && (int64_t)(now_tsc * wqes - post_tsc_sum) < 0) {
+		stats->invalid_timestamps += wqes;
+	} else if (wqes) {
+		stats->cqe_wqes += wqes;
+		stats->post_to_cqe_cycles += now_tsc * wqes - post_tsc_sum;
+	} else {
+		stats->missing_timestamps++;
+	}
+	stats->report_check_wqes += wqes ? wqes : 1;
+	if (stats->report_check_wqes < MLX5_SRM_TIMING_REPORT_WQES)
+		return;
+
+	fprintf(stderr,
+		"SRM_WQE_TIMING algorithm=srm pid=%d thread=%lu cqe_wqes=%llu post_to_cqe_cycles=%llu post_to_cqe_avg_cycles=%.2f missing_timestamps=%llu invalid_timestamps=%llu error_wqes=%llu\n",
+		getpid(), (unsigned long)pthread_self(),
+		(unsigned long long)stats->cqe_wqes,
+		(unsigned long long)stats->post_to_cqe_cycles,
+		stats->cqe_wqes ?
+			(double)stats->post_to_cqe_cycles / stats->cqe_wqes : 0.0,
+		(unsigned long long)stats->missing_timestamps,
+		(unsigned long long)stats->invalid_timestamps,
+		(unsigned long long)stats->errored_wqes);
+	memset(stats, 0, sizeof(*stats));
+}
+
+void mlx5_srm_timing_complete_wq(struct mlx5_wq *wq, uint32_t idx, bool error)
+{
+	uint64_t now_tsc = mlx5_srm_timing_rdtsc();
+	struct mlx5_srm_cqe_timing *slot;
+	uint32_t wqes = 0;
+	uint64_t sum = 0;
+	if (!wq->srm_cqe_timing)
+		return;
+	slot = &wq->srm_cqe_timing[idx];
+	while (__atomic_exchange_n(&slot->lock, 1, __ATOMIC_ACQUIRE))
+		__asm__ __volatile__("pause");
+	if (slot->pending_cqes) {
+		if (!slot->poisoned) {
+			wqes = slot->wqes;
+			sum = slot->post_tsc_sum;
+		}
+		slot->pending_cqes--;
+	}
+	__atomic_store_n(&slot->lock, 0, __ATOMIC_RELEASE);
+	mlx5_srm_timing_complete(sum, wqes, error, now_tsc);
+}
+
+static inline void mlx5_srm_timing_publish(struct mlx5_wq *wq, uint32_t idx,
+					    uint64_t post_tsc,
+					    bool signaled)
+{
+	struct mlx5_srm_cqe_timing *slot;
+	wq->srm_timing_pending_tsc_sum += post_tsc;
+	wq->srm_timing_pending_wqes++;
+	if (!signaled)
+		return;
+	slot = &wq->srm_cqe_timing[idx];
+	while (__atomic_exchange_n(&slot->lock, 1, __ATOMIC_ACQUIRE))
+		__asm__ __volatile__("pause");
+	/* The legacy SRM software slot becomes reusable before CQE arrival.
+	 * Never attribute a newer timestamp to an older CQE (possibly arriving
+	 * out of order through different KQPs): discard all ambiguous samples
+	 * for this slot until its outstanding signaled CQEs have drained. */
+	if (slot->pending_cqes) {
+		slot->poisoned = true;
+	} else {
+		slot->poisoned = false;
+		slot->post_tsc_sum = wq->srm_timing_pending_tsc_sum;
+		slot->wqes = wq->srm_timing_pending_wqes;
+	}
+	slot->pending_cqes++;
+	__atomic_store_n(&slot->lock, 0, __ATOMIC_RELEASE);
+	wq->srm_timing_pending_tsc_sum = 0;
+	wq->srm_timing_pending_wqes = 0;
+}
+#endif
 
 static void *get_recv_wqe(struct mlx5_qp *qp, int n)
 {
@@ -839,7 +948,11 @@ void print_wqe_info(void *seg, size_t size) {
 
 
 static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
-				  struct ibv_send_wr **bad_wr)
+				  struct ibv_send_wr **bad_wr
+#if MLX5_SRM_ENABLE_WQE_TIMING
+				  , uint64_t wqe_timing_start
+#endif
+				  )
 {
 	struct mlx5_qp *qp = to_mqp(ibqp);
 	void *seg;
@@ -865,6 +978,9 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	union ibv_gid *gid = &wr->qp_type.srm.remote_gid;
 	FILE *fp = to_mctx(ibqp->context)->dbg_fp; /* The compiler ignores in non-debug mode */
 	uint32_t imm;
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	bool wqe_timing = ibqp->qp_type == IBV_QPT_SRM;
+#endif
 
 	mlx5_spin_lock(&qp->sq.lock);
 
@@ -1203,6 +1319,18 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 
 		qp->sq.wrid[idx] = wr->wr_id;
 		qp->sq.wqe_head[idx] = qp->sq.head + nreq;
+#if MLX5_SRM_ENABLE_WQE_TIMING
+		if (wqe_timing) {
+			struct mlx5_srm_timing_slot *slot = &qp->sq.srm_timing_slots[idx];
+
+			slot->post_tsc = wqe_timing_start;
+			slot->sequence = qp->sq.cur_post;
+			__atomic_store_n(&slot->valid, 1, __ATOMIC_RELEASE);
+			mlx5_srm_timing_publish(&qp->sq, idx, wqe_timing_start,
+						     ctrl->fm_ce_se &
+						     MLX5_WQE_CTRL_CQ_UPDATE);
+		}
+#endif
 		qp->sq.cur_post += DIV_ROUND_UP(size * 16, MLX5_SEND_WQE_BB);
  
 #ifdef MLX5_DEBUG
@@ -1254,6 +1382,10 @@ out:
 int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		   struct ibv_send_wr **bad_wr)
 {
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	uint64_t post_start = ibqp->qp_type == IBV_QPT_SRM ?
+			      mlx5_srm_timing_rdtsc() : 0;
+#endif
 #ifdef MW_DEBUG
 	if (wr->opcode == IBV_WR_BIND_MW) {
 		if (wr->bind_mw.mw->type == IBV_MW_TYPE_1)
@@ -1269,7 +1401,11 @@ int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	}
 #endif
 
-	return _mlx5_post_send(ibqp, wr, bad_wr);
+	return _mlx5_post_send(ibqp, wr, bad_wr
+#if MLX5_SRM_ENABLE_WQE_TIMING
+			       , post_start
+#endif
+			       );
 }
 
 enum {
@@ -3813,7 +3949,11 @@ int mlx5_bind_mw(struct ibv_qp *qp, struct ibv_mw *mw,
 	wr.bind_mw.mw = mw;
 	wr.bind_mw.rkey = ibv_inc_rkey(mw->rkey);
 
-	ret = _mlx5_post_send(qp, &wr, &bad_wr);
+	ret = _mlx5_post_send(qp, &wr, &bad_wr
+#if MLX5_SRM_ENABLE_WQE_TIMING
+			      , qp->qp_type == IBV_QPT_SRM ? mlx5_srm_timing_rdtsc() : 0
+#endif
+			      );
 	if (ret)
 		return ret;
 
