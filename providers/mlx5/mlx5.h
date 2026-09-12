@@ -498,6 +498,12 @@ struct mlx5_sq_ctrl_page {
 _Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 128,
 	       "hollow RC ctrl ABI must occupy two cachelines");
 
+/* Compile-time only: zero hot-path cost and zero extra metadata by default. */
+#define MLX5_SRM_ENABLE_WQE_TIMING 1
+#if MLX5_SRM_ENABLE_WQE_TIMING != 0 && MLX5_SRM_ENABLE_WQE_TIMING != 1
+#error "MLX5_SRM_ENABLE_WQE_TIMING must be 0 or 1"
+#endif
+
 #define MLX5_SRM_PUBLISH_USR_BITS 16
 #define MLX5_SRM_PUBLISH_USR_MASK ((1ULL << MLX5_SRM_PUBLISH_USR_BITS) - 1)
 #define MLX5_SRM_PUBLISH_SEQ_MASK ((1ULL << 48) - 1)
@@ -670,6 +676,13 @@ struct mlx5_wq {
 	int				offset;
 	void			       *qend;
 	uint32_t			*wr_data;
+
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	uint64_t			*srm_timing_post_tsc_sum;
+	uint32_t			*srm_timing_post_wqes;
+	uint64_t			srm_timing_pending_tsc_sum;
+	uint32_t			srm_timing_pending_wqes;
+#endif
 
 
 	uint32_t		srm_entries_cap; /* SRM entries capacity */
@@ -1302,6 +1315,12 @@ int mlx5_modify_cq(struct ibv_cq *cq, struct ibv_modify_cq_attr *attr);
 int mlx5_destroy_cq(struct ibv_cq *cq);
 int mlx5_poll_cq(struct ibv_cq *cq, int ne, struct ibv_wc *wc);
 int mlx5_poll_cq_v1(struct ibv_cq *cq, int ne, struct ibv_wc *wc);
+#if MLX5_SRM_ENABLE_WQE_TIMING
+void mlx5_srm_timing_record_post(uint64_t total_cycles,
+				 uint64_t db_cycles, uint32_t db_calls,
+				 uint32_t wqes);
+void mlx5_srm_timing_complete_wq(struct mlx5_wq *wq, uint32_t idx);
+#endif
 int mlx5_arm_cq(struct ibv_cq *cq, int solicited);
 void mlx5_cq_event(struct ibv_cq *cq);
 void __mlx5_cq_clean(struct mlx5_cq *cq, uint32_t qpn, struct mlx5_srq *srq);

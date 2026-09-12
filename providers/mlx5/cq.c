@@ -801,6 +801,10 @@ again:
 			return CQ_POLL_ERR;
 		}
 		idx = wqe_ctr & (wq->wqe_cnt - 1);
+#if MLX5_SRM_ENABLE_WQE_TIMING
+		if (mqp->hollow_rc)
+			mlx5_srm_timing_complete_wq(wq, idx);
+#endif
 		if (lazy) {
 			uint32_t wc_byte_len;
 
@@ -961,12 +965,19 @@ again:
 			if (unlikely(!mqp))
 				return CQ_POLL_ERR;
 			wq = &mqp->sq;
+			if (mqp->hollow_rc && mqp->srm_large_kernel_qpn_valid &&
+			    qpn == mqp->srm_large_kernel_qpn)
+				wq = &mqp->srm_large_sq;
 			if (unlikely(!wq->wqe_cnt || !wq->wrid ||
 				     !wq->wqe_head)) {
 				*cur_rsc = NULL;
 				return CQ_POLL_ERR;
 			}
 			idx = wqe_ctr & (wq->wqe_cnt - 1);
+#if MLX5_SRM_ENABLE_WQE_TIMING
+			if (mqp->hollow_rc)
+				mlx5_srm_timing_complete_wq(wq, idx);
+#endif
 			if (lazy)
 				cq->verbs_cq.cq_ex.wr_id = wq->wrid[idx];
 			else

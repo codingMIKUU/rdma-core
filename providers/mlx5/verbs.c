@@ -2182,6 +2182,16 @@ static size_t mlx5_set_custom_qp_alignment(struct ibv_context *context,
 
 static void mlx5_free_qp_wrid(struct mlx5_qp *qp)
 {
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	free(qp->srm_large_sq.srm_timing_post_tsc_sum);
+	qp->srm_large_sq.srm_timing_post_tsc_sum = NULL;
+	free(qp->srm_large_sq.srm_timing_post_wqes);
+	qp->srm_large_sq.srm_timing_post_wqes = NULL;
+	free(qp->sq.srm_timing_post_tsc_sum);
+	qp->sq.srm_timing_post_tsc_sum = NULL;
+	free(qp->sq.srm_timing_post_wqes);
+	qp->sq.srm_timing_post_wqes = NULL;
+#endif
 	free(qp->srm_large_sq.wqe_head);
 	qp->srm_large_sq.wqe_head = NULL;
 	free(qp->srm_large_sq.wr_data);
@@ -2207,6 +2217,10 @@ static int mlx5_resize_wq_metadata(struct mlx5_wq *wq,
 	uint64_t *wrid;
 	uint32_t *wr_data;
 	unsigned int *wqe_head;
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	uint64_t *timing_sum;
+	uint32_t *timing_wqes;
+#endif
 
 	if (*metadata_cnt == wqe_cnt)
 		return 0;
@@ -2214,10 +2228,22 @@ static int mlx5_resize_wq_metadata(struct mlx5_wq *wq,
 	wrid = calloc(wqe_cnt, sizeof(*wrid));
 	wr_data = calloc(wqe_cnt, sizeof(*wr_data));
 	wqe_head = calloc(wqe_cnt, sizeof(*wqe_head));
-	if (!wrid || !wr_data || !wqe_head) {
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	timing_sum = calloc(wqe_cnt, sizeof(*timing_sum));
+	timing_wqes = calloc(wqe_cnt, sizeof(*timing_wqes));
+#endif
+	if (!wrid || !wr_data || !wqe_head
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	    || !timing_sum || !timing_wqes
+#endif
+	    ) {
 		free(wrid);
 		free(wr_data);
 		free(wqe_head);
+#if MLX5_SRM_ENABLE_WQE_TIMING
+		free(timing_sum);
+		free(timing_wqes);
+#endif
 		errno = ENOMEM;
 		return -1;
 	}
@@ -2225,9 +2251,19 @@ static int mlx5_resize_wq_metadata(struct mlx5_wq *wq,
 	free(wq->wrid);
 	free(wq->wr_data);
 	free(wq->wqe_head);
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	free(wq->srm_timing_post_tsc_sum);
+	free(wq->srm_timing_post_wqes);
+#endif
 	wq->wrid = wrid;
 	wq->wr_data = wr_data;
 	wq->wqe_head = wqe_head;
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	wq->srm_timing_post_tsc_sum = timing_sum;
+	wq->srm_timing_post_wqes = timing_wqes;
+	wq->srm_timing_pending_tsc_sum = 0;
+	wq->srm_timing_pending_wqes = 0;
+#endif
 	*metadata_cnt = wqe_cnt;
 	return 0;
 }

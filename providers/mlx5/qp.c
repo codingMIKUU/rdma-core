@@ -79,6 +79,108 @@ static inline uint64_t rdtsc() {
   return ((uint64_t)hi << 32) | lo;
 }
 
+#if MLX5_SRM_ENABLE_WQE_TIMING
+#define MLX5_SRM_TIMING_REPORT_WQES 1000000U
+
+struct mlx5_srm_wqe_timing_stats {
+	uint64_t post_calls;
+	uint64_t post_wqes;
+	uint64_t post_cycles;
+	uint64_t db_calls;
+	uint64_t db_cycles;
+	uint64_t cqe_wqes;
+	uint64_t post_to_cqe_cycles;
+	uint64_t missing_timestamps;
+	uint32_t report_check_wqes;
+};
+
+static __thread struct mlx5_srm_wqe_timing_stats srm_wqe_timing_stats;
+
+static inline uint64_t mlx5_srm_timing_rdtsc(void)
+{
+	unsigned int lo, hi;
+
+	__asm__ __volatile__("lfence\n\trdtsc" : "=a"(lo), "=d"(hi) :: "memory");
+	return ((uint64_t)hi << 32) | lo;
+}
+
+void mlx5_srm_timing_record_post(uint64_t total_cycles,
+				 uint64_t db_cycles, uint32_t db_calls,
+				 uint32_t wqes)
+{
+	struct mlx5_srm_wqe_timing_stats *stats = &srm_wqe_timing_stats;
+
+	if (!wqes)
+		return;
+	stats->post_calls++;
+	stats->post_wqes += wqes;
+	stats->post_cycles += total_cycles >= db_cycles ?
+		total_cycles - db_cycles : 0;
+	stats->db_calls += db_calls;
+	stats->db_cycles += db_cycles;
+}
+
+static void mlx5_srm_timing_complete(uint64_t post_tsc_sum, uint32_t wqes)
+{
+	struct mlx5_srm_wqe_timing_stats *stats = &srm_wqe_timing_stats;
+	uint64_t now_tsc = mlx5_srm_timing_rdtsc();
+
+	if (post_tsc_sum && wqes) {
+		stats->cqe_wqes += wqes;
+		stats->post_to_cqe_cycles += now_tsc * wqes - post_tsc_sum;
+	} else {
+		stats->missing_timestamps++;
+	}
+	stats->report_check_wqes += wqes ? wqes : 1;
+	if (stats->report_check_wqes < MLX5_SRM_TIMING_REPORT_WQES)
+		return;
+
+	fprintf(stderr,
+		"SRM_WQE_TIMING algorithm=farm pid=%d thread=%lu post_calls=%llu post_wqes=%llu post_excl_db_avg_cycles=%.2f cqe_wqes=%llu post_to_cqe_avg_cycles=%.2f db_calls=%llu db_avg_cycles=%.2f missing_timestamps=%llu\n",
+		getpid(), (unsigned long)pthread_self(),
+		(unsigned long long)stats->post_calls,
+		(unsigned long long)stats->post_wqes,
+		stats->post_calls ? (double)stats->post_cycles / stats->post_calls : 0.0,
+		(unsigned long long)stats->cqe_wqes,
+		stats->cqe_wqes ?
+			(double)stats->post_to_cqe_cycles / stats->cqe_wqes : 0.0,
+		(unsigned long long)stats->db_calls,
+		stats->db_calls ? (double)stats->db_cycles / stats->db_calls : 0.0,
+		(unsigned long long)stats->missing_timestamps);
+	memset(stats, 0, sizeof(*stats));
+}
+
+void mlx5_srm_timing_complete_wq(struct mlx5_wq *wq, uint32_t idx)
+{
+	uint32_t wqes;
+	uint64_t sum;
+
+	if (!wq->srm_timing_post_wqes || !wq->srm_timing_post_tsc_sum)
+		return;
+	wqes = __atomic_exchange_n(&wq->srm_timing_post_wqes[idx], 0,
+				     __ATOMIC_ACQ_REL);
+	sum = __atomic_exchange_n(&wq->srm_timing_post_tsc_sum[idx], 0,
+				    __ATOMIC_RELAXED);
+	mlx5_srm_timing_complete(sum, wqes);
+}
+
+static inline void mlx5_srm_timing_publish(struct mlx5_wq *wq, uint32_t idx,
+					    uint64_t post_tsc,
+					    bool signaled)
+{
+	wq->srm_timing_pending_tsc_sum += post_tsc;
+	wq->srm_timing_pending_wqes++;
+	if (!signaled)
+		return;
+	__atomic_store_n(&wq->srm_timing_post_tsc_sum[idx],
+			 wq->srm_timing_pending_tsc_sum, __ATOMIC_RELAXED);
+	__atomic_store_n(&wq->srm_timing_post_wqes[idx],
+			 wq->srm_timing_pending_wqes, __ATOMIC_RELEASE);
+	wq->srm_timing_pending_tsc_sum = 0;
+	wq->srm_timing_pending_wqes = 0;
+}
+#endif
+
 static inline uint64_t srm_monotonic_ns(void);
 
 struct srm_reserve_stats {
@@ -1363,6 +1465,12 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	uint64_t wr_id;
 	bool srm_fast = qp->srm_fast_ready &&
 		(!MLX5_SRM_ENABLE_LARGE_KERNEL_QP || qp->srm_large_fast_ready);
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	bool wqe_timing = qp->hollow_rc && qp->sender_side && srm_fast;
+	uint64_t wqe_timing_start = wqe_timing ? mlx5_srm_timing_rdtsc() : 0;
+	uint64_t wqe_timing_db_cycles = 0;
+	uint32_t wqe_timing_db_calls = 0;
+#endif
 	bool lock_sq = !srm_fast;
 	int phase_stats =
 		qp->hollow_rc && qp->sender_side && srm_stats_is_enabled();
@@ -1798,14 +1906,32 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		else
 			qp->sq.wqe_head[idx] = qp->sq.head + nreq;
 		post_wq->cur_post += DIV_ROUND_UP(size * 16, MLX5_SEND_WQE_BB);
+#if MLX5_SRM_ENABLE_WQE_TIMING
+		if (wqe_timing)
+			mlx5_srm_timing_publish(post_wq, idx, wqe_timing_start,
+						     ctrl->fm_ce_se &
+						     MLX5_WQE_CTRL_CQ_UPDATE);
+#endif
 		if (srm_fast)
 			srm_mark_wqe_ready(post_publish_token, post_publish_depth,
 					   qp->usr_rc_cnt, slot, phase_stats);
 		if (srm_fast) {
+#if MLX5_SRM_ENABLE_WQE_TIMING
+			uint64_t db_start = wqe_timing ?
+				mlx5_srm_timing_rdtsc() : 0;
+#endif
+
 			__atomic_store_n(&post_ctrl->resv_idx, slot + 1,
 					 __ATOMIC_RELEASE);
 			srm_farm_ring_db(post_mapping, post_ctrl,
 					 post_wq->cur_post, ctrl);
+#if MLX5_SRM_ENABLE_WQE_TIMING
+			if (wqe_timing) {
+				wqe_timing_db_cycles +=
+					mlx5_srm_timing_rdtsc() - db_start;
+				wqe_timing_db_calls++;
+			}
+#endif
 			srm_farm_unlock(post_ctrl);
 			farm_locked = false;
 			farm_locked_ctrl = NULL;
@@ -1871,6 +1997,13 @@ out:
 		srm_reserve_stats.phase_calls += nreq;
 		srm_maybe_report_reserve_stats();
 	}
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	if (wqe_timing)
+		mlx5_srm_timing_record_post(mlx5_srm_timing_rdtsc() -
+					    wqe_timing_start,
+					    wqe_timing_db_cycles,
+					    wqe_timing_db_calls, nreq);
+#endif
 
 	return err;
 }
