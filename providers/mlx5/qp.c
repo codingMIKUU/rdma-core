@@ -39,6 +39,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <time.h>
+#include <unistd.h>
 #include <util/mmio.h>
 #include <util/compiler.h>
 
@@ -1176,6 +1177,19 @@ static inline int srm_farm_reserve_wqe_blocking(
 				}
 				return 0;
 			}
+#if MLX5_SRM_ENABLE_RESERVE_BACKOFF_LOG
+			if (unlikely(attempt == 0))
+				fprintf(stderr,
+					"SRM_RESERVE_BACKOFF algorithm=farm reason=sq_full "
+					"pid=%d thread=%lu ctrl=%p wqe_cnt=%u "
+					"resv=%llu cons=%llu occupancy=%llu limit=%llu\n",
+					getpid(), (unsigned long)pthread_self(),
+					(void *)ctrl, wqe_cnt,
+					(unsigned long long)resv,
+					(unsigned long long)cons,
+					(unsigned long long)occupancy,
+					(unsigned long long)limit);
+#endif
 			srm_farm_unlock(ctrl);
 		}
 

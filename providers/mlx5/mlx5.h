@@ -54,6 +54,19 @@
 
 #define PFX		"mlx5: "
 
+/*
+ * Print immediately when a FARM post first has to wait for shared-SQ space.
+ * Disabled builds compile out the diagnostic and retain the original hot
+ * path.  Enable only for short saturation-debug runs because stderr is slow.
+ */
+#ifndef MLX5_SRM_ENABLE_RESERVE_BACKOFF_LOG
+#define MLX5_SRM_ENABLE_RESERVE_BACKOFF_LOG 0
+#endif
+#if MLX5_SRM_ENABLE_RESERVE_BACKOFF_LOG != 0 && \
+	MLX5_SRM_ENABLE_RESERVE_BACKOFF_LOG != 1
+#error "MLX5_SRM_ENABLE_RESERVE_BACKOFF_LOG must be 0 or 1"
+#endif
+
 #ifndef PCI_VENDOR_ID_MELLANOX
 #define PCI_VENDOR_ID_MELLANOX 0x15b3
 #endif
