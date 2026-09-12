@@ -2135,11 +2135,22 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		uint32_t post_ctrl_slot_idx = qp->sq_ctrl_slot_idx;
 		struct mlx5_srm_mapping_bundle *post_mapping = qp->srm_mapping;
 		bool srm_signaled;
+#if MLX5_SRM_ENABLE_WQE_PAYLOAD_LOG
+		uint32_t srm_payload_bytes = 0;
+		bool srm_large_wqe = false;
+
+		if (srm_fast)
+			srm_payload_bytes = mlx5_srm_wr_data_bytes(wr);
+#endif
 
 		if (srm_fast && qp->srm_large_fast_ready &&
 		    qp->srm_large_msg_threshold &&
 		    (
+#if MLX5_SRM_ENABLE_WQE_PAYLOAD_LOG
+		     srm_payload_bytes
+#else
 		     mlx5_srm_wr_data_bytes(wr)
+#endif
 		     >= qp->srm_large_msg_threshold)) {
 			post_wq = &qp->srm_large_sq;
 			post_sq_start = qp->srm_large_sq_start;
@@ -2149,6 +2160,9 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			post_kernel_qpn = qp->srm_large_kernel_qpn;
 			post_ctrl_slot_idx = qp->srm_large_sq_ctrl_slot_idx;
 			post_mapping = qp->srm_large_mapping;
+#if MLX5_SRM_ENABLE_WQE_PAYLOAD_LOG
+			srm_large_wqe = true;
+#endif
 		}
 		srm_signaled = srm_fast &&
 			((wr->send_flags & IBV_SEND_SIGNALED) ||
@@ -2585,6 +2599,17 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		if (srm_signaled && !qp->srm_cq_dispatch)
 			mlx5_srm_queue_completion(qp, post_ctrl, slot, wr_id, wr,
 						  post_wq);
+#if MLX5_SRM_ENABLE_WQE_PAYLOAD_LOG
+		if (srm_fast)
+			fprintf(stderr,
+				"HOLLOW_WQE_PAYLOAD pid=%d logical_qpn=%u kernel_qpn=%u slot=%llu class=%s opcode=%s(%d) payload_bytes=%u num_sge=%d send_flags=0x%x\n",
+				getpid(), ibqp->qp_num, post_kernel_qpn,
+				(unsigned long long)slot,
+				srm_large_wqe ? "large" : "small",
+				ibv_wr_opcode_str(wr->opcode), wr->opcode,
+				srm_payload_bytes, wr->num_sge,
+				wr->send_flags);
+#endif
 		if (phase_stats)
 		{
 			post_publish_start = rdtsc();

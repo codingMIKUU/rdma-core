@@ -526,7 +526,7 @@ _Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 512,
  * overhead on the send/completion hot paths.
  */
 #ifndef MLX5_SRM_ENABLE_WQE_TIMING
-#define MLX5_SRM_ENABLE_WQE_TIMING 0
+#define MLX5_SRM_ENABLE_WQE_TIMING 1
 #endif
 #if MLX5_SRM_ENABLE_WQE_TIMING != 0 && MLX5_SRM_ENABLE_WQE_TIMING != 1
 #error "MLX5_SRM_ENABLE_WQE_TIMING must be 0 or 1"
@@ -539,7 +539,7 @@ _Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 512,
  * outside the benchmark hot path unless the diagnostic is requested.
  */
 #ifndef MLX5_SRM_ENABLE_RESERVE_BACKOFF_LOG
-#define MLX5_SRM_ENABLE_RESERVE_BACKOFF_LOG 0
+#define MLX5_SRM_ENABLE_RESERVE_BACKOFF_LOG 1
 #endif
 #if MLX5_SRM_ENABLE_RESERVE_BACKOFF_LOG != 0 && \
 	MLX5_SRM_ENABLE_RESERVE_BACKOFF_LOG != 1
@@ -587,6 +587,20 @@ struct mlx5_srm_dispatch_status {
 
 /* Must match MLX5_SRM_ENABLE_READY_FASTPATH in the kernel scheduler.h. */
 #define MLX5_SRM_ENABLE_READY_FASTPATH 0
+
+/*
+ * Print one stderr record for every successfully built Hollow RC send WQE.
+ * Keep this as a compile-time switch so the disabled build has no hot-path
+ * branch, payload walk, or logging state.  Enabling it is for short debug
+ * runs only: per-WQE stdio serialization severely perturbs throughput.
+ */
+#ifndef MLX5_SRM_ENABLE_WQE_PAYLOAD_LOG
+#define MLX5_SRM_ENABLE_WQE_PAYLOAD_LOG 0
+#endif
+#if MLX5_SRM_ENABLE_WQE_PAYLOAD_LOG != 0 && \
+	MLX5_SRM_ENABLE_WQE_PAYLOAD_LOG != 1
+#error "MLX5_SRM_ENABLE_WQE_PAYLOAD_LOG must be 0 or 1"
+#endif
 
 /* Direct user MMIO is the FARM fast path; the syscall experiment stays off. */
 #ifndef MLX5_SRM_ENABLE_DIRECT_USER_DB
