@@ -588,7 +588,7 @@ struct wr_list {
 
 /* Compile-time only; enable the matching scheduler.h switch as well. */
 #ifndef MLX5_SRM_ENABLE_WQE_TIMING
-#define MLX5_SRM_ENABLE_WQE_TIMING 0
+#define MLX5_SRM_ENABLE_WQE_TIMING 1
 #endif
 #if MLX5_SRM_ENABLE_WQE_TIMING != 0 && MLX5_SRM_ENABLE_WQE_TIMING != 1
 #error "MLX5_SRM_ENABLE_WQE_TIMING must be 0 or 1"
