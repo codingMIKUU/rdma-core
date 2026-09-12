@@ -537,6 +537,10 @@ struct mlx5_srm_dispatch_status {
 	uint8_t dispatched;
 };
 
+/* CQ-local sparse UIDX index; only direct mode allocates its leaves. */
+#define MLX5_SRM_DIRECT_INDEX_SHIFT 8
+#define MLX5_SRM_DIRECT_INDEX_MASK ((1U << MLX5_SRM_DIRECT_INDEX_SHIFT) - 1)
+
 #define MLX5_SRM_DB_OWNER_FREE   0U
 #define MLX5_SRM_DB_OWNER_USER   1U
 #define MLX5_SRM_DB_OWNER_KERNEL 2U
@@ -652,12 +656,18 @@ struct mlx5_cq {
 	uint32_t			srm_sw_cq_depth;
 	uint8_t				srm_cq_mode_known;
 	uint8_t				srm_cq_dispatch;
+	uint8_t				srm_cq_direct;
 	uint8_t				srm_cq_mode_reported;
 	uint8_t				srm_dispatch_error_reported;
 	struct mlx5_qp		       *srm_attached_head;
 	/* QPs waiting for a Hollow RC completion. */
 	struct mlx5_qp		       *srm_pending_head;
 	struct mlx5_qp		       *srm_pending_tail;
+	/* Mode 2 only: QPs with decoded CQEs waiting for ordered WC return. */
+	struct mlx5_qp		       *srm_direct_ready_head;
+	struct mlx5_qp		       *srm_direct_ready_tail;
+	struct mlx5_qp		     ***srm_direct_index;
+	uint32_t			srm_direct_index_size;
 };
 
 struct mlx5_tag_entry {
@@ -915,6 +925,9 @@ struct mlx5_qp {
 	uint8_t srm_cq_mode_known;
 	uint8_t srm_cq_mode_legacy;
 	uint8_t srm_cq_dispatch;
+	uint8_t srm_cq_direct;
+	uint8_t srm_direct_ready_queued;
+	struct mlx5_qp *srm_direct_ready_next;
 	uint8_t srm_cq_attached;
 	struct mlx5_cq *srm_completion_cq;
 	struct mlx5_qp *srm_attached_next;

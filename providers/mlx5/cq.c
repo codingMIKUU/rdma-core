@@ -46,6 +46,12 @@
 #include "mlx5.h"
 #include "wqe.h"
 
+_Static_assert(sizeof(struct mlx5_cqe64) == MLX5_SRM_DIRECT_CQE_SIZE &&
+	       offsetof(struct mlx5_cqe64, srqn_uidx) == 32 &&
+	       offsetof(struct mlx5_cqe64, op_own) == 63 &&
+	       sizeof(struct mlx5_srm_direct_cqe_meta) == 24,
+	       "Hollow direct CQE layout mismatch");
+
 enum {
 	CQ_OK					=  0,
 	CQ_EMPTY				= -1,
@@ -1142,6 +1148,136 @@ static int mlx5_srm_drain_dispatch(struct mlx5_cq *cq)
 	return CQ_OK;
 }
 
+/* Direct CQEs carry the provider resource index, avoiding a per-event walk
+ * of every attached QP. Only QPs with a ready oldest marker enter this FIFO. */
+static void mlx5_srm_direct_event(struct mlx5_cq *cq,
+				  const struct mlx5_cqe64 *cqe)
+{
+	struct mlx5_srm_direct_cqe_meta event;
+	struct mlx5_qp *qp;
+	struct mlx5_sq_ctrl_page *ctrl;
+	uint64_t *cursor, tail, head;
+	uint32_t uidx = be32toh(cqe->srqn_uidx) & 0xffffff;
+	uint32_t page = uidx >> MLX5_SRM_DIRECT_INDEX_SHIFT;
+
+	memcpy(&event, cqe, sizeof(event));
+	/* Never dereference a resource from another CQ: its UIDX may have been
+	 * reused after destroy while an old kernel event was still in flight.
+	 * This CQ lock protects both index membership and QP lifetime. */
+	if (page >= cq->srm_direct_index_size || !cq->srm_direct_index[page])
+		return;
+	qp = cq->srm_direct_index[page][uidx & MLX5_SRM_DIRECT_INDEX_MASK];
+	if (!qp || !qp->srm_cq_direct || qp->srm_completion_cq != cq ||
+	    qp->usr_rc_cnt != event.usr_rc)
+		return;
+	if (event.kqp_idx == qp->sq_ctrl_slot_idx) {
+		ctrl = qp->sq_ctrl;
+		cursor = &qp->srm_dispatch_small_cursor;
+	} else if (qp->srm_large_fast_ready &&
+		   event.kqp_idx == qp->srm_large_sq_ctrl_slot_idx) {
+		ctrl = qp->srm_large_sq_ctrl;
+		cursor = &qp->srm_dispatch_large_cursor;
+	} else {
+		return;
+	}
+	head = qp->srm_completion_head;
+	tail = qp->srm_completion_tail;
+	if ((int64_t)(*cursor - tail) > 0)
+		tail = *cursor;
+	for (; tail != head; tail++) {
+		uint32_t idx = tail & (qp->srm_completion_capacity - 1);
+		struct mlx5_srm_completion_marker *marker = &qp->srm_completion_ring[idx];
+		struct mlx5_srm_dispatch_status *status = &qp->srm_dispatch_ring[idx];
+
+		/* Full indices reject both physical-slot reuse and stale ID events.
+		 * The common single-lane case matches its next marker immediately. */
+		if (marker->ctrl != ctrl || marker->idx != event.post_idx)
+			continue;
+		status->status = event.status;
+		status->vendor_err = event.vendor_err;
+		status->dispatched = 1;
+		*cursor = tail + 1;
+		if (!qp->srm_direct_ready_queued && qp->srm_dispatch_ring[
+		    qp->srm_completion_tail & (qp->srm_completion_capacity - 1)].dispatched) {
+			qp->srm_direct_ready_next = NULL;
+			if (cq->srm_direct_ready_tail)
+				cq->srm_direct_ready_tail->srm_direct_ready_next = qp;
+			else
+				cq->srm_direct_ready_head = qp;
+			cq->srm_direct_ready_tail = qp;
+			qp->srm_direct_ready_queued = 1;
+		}
+		return;
+	}
+	if (event.status != IBV_WC_SUCCESS && !cq->srm_dispatch_error_reported) {
+		fprintf(stderr, "Hollow direct CQE has no signaled marker: usr_rc=%u kqp=%u post=%llu status=%u\n",
+			event.usr_rc, event.kqp_idx, (unsigned long long)event.post_idx,
+			event.status);
+		cq->srm_dispatch_error_reported = 1;
+	}
+}
+
+static int mlx5_srm_poll_direct(struct mlx5_cq *cq, int ne, struct ibv_wc *wc)
+{
+	struct mlx5_srm_sw_cq *ring = cq->srm_sw_cq;
+	uint64_t consumer = ring->consumer;
+	unsigned int examined = 0;
+	int n = 0;
+
+	while (n < ne) {
+		struct mlx5_qp *qp = cq->srm_direct_ready_head;
+		if (qp) {
+			uint64_t tail = qp->srm_completion_tail;
+			uint64_t head = qp->srm_completion_head;
+			uint32_t mask = qp->srm_completion_capacity - 1;
+			struct mlx5_srm_dispatch_status *status = &qp->srm_dispatch_ring[tail & mask];
+
+			if (tail != head && status->dispatched) {
+				struct mlx5_srm_completion_marker *marker = &qp->srm_completion_ring[tail & mask];
+				struct ibv_wc *out = &wc[n++];
+				memset(out, 0, sizeof(*out));
+				out->wr_id = marker->wr_id;
+				out->opcode = marker->opcode;
+				out->qp_num = qp->verbs_qp.qp.qp_num;
+				out->status = status->status;
+				out->vendor_err = status->vendor_err;
+				if (out->opcode == IBV_WC_RDMA_READ)
+					out->byte_len = marker->byte_len;
+				__atomic_store_n(&qp->srm_completion_tail, ++tail, __ATOMIC_RELEASE);
+			}
+			if (tail == head || !qp->srm_dispatch_ring[tail & mask].dispatched) {
+				cq->srm_direct_ready_head = qp->srm_direct_ready_next;
+				if (!cq->srm_direct_ready_head)
+					cq->srm_direct_ready_tail = NULL;
+				qp->srm_direct_ready_next = NULL;
+				qp->srm_direct_ready_queued = 0;
+			}
+			continue;
+		}
+		/* Bound orphan/out-of-order processing too; never drain an actively
+		 * refilled ring forever and starve hardware receive completions. */
+		if (examined++ == cq->srm_sw_cq_depth)
+			break;
+		{
+			struct mlx5_cqe64 *cqe = (void *)((uint8_t *)ring->entries +
+				(consumer & (cq->srm_sw_cq_depth - 1)) * MLX5_SRM_DIRECT_CQE_SIZE);
+			uint8_t owner = __atomic_load_n(&cqe->op_own, __ATOMIC_ACQUIRE);
+
+			if ((owner >> 4) == MLX5_CQE_INVALID ||
+			    (owner & 1) != !!(consumer & cq->srm_sw_cq_depth))
+				break;
+			if ((owner >> 4) != MLX5_CQE_REQ && (owner >> 4) != MLX5_CQE_REQ_ERR) {
+				__atomic_store_n(&ring->consumer, consumer, __ATOMIC_RELEASE);
+				return CQ_POLL_ERR;
+			}
+			mlx5_srm_direct_event(cq, cqe);
+			consumer++;
+		}
+	}
+	__atomic_store_n(&ring->consumer, consumer, __ATOMIC_RELEASE);
+	return n;
+}
+
 static inline int mlx5_srm_poll_watermarks(struct mlx5_cq *cq, int ne,
 					   struct ibv_wc *wc)
 {
@@ -1259,7 +1395,8 @@ static inline int poll_cq(struct ibv_cq *ibcq, int ne,
 	}
 
 	mlx5_spin_lock(&cq->lock);
-	npolled = mlx5_srm_poll_watermarks(cq, ne, wc);
+	npolled = cq->srm_cq_direct ? mlx5_srm_poll_direct(cq, ne, wc) :
+		mlx5_srm_poll_watermarks(cq, ne, wc);
 	if (npolled < 0) {
 		err = CQ_POLL_ERR;
 		goto out;

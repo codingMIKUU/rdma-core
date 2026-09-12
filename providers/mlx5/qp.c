@@ -1269,7 +1269,7 @@ static int mlx5_srm_ensure_completion_space(struct mlx5_qp *qp)
 	new_ring = calloc(new_capacity, sizeof(*new_ring));
 	if (!new_ring)
 		return ENOMEM;
-	if (qp->srm_cq_dispatch) {
+	if (qp->srm_cq_dispatch || qp->srm_cq_direct) {
 		new_status = calloc(new_capacity, sizeof(*new_status));
 		if (!new_status) {
 			free(new_ring);
@@ -1344,12 +1344,12 @@ static inline void mlx5_srm_queue_completion(
 	marker->wr_id = wr_id;
 	marker->byte_len = mlx5_srm_wr_data_bytes(wr);
 	marker->opcode = mlx5_srm_wc_opcode(wr->opcode);
-	if (qp->srm_cq_dispatch)
+	if (qp->srm_cq_dispatch || qp->srm_cq_direct)
 		qp->srm_dispatch_ring[
 			head & (qp->srm_completion_capacity - 1)].dispatched = 0;
 	__atomic_store_n(&qp->srm_completion_head, head + 1,
 			 __ATOMIC_RELEASE);
-	if (!qp->srm_completion_queued) {
+	if (!qp->srm_cq_direct && !qp->srm_completion_queued) {
 		qp->srm_completion_next = NULL;
 		if (cq->srm_pending_tail)
 			cq->srm_pending_tail->srm_completion_next = qp;
@@ -2325,7 +2325,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		post_wq->cur_post += DIV_ROUND_UP(size * 16, MLX5_SEND_WQE_BB);
 		/* A dispatched event may be polled as soon as the token is visible.
 		 * Its immutable marker must already be linked into the CQ. */
-		if (srm_signaled && qp->srm_cq_dispatch)
+		if (srm_signaled && (qp->srm_cq_dispatch || qp->srm_cq_direct))
 			mlx5_srm_queue_completion(qp, post_ctrl, slot, wr_id, wr);
 		if (srm_fast)
 			srm_mark_wqe_ready(post_ctrl, post_publish_token,
@@ -2336,7 +2336,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 					       post_publish_token,
 					       post_publish_depth, post_wq,
 					       post_kernel_qpn, slot);
-		if (srm_signaled && !qp->srm_cq_dispatch)
+		if (srm_signaled && !qp->srm_cq_dispatch && !qp->srm_cq_direct)
 			mlx5_srm_queue_completion(qp, post_ctrl, slot, wr_id, wr);
 		if (phase_stats)
 		{

@@ -30,7 +30,7 @@ def main():
                  "struct ibv_wc")),
         (abi, ("struct mlx5_ib_burst_info", "struct mlx5_ib_modify_qp",
                "enum mlx5_ib_modify_qp_resp_mask", "struct mlx5_srm_sw_cqe",
-               "struct mlx5_srm_sw_cq")),
+               "struct mlx5_srm_sw_cq", "struct mlx5_srm_direct_cqe_meta")),
         (header, ("struct mlx5_sq_ctrl_page", "struct mlx5_srm_completion_marker",
                   "struct mlx5_srm_dispatch_status")),
     ):
@@ -38,13 +38,20 @@ def main():
                             for name in names)
     declarations.append(re.search(r"^#define MLX5_SRM_SW_CQ_MAX_DEPTH.*$", abi,
                                   re.MULTILINE).group())
+    declarations.append(re.search(r"^#define MLX5_SRM_DIRECT_CQE_SIZE.*$", abi,
+                                  re.MULTILINE).group())
+    for name in ("SHIFT", "MASK"):
+        declarations.append(re.search(r"^#define MLX5_SRM_DIRECT_INDEX_" + name +
+                                      r".*$", header, re.MULTILINE).group())
     functions = []
     for filename, names in (
         ("qp.c", ("mlx5_srm_wr_data_bytes", "mlx5_srm_wc_opcode",
                   "mlx5_srm_ensure_completion_space", "mlx5_srm_queue_completion")),
         ("cq.c", ("mlx5_srm_dispatch_event", "mlx5_srm_drain_dispatch",
+                  "mlx5_srm_direct_event", "mlx5_srm_poll_direct",
                   "mlx5_srm_poll_watermarks", "poll_cq")),
-        ("verbs.c", ("mlx5_srm_prepare_completion_cq", "mlx5_srm_record_cq_mode",
+        ("verbs.c", ("mlx5_srm_index_direct_qp", "mlx5_srm_free_direct_index",
+                     "mlx5_srm_prepare_completion_cq", "mlx5_srm_record_cq_mode",
                      "mlx5_srm_remove_pending_completion",
                      "mlx5_srm_detach_completion_cq")),
     ):
