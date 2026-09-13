@@ -1059,6 +1059,7 @@ static inline int mlx5_poll_one(struct mlx5_cq *cq,
 	return mlx5_parse_cqe(cq, cqe64, cqe, cur_rsc, cur_srq, wc, cqe_ver, 0);
 }
 
+#if MLX5_SRM_ENABLE_CQE_SIMPLIFY
 static inline int mlx5_srm_poll_watermarks(struct mlx5_cq *cq, int ne,
 					   struct ibv_wc *wc)
 {
@@ -1124,6 +1125,8 @@ static inline int mlx5_srm_poll_watermarks(struct mlx5_cq *cq, int ne,
 	return npolled;
 }
 
+#endif /* MLX5_SRM_ENABLE_CQE_SIMPLIFY */
+
 static inline int poll_cq(struct ibv_cq *ibcq, int ne,
 		      struct ibv_wc *wc, int cqe_ver)
 		      ALWAYS_INLINE;
@@ -1147,7 +1150,11 @@ static inline int poll_cq(struct ibv_cq *ibcq, int ne,
 	}
 
 	mlx5_spin_lock(&cq->lock);
+#if MLX5_SRM_ENABLE_CQE_SIMPLIFY
 	npolled = mlx5_srm_poll_watermarks(cq, ne, wc);
+#else
+	npolled = 0;
+#endif
 
 	for (; npolled < ne; ++npolled) {
 		err = mlx5_poll_one(cq, &rsc, &srq, wc + npolled, cqe_ver);

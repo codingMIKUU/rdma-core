@@ -3219,6 +3219,7 @@ static void mlx5_unlock_cqs(struct ibv_qp *qp)
 	}
 }
 
+#if MLX5_SRM_ENABLE_CQE_SIMPLIFY
 static void mlx5_srm_remove_pending_completion(struct mlx5_qp *qp)
 {
 	struct mlx5_cq *cq = qp->srm_completion_cq;
@@ -3247,6 +3248,8 @@ static void mlx5_srm_remove_pending_completion(struct mlx5_qp *qp)
 	mlx5_spin_unlock(&cq->lock);
 }
 
+#endif /* MLX5_SRM_ENABLE_CQE_SIMPLIFY */
+
 int mlx5_destroy_qp(struct ibv_qp *ibqp)
 {
 	struct mlx5_qp *qp = to_mqp(ibqp);
@@ -3270,7 +3273,9 @@ int mlx5_destroy_qp(struct ibv_qp *ibqp)
 			pthread_mutex_unlock(&ctx->qp_table_mutex);
 		return ret;
 	}
+#if MLX5_SRM_ENABLE_CQE_SIMPLIFY
 	mlx5_srm_remove_pending_completion(qp);
+#endif
 
 	if (qp->skip_kern_qp) {
 		if (!ctx->cqe_version)

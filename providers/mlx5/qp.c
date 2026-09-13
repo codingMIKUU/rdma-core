@@ -1208,6 +1208,7 @@ static inline uint32_t mlx5_srm_wr_data_bytes(const struct ibv_send_wr *wr)
 	return bytes > UINT32_MAX ? UINT32_MAX : (uint32_t)bytes;
 }
 
+#if MLX5_SRM_ENABLE_CQE_SIMPLIFY
 static inline enum ibv_wc_opcode
 mlx5_srm_wc_opcode(enum ibv_wr_opcode opcode)
 {
@@ -1261,6 +1262,8 @@ static inline void mlx5_srm_queue_completion(
 	qp->srm_completion_queued = 1;
 	mlx5_spin_unlock(&cq->lock);
 }
+
+#endif /* MLX5_SRM_ENABLE_CQE_SIMPLIFY */
 
 static inline int srm_reserve_wqe_blocking(struct mlx5_sq_ctrl_page *ctrl,
 					    uint32_t wqe_cnt,
@@ -1824,6 +1827,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			post_ctrl_slot_idx = qp->srm_large_sq_ctrl_slot_idx;
 			post_mapping = qp->srm_large_mapping;
 		}
+#if MLX5_SRM_ENABLE_CQE_SIMPLIFY
 		if (srm_fast && (wr->send_flags & IBV_SEND_SIGNALED) &&
 		    unlikely(mlx5_srm_completion_slot_busy(qp))) {
 			/* The fixed-window Hollow RC API keeps at most one signaled
@@ -1833,6 +1837,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 				*bad_wr = wr;
 			goto out;
 		}
+#endif
 
 		if (srm_fast) {
 			if (phase_stats) {
@@ -2219,8 +2224,10 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 					       post_publish_token,
 					       post_publish_depth, post_wq,
 					       post_kernel_qpn, slot);
+#if MLX5_SRM_ENABLE_CQE_SIMPLIFY
 		if (srm_fast && (wr->send_flags & IBV_SEND_SIGNALED))
 			mlx5_srm_queue_completion(qp, post_ctrl, slot, wr_id, wr);
+#endif
 		if (phase_stats)
 		{
 			post_publish_start = rdtsc();

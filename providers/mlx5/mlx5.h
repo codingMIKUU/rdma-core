@@ -524,6 +524,16 @@ _Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 512,
 #define MLX5_SRM_DB_OWNER_KERNEL 2U
 #define MLX5_SRM_CTRL_F_DIRECT_DB_STATS (1U << 0)
 
+/* Must match rdma-kerndriver's scheduler.h. This historical branch uses
+ * 0 = native kernel CQE delivery, 1 = per-KQP completion watermarks.
+ * Unlike the later MPI branch, there is no software-dispatch mode 2. */
+#ifndef MLX5_SRM_ENABLE_CQE_SIMPLIFY
+#define MLX5_SRM_ENABLE_CQE_SIMPLIFY 0
+#endif
+#if MLX5_SRM_ENABLE_CQE_SIMPLIFY != 0 && MLX5_SRM_ENABLE_CQE_SIMPLIFY != 1
+#error "MLX5_SRM_ENABLE_CQE_SIMPLIFY must be 0 or 1"
+#endif
+
 /* Must match MLX5_SRM_ENABLE_READY_FASTPATH in the kernel scheduler.h. */
 #define MLX5_SRM_ENABLE_READY_FASTPATH 0
 
@@ -622,9 +632,11 @@ struct mlx5_cq {
 	int				cached_opcode;
 	struct mlx5dv_clock_info	last_clock_info;
 	struct ibv_pd			*parent_domain;
+#if MLX5_SRM_ENABLE_CQE_SIMPLIFY
 	/* QPs waiting for a synthetic Hollow RC completion. */
 	struct mlx5_qp		       *srm_pending_head;
 	struct mlx5_qp		       *srm_pending_tail;
+#endif
 };
 
 struct mlx5_tag_entry {
@@ -876,6 +888,7 @@ struct mlx5_qp {
 	uint8_t hollow_rc;
 	uint8_t srm_fast_ready;
 	uint8_t srm_large_fast_ready;
+#if MLX5_SRM_ENABLE_CQE_SIMPLIFY
 	struct mlx5_cq *srm_completion_cq;
 	struct mlx5_qp *srm_completion_next;
 	struct mlx5_sq_ctrl_page *srm_completion_ctrl;
@@ -885,6 +898,7 @@ struct mlx5_qp {
 	enum ibv_wc_opcode srm_completion_opcode;
 	uint8_t srm_completion_pending;
 	uint8_t srm_completion_queued;
+#endif
 	uint32_t srm_num_level;
 	uint32_t srm_num_sched;
 	uint32_t srm_max_xrc_qp_per_srm;
