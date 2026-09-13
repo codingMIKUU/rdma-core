@@ -474,6 +474,23 @@ struct mlx5_pd {
 	};
 };
 
+/* Match scheduler.h; the reserved control-slot layout stays 512 bytes. */
+#ifndef MLX5_SRM_ENABLE_DB_SHARE_STATS
+#define MLX5_SRM_ENABLE_DB_SHARE_STATS 0
+#endif
+
+struct mlx5_srm_db_share {
+	uint32_t seq;
+	uint32_t reserved;
+	uint64_t user_calls;
+	uint64_t user_wqes;
+	uint64_t kernel_calls;
+	uint64_t kernel_wqes;
+	uint8_t pad[24];
+};
+_Static_assert(sizeof(struct mlx5_srm_db_share) == 64,
+	       "DB share counters must occupy one reserved cacheline");
+
 struct mlx5_sq_ctrl_page {
 	uint64_t resv_idx;
 	uint64_t ready_idx;
@@ -514,7 +531,8 @@ struct mlx5_sq_ctrl_page {
 	uint64_t latest_hot_hint;
 	uint8_t hot_hint_pad[56];
 	/* A power-of-two stride keeps every control slot within one mmap page. */
-	uint8_t slot_pad[192];
+	struct mlx5_srm_db_share db_share;
+	uint8_t slot_pad[128];
 } __attribute__((aligned(64)));
 _Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 512,
 	       "hollow RC ctrl ABI must occupy eight cachelines");
@@ -523,6 +541,34 @@ _Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 512,
 #define MLX5_SRM_DB_OWNER_USER   1U
 #define MLX5_SRM_DB_OWNER_KERNEL 2U
 #define MLX5_SRM_CTRL_F_DIRECT_DB_STATS (1U << 0)
+#define MLX5_SRM_CTRL_F_DB_SHARE_STATS (1U << 1)
+
+#if MLX5_SRM_ENABLE_DB_SHARE_STATS
+/* Called only after an actual DB, while holding this KQP's db_owner.
+ * All producers and the kernel already serialize through that owner, so
+ * counter updates need no additional lock or atomic read-modify-write.
+ * seq lets the diagnostic reader reject an overlapping update. */
+static inline void mlx5_srm_record_user_db_share(
+	struct mlx5_sq_ctrl_page *ctrl, uint32_t sent)
+{
+	struct mlx5_srm_db_share *share = &ctrl->db_share;
+	uint32_t seq;
+
+	if (!(__atomic_load_n(&ctrl->flags, __ATOMIC_RELAXED) &
+	      MLX5_SRM_CTRL_F_DB_SHARE_STATS))
+		return;
+	seq = __atomic_load_n(&share->seq, __ATOMIC_RELAXED);
+	__atomic_store_n(&share->seq, seq + 1, __ATOMIC_RELAXED);
+	__atomic_thread_fence(__ATOMIC_RELEASE);
+	__atomic_store_n(&share->user_calls,
+		__atomic_load_n(&share->user_calls, __ATOMIC_RELAXED) + 1,
+		__ATOMIC_RELAXED);
+	__atomic_store_n(&share->user_wqes,
+		__atomic_load_n(&share->user_wqes, __ATOMIC_RELAXED) + sent,
+		__ATOMIC_RELAXED);
+	__atomic_store_n(&share->seq, seq + 2, __ATOMIC_RELEASE);
+}
+#endif
 
 /* Must match rdma-kerndriver's scheduler.h. This historical branch uses
  * 0 = native kernel CQE delivery, 1 = per-KQP completion watermarks.

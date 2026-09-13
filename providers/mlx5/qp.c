@@ -1656,6 +1656,9 @@ static inline void srm_try_direct_user_db(
 	srm_direct_ring_db(mapping, ctrl_page,
 			   require_full_prefix ? target_tail : tail + sent,
 			   last_ctrl);
+#if MLX5_SRM_ENABLE_DB_SHARE_STATS
+	mlx5_srm_record_user_db_share(ctrl_page, sent);
+#endif
 	__atomic_store_n(&ctrl_page->db_tail,
 			 require_full_prefix ? target_tail : tail + sent,
 			 __ATOMIC_RELEASE);
