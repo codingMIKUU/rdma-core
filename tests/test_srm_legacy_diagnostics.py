@@ -62,6 +62,8 @@ typedef uint64_t __u64;
 typedef uint32_t __u32;
 typedef uint8_t __u8;
 typedef uint64_t atomic64_t;
+#define U64_MAX UINT64_MAX
+static unsigned fls64(uint64_t x) { return x ? 64 - __builtin_clzll(x) : 0; }
 #define READ_ONCE(x) __atomic_load_n(&(x), __ATOMIC_RELAXED)
 #define WRITE_ONCE(x,v) __atomic_store_n(&(x),(v), __ATOMIC_RELAXED)
 #define smp_load_acquire(p) __atomic_load_n((p), __ATOMIC_ACQUIRE)
@@ -84,7 +86,10 @@ static u64 div64_u64_rem(u64 a, u64 b, u64 *r) { *r = a % b; return a / b; }
         result_type = ("bool" if name == "mlx5_srm_read_db_share" else
                        "u64" if name == "mlx5_srm_diag_ratio" else "void")
         defs += "static " + result_type + " " + function(source, name) + "\n"
-    defs += declaration(sc, "mlx5_srm_cqe_cycle_stats") + r'''
+    defs += declaration(sc, "mlx5_srm_cqe_cycle_stats") + "\n"
+    defs += "static void " + function(sc, "mlx5_srm_cqe_hist_add") + "\n"
+    defs += "static u64 " + function(sc, "mlx5_srm_cqe_p99_upper") + "\n"
+    defs += r'''
 struct mlx5_srm_cq_workspace { struct mlx5_srm_cqe_cycle_stats cqe_cycles; };
 struct mlx5_ib_sched;
 struct mlx5_qp_ctrl_pool;
@@ -178,9 +183,32 @@ int main(void) {
         assert(workspace.cqe_cycles.cqes == 48);
         assert(workspace.cqe_cycles.active_cycles == 4000);
         assert(workspace.cqe_cycles.nonpositive_cycles == 400);
+        assert(mlx5_srm_cqe_p99_upper(&workspace.cqe_cycles) == 127);
         assert(mlx5_srm_diag_ratio(workspace.cqe_cycles.active_cycles,
                                   workspace.cqe_cycles.cqes, 1) == 83);
         puts("PASS: production CQ wrapper: hardware-CQE denominator, empty/skip separation, return values");
+    }
+    {
+        struct mlx5_srm_cqe_cycle_stats h = {0};
+        assert(mlx5_srm_cqe_p99_upper(&h) == 0);
+        mlx5_srm_cqe_hist_add(&h, 99 * 10, 99);
+        mlx5_srm_cqe_hist_add(&h, 1000, 1);
+        h.cqes = 100;
+        assert(mlx5_srm_cqe_p99_upper(&h) == 10);
+        mlx5_srm_cqe_hist_add(&h, 1000, 1);
+        h.cqes++;
+        assert(mlx5_srm_cqe_p99_upper(&h) == 1023);
+        uint64_t values[] = {0, 1, 7, 8, 15, 16, 31, 32, 205, 283,
+                             UINT64_C(1) << 63, UINT64_MAX};
+        for (unsigned i = 0; i < sizeof(values)/sizeof(values[0]); i++) {
+            memset(&h, 0, sizeof(h));
+            mlx5_srm_cqe_hist_add(&h, values[i], 1);
+            h.cqes = 1;
+            uint64_t upper = mlx5_srm_cqe_p99_upper(&h);
+            assert(upper >= values[i]);
+            assert(upper - values[i] <= values[i] / 8);
+        }
+        puts("PASS: CQE-weighted nearest-rank P99, bucket boundaries and u64 extremes");
     }
 }
 '''

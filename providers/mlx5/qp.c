@@ -39,6 +39,7 @@
 #include <errno.h>
 #include <stdio.h>
 #include <time.h>
+#include <unistd.h>
 #include <util/mmio.h>
 #include <util/compiler.h>
 
@@ -76,6 +77,141 @@ static inline uint64_t rdtsc() {
   __asm__ __volatile__("rdtsc" : "=a"(lo), "=d"(hi));
   return ((uint64_t)hi << 32) | lo;
 }
+
+#if MLX5_SRM_ENABLE_WQE_TIMING
+struct mlx5_srm_wqe_timing_stats {
+	uint64_t cqe_wqes;
+	uint64_t post_to_cqe_cycles;
+	uint64_t missing_timestamps;
+	uint64_t invalid_timestamps;
+	uint64_t error_wqes;
+	uint32_t report_check_wqes;
+};
+
+static __thread struct mlx5_srm_wqe_timing_stats srm_wqe_timing_stats;
+
+static inline uint64_t mlx5_srm_timing_rdtsc(void)
+{
+	unsigned int lo, hi;
+
+	__asm__ __volatile__("lfence\n\trdtsc" : "=a"(lo), "=d"(hi) :: "memory");
+	return ((uint64_t)hi << 32) | lo;
+}
+
+static inline struct mlx5_srm_wqe_timestamp *
+mlx5_srm_timestamp_array(uint64_t *publish, uint32_t depth)
+{
+	return (void *)((char *)publish + MLX5_SRM_TIMING_OFFSET(depth));
+}
+
+
+void mlx5_srm_timing_complete(uint64_t post_tsc_sum, uint32_t wqes,
+			       enum ibv_wc_status status)
+{
+	struct mlx5_srm_wqe_timing_stats *stats = &srm_wqe_timing_stats;
+	uint64_t now_tsc = mlx5_srm_timing_rdtsc();
+	uint64_t elapsed = now_tsc * wqes - post_tsc_sum;
+
+	if (status != IBV_WC_SUCCESS) {
+		stats->error_wqes += wqes ? wqes : 1;
+	} else if (wqes && (int64_t)elapsed < 0) {
+		stats->invalid_timestamps += wqes;
+	} else if (wqes) {
+		stats->cqe_wqes += wqes;
+		stats->post_to_cqe_cycles += elapsed;
+	} else {
+		stats->missing_timestamps++;
+	}
+	stats->report_check_wqes += wqes ? wqes : 1;
+	if (stats->report_check_wqes < MLX5_SRM_TIMING_REPORT_WQES)
+		return;
+
+	fprintf(stderr,
+		"SRM_WQE_TIMING algorithm=qpswitch pid=%d thread=%lu cqe_wqes=%llu post_to_cqe_cycles=%llu post_to_cqe_avg_cycles=%.2f missing_timestamps=%llu invalid_timestamps=%llu error_wqes=%llu\n",
+		getpid(), (unsigned long)pthread_self(),
+		(unsigned long long)stats->cqe_wqes,
+		(unsigned long long)stats->post_to_cqe_cycles,
+		stats->cqe_wqes ?
+			(double)stats->post_to_cqe_cycles / stats->cqe_wqes : 0.0,
+		(unsigned long long)stats->missing_timestamps,
+		(unsigned long long)stats->invalid_timestamps,
+		(unsigned long long)stats->error_wqes);
+	memset(stats, 0, sizeof(*stats));
+}
+#endif
+
+#if MLX5_SRM_ENABLE_WQE_TIMING
+/* Called before reserving a physical slot: ENOMEM must not leave a SQ hole. */
+static int mlx5_srm_timing_prepare(struct mlx5_qp *qp, struct mlx5_wq *wq)
+{
+	struct mlx5_cq *cq = to_mcq(qp->ibv_qp->send_cq);
+	struct mlx5_srm_timing_entry *entries;
+	uint32_t capacity, i;
+	int ret = 0;
+
+	mlx5_spin_lock(&cq->lock);
+	if (wq->srm_timing_count < wq->srm_timing_capacity)
+		goto out;
+	if (wq->srm_timing_capacity > UINT32_MAX / 2) {
+		ret = ENOMEM;
+		goto out;
+	}
+	capacity = wq->srm_timing_capacity ? wq->srm_timing_capacity * 2 : 16;
+	entries = calloc(capacity, sizeof(*entries));
+	if (!entries) {
+		ret = ENOMEM;
+		goto out;
+	}
+	for (i = 0; i < wq->srm_timing_count; i++)
+		entries[i] = wq->srm_timing_entries[
+			(wq->srm_timing_head + i) & (wq->srm_timing_capacity - 1)];
+	free(wq->srm_timing_entries);
+	wq->srm_timing_entries = entries;
+	wq->srm_timing_capacity = capacity;
+	wq->srm_timing_head = 0;
+out:
+	mlx5_spin_unlock(&cq->lock);
+	return ret;
+}
+
+static void mlx5_srm_timing_publish(struct mlx5_qp *qp, struct mlx5_wq *wq,
+				    uint64_t slot, uint64_t start)
+{
+	struct mlx5_cq *cq = to_mcq(qp->ibv_qp->send_cq);
+	uint32_t index;
+
+	mlx5_spin_lock(&cq->lock);
+	index = (wq->srm_timing_head + wq->srm_timing_count) &
+		(wq->srm_timing_capacity - 1);
+	wq->srm_timing_entries[index].slot = slot;
+	wq->srm_timing_entries[index].post_tsc = start;
+	wq->srm_timing_count++;
+	mlx5_spin_unlock(&cq->lock);
+}
+
+/* CQ lock held. Consume the logical WR prefix through the returned counter;
+ * other logical QPs' physical slots are not part of this queue. */
+void mlx5_srm_timing_complete_wq(struct mlx5_wq *wq, uint16_t counter,
+				 enum ibv_wc_status status)
+{
+	uint64_t sum = 0;
+	uint32_t n;
+
+	for (n = 0; n < wq->srm_timing_count; n++) {
+		struct mlx5_srm_timing_entry *entry = &wq->srm_timing_entries[
+			(wq->srm_timing_head + n) & (wq->srm_timing_capacity - 1)];
+		sum += entry->post_tsc;
+		if ((uint16_t)entry->slot == counter) {
+			wq->srm_timing_head = (wq->srm_timing_head + n + 1) &
+				(wq->srm_timing_capacity - 1);
+			wq->srm_timing_count -= n + 1;
+			mlx5_srm_timing_complete(sum, n + 1, status);
+			return;
+		}
+	}
+	mlx5_srm_timing_complete(0, 0, status);
+}
+#endif
 
 static inline uint64_t srm_monotonic_ns(void);
 
@@ -1239,7 +1375,11 @@ static inline int mlx5_srm_completion_slot_busy(struct mlx5_qp *qp)
 
 static inline void mlx5_srm_queue_completion(
 	struct mlx5_qp *qp, struct mlx5_sq_ctrl_page *ctrl, uint64_t slot,
-	uint64_t wr_id, const struct ibv_send_wr *wr)
+	uint64_t wr_id, const struct ibv_send_wr *wr
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	, struct mlx5_wq *timing_wq
+#endif
+	)
 {
 	struct mlx5_cq *cq = to_mcq(qp->ibv_qp->send_cq);
 
@@ -1248,6 +1388,9 @@ static inline void mlx5_srm_queue_completion(
 	 * rejects a second signaled marker until this one has been polled. */
 	qp->srm_completion_cq = cq;
 	qp->srm_completion_ctrl = ctrl;
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	qp->srm_completion_timing_wq = timing_wq;
+#endif
 	qp->srm_completion_idx = slot;
 	qp->srm_completion_wr_id = wr_id;
 	qp->srm_completion_byte_len = mlx5_srm_wr_data_bytes(wr);
@@ -1742,7 +1885,11 @@ void print_wqe_info(void *seg, size_t size) {
 
 
 static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
-				  struct ibv_send_wr **bad_wr)
+				  struct ibv_send_wr **bad_wr
+#if MLX5_SRM_ENABLE_WQE_TIMING
+				  , uint64_t wqe_timing_start
+#endif
+				  )
 {
 	struct mlx5_qp *qp = to_mqp(ibqp);
 	void *seg;
@@ -1843,6 +1990,14 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 #endif
 
 		if (srm_fast) {
+#if MLX5_SRM_ENABLE_WQE_TIMING
+			err = mlx5_srm_timing_prepare(qp, post_wq);
+			if (err) {
+				if (bad_wr)
+					*bad_wr = wr;
+				goto out;
+			}
+#endif
 			if (phase_stats) {
 				reserve_start = rdtsc();
 				srm_reserve_stats.pre_reserve_cycles +=
@@ -2218,6 +2373,19 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		else
 			qp->sq.wqe_head[idx] = qp->sq.head + nreq;
 		post_wq->cur_post += DIV_ROUND_UP(size * 16, MLX5_SEND_WQE_BB);
+#if MLX5_SRM_ENABLE_WQE_TIMING
+		if (srm_fast) {
+			struct mlx5_srm_wqe_timestamp *entry =
+				&mlx5_srm_timestamp_array(post_publish_token,
+							 post_publish_depth)
+				 [slot & (post_publish_depth - 1)];
+			/* Both timing stores precede the existing ready-token release. */
+			__atomic_store_n(&entry->post_tsc, wqe_timing_start,
+					 __ATOMIC_RELAXED);
+			__atomic_store_n(&entry->sequence, slot + 1, __ATOMIC_RELEASE);
+			mlx5_srm_timing_publish(qp, post_wq, slot, wqe_timing_start);
+		}
+#endif
 		if (srm_fast)
 			srm_mark_wqe_ready(post_ctrl, post_publish_token,
 					   post_publish_depth,
@@ -2229,7 +2397,11 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 					       post_kernel_qpn, slot);
 #if MLX5_SRM_ENABLE_CQE_SIMPLIFY
 		if (srm_fast && (wr->send_flags & IBV_SEND_SIGNALED))
-			mlx5_srm_queue_completion(qp, post_ctrl, slot, wr_id, wr);
+			mlx5_srm_queue_completion(qp, post_ctrl, slot, wr_id, wr
+#if MLX5_SRM_ENABLE_WQE_TIMING
+						  , post_wq
+#endif
+						  );
 #endif
 		if (phase_stats)
 		{
@@ -2298,6 +2470,10 @@ int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		   struct ibv_send_wr **bad_wr)
 {
 	struct mlx5_qp *mqp = to_mqp(ibqp);
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	uint64_t timing_start = mqp->hollow_rc && mqp->sender_side ?
+		mlx5_srm_timing_rdtsc() : 0;
+#endif
 	int ret;
 #ifdef MW_DEBUG
 	if (wr->opcode == IBV_WR_BIND_MW) {
@@ -2319,7 +2495,11 @@ int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		return EINVAL;
 	}
 	if (ibqp->qp_type == IBV_QPT_RC) {
-		ret = _mlx5_post_send(ibqp, wr, bad_wr);
+		ret = _mlx5_post_send(ibqp, wr, bad_wr
+#if MLX5_SRM_ENABLE_WQE_TIMING
+				      , timing_start
+#endif
+				      );
 		if (ret)
 			return ret;
 			
@@ -2420,7 +2600,11 @@ int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		return 0;
 	}
 
-	return _mlx5_post_send(ibqp, wr, bad_wr);
+	return _mlx5_post_send(ibqp, wr, bad_wr
+#if MLX5_SRM_ENABLE_WQE_TIMING
+			       , timing_start
+#endif
+			       );
 }
 
 enum {
@@ -4968,7 +5152,11 @@ int mlx5_bind_mw(struct ibv_qp *qp, struct ibv_mw *mw,
 	wr.bind_mw.mw = mw;
 	wr.bind_mw.rkey = ibv_inc_rkey(mw->rkey);
 
-	ret = _mlx5_post_send(qp, &wr, &bad_wr);
+	ret = _mlx5_post_send(qp, &wr, &bad_wr
+#if MLX5_SRM_ENABLE_WQE_TIMING
+			      , 0
+#endif
+			      );
 	if (ret)
 		return ret;
 

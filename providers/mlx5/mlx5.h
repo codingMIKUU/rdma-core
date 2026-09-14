@@ -476,7 +476,7 @@ struct mlx5_pd {
 
 /* Match scheduler.h; the reserved control-slot layout stays 512 bytes. */
 #ifndef MLX5_SRM_ENABLE_DB_SHARE_STATS
-#define MLX5_SRM_ENABLE_DB_SHARE_STATS 0
+#define MLX5_SRM_ENABLE_DB_SHARE_STATS 1
 #endif
 
 struct mlx5_srm_db_share {
@@ -543,6 +543,33 @@ _Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 512,
 #define MLX5_SRM_CTRL_F_DIRECT_DB_STATS (1U << 0)
 #define MLX5_SRM_CTRL_F_DB_SHARE_STATS (1U << 1)
 
+/* Match both driver builds. Off: no timestamp storage or hot-path hooks. */
+#ifndef MLX5_SRM_ENABLE_WQE_TIMING
+#define MLX5_SRM_ENABLE_WQE_TIMING 0
+#endif
+#if MLX5_SRM_ENABLE_WQE_TIMING != 0 && MLX5_SRM_ENABLE_WQE_TIMING != 1
+#error "MLX5_SRM_ENABLE_WQE_TIMING must be 0 or 1"
+#endif
+#define MLX5_SRM_TIMING_REPORT_WQES 1000000U
+/* Bit 1 belongs to DB_SHARE_STATS in this branch; do not reuse it. */
+#define MLX5_SRM_CTRL_F_WQE_TIMING (1U << 2)
+
+struct mlx5_srm_wqe_timestamp {
+    uint64_t post_tsc;
+    uint64_t sequence;
+};
+#if MLX5_SRM_ENABLE_WQE_TIMING
+struct mlx5_srm_timing_entry {
+    uint64_t slot;
+    uint64_t post_tsc;
+};
+#endif
+#define MLX5_SRM_TIMING_OFFSET(depth) \
+    (((size_t)(depth) * sizeof(uint64_t) + 15U) & ~(size_t)15U)
+#define MLX5_SRM_TIMING_MAP_BYTES(depth) \
+    (MLX5_SRM_TIMING_OFFSET(depth) + \
+     (size_t)(depth) * sizeof(struct mlx5_srm_wqe_timestamp))
+
 #if MLX5_SRM_ENABLE_DB_SHARE_STATS
 /* Called only after an actual DB, while holding this KQP's db_owner.
  * All producers and the kernel already serialize through that owner, so
@@ -574,7 +601,7 @@ static inline void mlx5_srm_record_user_db_share(
  * 0 = native kernel CQE delivery, 1 = per-KQP completion watermarks.
  * Unlike the later MPI branch, there is no software-dispatch mode 2. */
 #ifndef MLX5_SRM_ENABLE_CQE_SIMPLIFY
-#define MLX5_SRM_ENABLE_CQE_SIMPLIFY 0
+#define MLX5_SRM_ENABLE_CQE_SIMPLIFY 1
 #endif
 #if MLX5_SRM_ENABLE_CQE_SIMPLIFY != 0 && MLX5_SRM_ENABLE_CQE_SIMPLIFY != 1
 #error "MLX5_SRM_ENABLE_CQE_SIMPLIFY must be 0 or 1"
@@ -752,6 +779,12 @@ struct wr_list {
 };
 
 struct mlx5_wq {
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	/* Per-logical-QP timestamps, not recycled with the shared physical SQ.
+	 * Protected by send CQ lock; storage grows only as outstanding increases. */
+	struct mlx5_srm_timing_entry *srm_timing_entries;
+	uint32_t srm_timing_capacity, srm_timing_head, srm_timing_count;
+#endif
 	uint64_t		       *wrid;
 	unsigned		       *wqe_head;
 	struct mlx5_spinlock		lock;
@@ -938,6 +971,9 @@ struct mlx5_qp {
 	struct mlx5_cq *srm_completion_cq;
 	struct mlx5_qp *srm_completion_next;
 	struct mlx5_sq_ctrl_page *srm_completion_ctrl;
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	struct mlx5_wq *srm_completion_timing_wq;
+#endif
 	uint64_t srm_completion_idx;
 	uint64_t srm_completion_wr_id;
 	uint32_t srm_completion_byte_len;
@@ -1450,6 +1486,10 @@ int mlx5_modify_qp_drain_sigerr(struct ibv_qp *qp);
 int mlx5_destroy_qp(struct ibv_qp *qp);
 void mlx5_init_qp_indices(struct mlx5_qp *qp);
 void mlx5_init_rwq_indices(struct mlx5_rwq *rwq);
+#if MLX5_SRM_ENABLE_WQE_TIMING
+void mlx5_srm_timing_complete_wq(struct mlx5_wq *wq, uint16_t counter,
+				 enum ibv_wc_status status);
+#endif
 int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			  struct ibv_send_wr **bad_wr);
 int mlx5_srm_add_tot_recv_cqes(struct ibv_qp *qp, uint64_t cqes);

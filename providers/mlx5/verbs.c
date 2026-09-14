@@ -3328,6 +3328,10 @@ free:
 		atomic_fetch_sub(&mparent_domain->mpd.refcount, 1);
 
 	mlx5_put_qp_uar(ctx, qp->bf);
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	free(qp->sq.srm_timing_entries);
+	free(qp->srm_large_sq.srm_timing_entries);
+#endif
 	free(qp);
 
 	return 0;
@@ -3563,6 +3567,23 @@ void mlx5_srm_release_mappings(struct mlx5_context *ctx)
 
 #define MLX5_SRM_ENABLE_LARGE_KERNEL_QP 0
 
+static int mlx5_srm_check_timing_mapping(struct mlx5_sq_ctrl_page *ctrl,
+				       uint32_t depth, size_t mapped_bytes)
+{
+	bool kernel_timing = __atomic_load_n(&ctrl->flags, __ATOMIC_ACQUIRE) &
+		MLX5_SRM_CTRL_F_WQE_TIMING;
+
+	if (kernel_timing != !!MLX5_SRM_ENABLE_WQE_TIMING ||
+	    (kernel_timing && mapped_bytes < MLX5_SRM_TIMING_MAP_BYTES(depth))) {
+		fprintf(stderr,
+			"Hollow WQE timing mismatch: provider=%d kernel=%d publish_bytes=%zu depth=%u; rebuild rdma-core and kernel with matching MLX5_SRM_ENABLE_WQE_TIMING\n",
+			MLX5_SRM_ENABLE_WQE_TIMING, kernel_timing,
+			mapped_bytes, depth);
+		return EPROTO;
+	}
+	return 0;
+}
+
 static int mlx5_srm_acquire_mapping(struct mlx5_context *ctx,
 				    struct mlx5_qp *qp,
 				    const struct mlx5_ib_modify_qp_resp *resp)
@@ -3643,6 +3664,12 @@ static int mlx5_srm_acquire_mapping(struct mlx5_context *ctx,
 		errno = EPROTO;
 		goto err_unlock;
 	}
+
+	errno = mlx5_srm_check_timing_mapping(
+		&((struct mlx5_sq_ctrl_page *)ctx->srm_ctrl_map)[resp->sq_state_slot_idx],
+		resp->publish_depth, resp->publish_mmap_len);
+	if (errno)
+		goto err_unlock;
 
 	sq_map = mmap(NULL, resp->sq_mmap_len, PROT_READ | PROT_WRITE,
 		      MAP_SHARED, ctx->ibv_ctx.context.cmd_fd,
@@ -3796,6 +3823,12 @@ static int mlx5_srm_acquire_large_mapping(struct mlx5_context *ctx,
 		errno = EPROTO;
 		goto err_unlock;
 	}
+
+	errno = mlx5_srm_check_timing_mapping(
+		&((struct mlx5_sq_ctrl_page *)ctx->srm_ctrl_map)[resp->large_sq_state_slot_idx],
+		resp->large_publish_depth, resp->large_publish_mmap_len);
+	if (errno)
+		goto err_unlock;
 
 	sq_map = mmap(NULL, resp->large_sq_mmap_len, PROT_READ | PROT_WRITE,
 		      MAP_SHARED, ctx->ibv_ctx.context.cmd_fd,

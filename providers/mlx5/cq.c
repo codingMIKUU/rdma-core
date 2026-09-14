@@ -855,6 +855,10 @@ again:
 		}
 
 		wq->tail = mqp->hollow_rc ? wqe_ctr + 1 : wq->wqe_head[idx] + 1;
+#if MLX5_SRM_ENABLE_WQE_TIMING
+		if (mqp->hollow_rc && mqp->sender_side)
+			mlx5_srm_timing_complete_wq(wq, wqe_ctr, err);
+#endif
 		break;
 	}
 	case MLX5_CQE_RESP_WR_IMM:
@@ -972,6 +976,14 @@ again:
 			else
 				wc->wr_id = wq->wrid[idx];
 			wq->tail = wq->wqe_head[idx] + 1;
+#if MLX5_SRM_ENABLE_WQE_TIMING
+			if (mqp->hollow_rc && mqp->sender_side)
+				mlx5_srm_timing_complete_wq(
+					mqp->srm_large_kernel_qpn_valid &&
+					qpn == mqp->srm_large_kernel_qpn ?
+					&mqp->srm_large_sq : wq, wqe_ctr,
+					lazy ? cq->verbs_cq.cq_ex.status : wc->status);
+#endif
 		} else {
 			err = get_cur_rsc(mctx, cqe_ver, qpn, srqn_uidx,
 					  cur_rsc, cur_srq, &is_srq);
@@ -1113,6 +1125,10 @@ static inline int mlx5_srm_poll_watermarks(struct mlx5_cq *cq, int ne,
 				} else {
 					cur->status = IBV_WC_SUCCESS;
 				}
+#if MLX5_SRM_ENABLE_WQE_TIMING
+				mlx5_srm_timing_complete_wq(qp->srm_completion_timing_wq,
+					(uint16_t)qp->srm_completion_idx, cur->status);
+#endif
 				__atomic_store_n(&qp->srm_completion_pending, 0,
 						 __ATOMIC_RELEASE);
 			}
