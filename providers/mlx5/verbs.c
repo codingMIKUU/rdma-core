@@ -2197,6 +2197,12 @@ static void mlx5_free_qp_wrid(struct mlx5_qp *qp)
 	qp->sq.wr_data = NULL;
 	free(qp->sq.wrid);
 	qp->sq.wrid = NULL;
+#if MLX5_RC_ENABLE_TIMING
+	free(qp->sq.rc_timing_entries);
+	qp->sq.rc_timing_entries = NULL;
+	free(qp->srm_large_sq.rc_timing_entries);
+	qp->srm_large_sq.rc_timing_entries = NULL;
+#endif
 	qp->sq_metadata_cnt = 0;
 }
 
@@ -2207,6 +2213,9 @@ static int mlx5_resize_wq_metadata(struct mlx5_wq *wq,
 	uint64_t *wrid;
 	uint32_t *wr_data;
 	unsigned int *wqe_head;
+#if MLX5_RC_ENABLE_TIMING
+	struct mlx5_rc_timing_entry *rc_timing_entries;
+#endif
 
 	if (*metadata_cnt == wqe_cnt)
 		return 0;
@@ -2214,10 +2223,20 @@ static int mlx5_resize_wq_metadata(struct mlx5_wq *wq,
 	wrid = calloc(wqe_cnt, sizeof(*wrid));
 	wr_data = calloc(wqe_cnt, sizeof(*wr_data));
 	wqe_head = calloc(wqe_cnt, sizeof(*wqe_head));
-	if (!wrid || !wr_data || !wqe_head) {
+#if MLX5_RC_ENABLE_TIMING
+	rc_timing_entries = calloc(wqe_cnt, sizeof(*rc_timing_entries));
+#endif
+	if (!wrid || !wr_data || !wqe_head
+#if MLX5_RC_ENABLE_TIMING
+	    || !rc_timing_entries
+#endif
+	    ) {
 		free(wrid);
 		free(wr_data);
 		free(wqe_head);
+#if MLX5_RC_ENABLE_TIMING
+		free(rc_timing_entries);
+#endif
 		errno = ENOMEM;
 		return -1;
 	}
@@ -2225,9 +2244,15 @@ static int mlx5_resize_wq_metadata(struct mlx5_wq *wq,
 	free(wq->wrid);
 	free(wq->wr_data);
 	free(wq->wqe_head);
+#if MLX5_RC_ENABLE_TIMING
+	free(wq->rc_timing_entries);
+#endif
 	wq->wrid = wrid;
 	wq->wr_data = wr_data;
 	wq->wqe_head = wqe_head;
+#if MLX5_RC_ENABLE_TIMING
+	wq->rc_timing_entries = rc_timing_entries;
+#endif
 	*metadata_cnt = wqe_cnt;
 	return 0;
 }

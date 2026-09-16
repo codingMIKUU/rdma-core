@@ -476,7 +476,7 @@ struct mlx5_pd {
 
 /* Match scheduler.h; the reserved control-slot layout stays 512 bytes. */
 #ifndef MLX5_SRM_ENABLE_DB_SHARE_STATS
-#define MLX5_SRM_ENABLE_DB_SHARE_STATS 1
+#define MLX5_SRM_ENABLE_DB_SHARE_STATS 0
 #endif
 
 struct mlx5_srm_db_share {
@@ -557,11 +557,14 @@ _Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 512,
 struct mlx5_srm_wqe_timestamp {
     uint64_t post_tsc;
     uint64_t sequence;
+    uint64_t kernel_cqe_tsc;
+    uint64_t kernel_cqe_sequence;
 };
 #if MLX5_SRM_ENABLE_WQE_TIMING
 struct mlx5_srm_timing_entry {
     uint64_t slot;
     uint64_t post_tsc;
+    struct mlx5_srm_wqe_timestamp *shared_timestamp;
 };
 #endif
 #define MLX5_SRM_TIMING_OFFSET(depth) \
@@ -569,6 +572,21 @@ struct mlx5_srm_timing_entry {
 #define MLX5_SRM_TIMING_MAP_BYTES(depth) \
     (MLX5_SRM_TIMING_OFFSET(depth) + \
      (size_t)(depth) * sizeof(struct mlx5_srm_wqe_timestamp))
+
+/* Ordinary RC-only provider timing.  Off removes all data-path hooks. */
+#ifndef MLX5_RC_ENABLE_TIMING
+#define MLX5_RC_ENABLE_TIMING 1
+#endif
+#if MLX5_RC_ENABLE_TIMING != 0 && MLX5_RC_ENABLE_TIMING != 1
+#error "MLX5_RC_ENABLE_TIMING must be 0 or 1"
+#endif
+#define MLX5_RC_TIMING_REPORT_CQES 1000000U
+#if MLX5_RC_ENABLE_TIMING
+struct mlx5_rc_timing_entry {
+	uint64_t post_tsc;
+	uint64_t sequence;
+};
+#endif
 
 #if MLX5_SRM_ENABLE_DB_SHARE_STATS
 /* Called only after an actual DB, while holding this KQP's db_owner.
@@ -705,6 +723,10 @@ struct mlx5_cq {
 	int				cached_opcode;
 	struct mlx5dv_clock_info	last_clock_info;
 	struct ibv_pd			*parent_domain;
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	/* Once set, include empty and non-empty polls on this Hollow send CQ. */
+	uint8_t				srm_timing_enabled;
+#endif
 #if MLX5_SRM_ENABLE_CQE_SIMPLIFY
 	/* QPs waiting for a synthetic Hollow RC completion. */
 	struct mlx5_qp		       *srm_pending_head;
@@ -784,6 +806,9 @@ struct mlx5_wq {
 	 * Protected by send CQ lock; storage grows only as outstanding increases. */
 	struct mlx5_srm_timing_entry *srm_timing_entries;
 	uint32_t srm_timing_capacity, srm_timing_head, srm_timing_count;
+#endif
+#if MLX5_RC_ENABLE_TIMING
+	struct mlx5_rc_timing_entry *rc_timing_entries;
 #endif
 	uint64_t		       *wrid;
 	unsigned		       *wqe_head;
@@ -1489,6 +1514,14 @@ void mlx5_init_rwq_indices(struct mlx5_rwq *rwq);
 #if MLX5_SRM_ENABLE_WQE_TIMING
 void mlx5_srm_timing_complete_wq(struct mlx5_wq *wq, uint16_t counter,
 				 enum ibv_wc_status status);
+void mlx5_srm_timing_poll_begin(struct mlx5_cq *cq);
+void mlx5_srm_timing_poll_end(void);
+#endif
+#if MLX5_RC_ENABLE_TIMING
+void mlx5_rc_timing_complete_wq(struct mlx5_wq *wq, uint16_t counter,
+				enum ibv_wc_status status);
+void mlx5_rc_timing_poll_begin(void);
+void mlx5_rc_timing_poll_end(void);
 #endif
 int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			  struct ibv_send_wr **bad_wr);

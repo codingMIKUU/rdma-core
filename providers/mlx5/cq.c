@@ -859,6 +859,11 @@ again:
 		if (mqp->hollow_rc && mqp->sender_side)
 			mlx5_srm_timing_complete_wq(wq, wqe_ctr, err);
 #endif
+#if MLX5_RC_ENABLE_TIMING
+		if (!mqp->hollow_rc && mqp->ibv_qp &&
+		    mqp->ibv_qp->qp_type == IBV_QPT_RC)
+			mlx5_rc_timing_complete_wq(wq, wqe_ctr, err);
+#endif
 		break;
 	}
 	case MLX5_CQE_RESP_WR_IMM:
@@ -982,6 +987,13 @@ again:
 					mqp->srm_large_kernel_qpn_valid &&
 					qpn == mqp->srm_large_kernel_qpn ?
 					&mqp->srm_large_sq : wq, wqe_ctr,
+					lazy ? cq->verbs_cq.cq_ex.status : wc->status);
+#endif
+#if MLX5_RC_ENABLE_TIMING
+			if (!mqp->hollow_rc && mqp->ibv_qp &&
+			    mqp->ibv_qp->qp_type == IBV_QPT_RC)
+				mlx5_rc_timing_complete_wq(
+					wq, wqe_ctr,
 					lazy ? cq->verbs_cq.cq_ex.status : wc->status);
 #endif
 		} else {
@@ -1154,6 +1166,12 @@ static inline int poll_cq(struct ibv_cq *ibcq, int ne,
 	struct mlx5_srq *srq = NULL;
 	int npolled;
 	int err = CQ_OK;
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	mlx5_srm_timing_poll_begin(cq);
+#endif
+#if MLX5_RC_ENABLE_TIMING
+	mlx5_rc_timing_poll_begin();
+#endif
 
 	if (cq->stall_enable) {
 		if (cq->stall_adaptive_enable) {
@@ -1202,6 +1220,12 @@ static inline int poll_cq(struct ibv_cq *ibcq, int ne,
 		}
 	}
 
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	mlx5_srm_timing_poll_end();
+#endif
+#if MLX5_RC_ENABLE_TIMING
+	mlx5_rc_timing_poll_end();
+#endif
 	return err == CQ_POLL_ERR ? err : npolled;
 }
 

@@ -80,8 +80,20 @@ static inline uint64_t rdtsc() {
 
 #if MLX5_SRM_ENABLE_WQE_TIMING
 struct mlx5_srm_wqe_timing_stats {
+	uint64_t post_calls;
+	uint64_t post_cycles;
+	uint64_t poll_calls;
+	uint64_t poll_cycles;
+	uint64_t poll_start_tsc;
 	uint64_t cqe_wqes;
 	uint64_t post_to_cqe_cycles;
+	uint64_t kernel_to_user_cqes;
+	uint64_t kernel_to_user_cycles;
+	uint64_t kernel_to_user_missing;
+	uint64_t kernel_to_user_invalid;
+	uint64_t poll_kernel_tsc_sum;
+	uint32_t poll_kernel_cqes;
+	bool poll_active;
 	uint64_t missing_timestamps;
 	uint64_t invalid_timestamps;
 	uint64_t error_wqes;
@@ -96,6 +108,12 @@ static inline uint64_t mlx5_srm_timing_rdtsc(void)
 
 	__asm__ __volatile__("lfence\n\trdtsc" : "=a"(lo), "=d"(hi) :: "memory");
 	return ((uint64_t)hi << 32) | lo;
+}
+
+static inline void mlx5_srm_timing_record_post_call(uint64_t cycles)
+{
+	srm_wqe_timing_stats.post_calls++;
+	srm_wqe_timing_stats.post_cycles += cycles;
 }
 
 static inline struct mlx5_srm_wqe_timestamp *
@@ -123,16 +141,71 @@ void mlx5_srm_timing_complete(uint64_t post_tsc_sum, uint32_t wqes,
 		stats->missing_timestamps++;
 	}
 	stats->report_check_wqes += wqes ? wqes : 1;
+}
+
+void mlx5_srm_timing_poll_begin(struct mlx5_cq *cq)
+{
+	struct mlx5_srm_wqe_timing_stats *stats = &srm_wqe_timing_stats;
+
+	stats->poll_kernel_tsc_sum = 0;
+	stats->poll_kernel_cqes = 0;
+	stats->poll_active = cq && cq->srm_timing_enabled;
+	stats->poll_start_tsc = stats->poll_active ?
+		mlx5_srm_timing_rdtsc() : 0;
+}
+
+void mlx5_srm_timing_poll_end(void)
+{
+	struct mlx5_srm_wqe_timing_stats *stats = &srm_wqe_timing_stats;
+	uint64_t end_tsc;
+	uint64_t elapsed;
+
+	if (!stats->poll_active)
+		return;
+	end_tsc = mlx5_srm_timing_rdtsc();
+	stats->poll_active = false;
+	stats->poll_calls++;
+	stats->poll_cycles += end_tsc - stats->poll_start_tsc;
+	stats->poll_start_tsc = 0;
+
+	if (stats->poll_kernel_cqes) {
+		elapsed = end_tsc * stats->poll_kernel_cqes -
+			  stats->poll_kernel_tsc_sum;
+		if ((int64_t)elapsed < 0)
+			stats->kernel_to_user_invalid += stats->poll_kernel_cqes;
+		else {
+			stats->kernel_to_user_cqes += stats->poll_kernel_cqes;
+			stats->kernel_to_user_cycles += elapsed;
+		}
+	}
+	stats->poll_kernel_tsc_sum = 0;
+	stats->poll_kernel_cqes = 0;
+
 	if (stats->report_check_wqes < MLX5_SRM_TIMING_REPORT_WQES)
 		return;
 
 	fprintf(stderr,
-		"SRM_WQE_TIMING algorithm=qpswitch pid=%d thread=%lu cqe_wqes=%llu post_to_cqe_cycles=%llu post_to_cqe_avg_cycles=%.2f missing_timestamps=%llu invalid_timestamps=%llu error_wqes=%llu\n",
+		"SRM_WQE_TIMING algorithm=qpswitch post_scope=ibv_post_send poll_scope=ibv_poll_cq kernel_to_user_scope=kernel_cqe_poll_to_user_poll_return pid=%d thread=%lu post_calls=%llu post_cycles=%llu post_avg_cycles=%.2f poll_calls=%llu poll_cycles=%llu poll_avg_cycles=%.2f cqe_wqes=%llu post_to_cqe_cycles=%llu post_to_cqe_avg_cycles=%.2f kernel_to_user_cqes=%llu kernel_to_user_cycles=%llu kernel_to_user_avg_cycles=%.2f kernel_to_user_missing=%llu kernel_to_user_invalid=%llu missing_timestamps=%llu invalid_timestamps=%llu error_wqes=%llu\n",
 		getpid(), (unsigned long)pthread_self(),
+		(unsigned long long)stats->post_calls,
+		(unsigned long long)stats->post_cycles,
+		stats->post_calls ?
+			(double)stats->post_cycles / stats->post_calls : 0.0,
+		(unsigned long long)stats->poll_calls,
+		(unsigned long long)stats->poll_cycles,
+		stats->poll_calls ?
+			(double)stats->poll_cycles / stats->poll_calls : 0.0,
 		(unsigned long long)stats->cqe_wqes,
 		(unsigned long long)stats->post_to_cqe_cycles,
 		stats->cqe_wqes ?
 			(double)stats->post_to_cqe_cycles / stats->cqe_wqes : 0.0,
+		(unsigned long long)stats->kernel_to_user_cqes,
+		(unsigned long long)stats->kernel_to_user_cycles,
+		stats->kernel_to_user_cqes ?
+			(double)stats->kernel_to_user_cycles /
+			stats->kernel_to_user_cqes : 0.0,
+		(unsigned long long)stats->kernel_to_user_missing,
+		(unsigned long long)stats->kernel_to_user_invalid,
 		(unsigned long long)stats->missing_timestamps,
 		(unsigned long long)stats->invalid_timestamps,
 		(unsigned long long)stats->error_wqes);
@@ -150,6 +223,7 @@ static int mlx5_srm_timing_prepare(struct mlx5_qp *qp, struct mlx5_wq *wq)
 	int ret = 0;
 
 	mlx5_spin_lock(&cq->lock);
+	cq->srm_timing_enabled = 1;
 	if (wq->srm_timing_count < wq->srm_timing_capacity)
 		goto out;
 	if (wq->srm_timing_capacity > UINT32_MAX / 2) {
@@ -175,7 +249,8 @@ out:
 }
 
 static void mlx5_srm_timing_publish(struct mlx5_qp *qp, struct mlx5_wq *wq,
-				    uint64_t slot, uint64_t start)
+				    uint64_t slot, uint64_t start,
+				    struct mlx5_srm_wqe_timestamp *shared)
 {
 	struct mlx5_cq *cq = to_mcq(qp->ibv_qp->send_cq);
 	uint32_t index;
@@ -185,6 +260,7 @@ static void mlx5_srm_timing_publish(struct mlx5_qp *qp, struct mlx5_wq *wq,
 		(wq->srm_timing_capacity - 1);
 	wq->srm_timing_entries[index].slot = slot;
 	wq->srm_timing_entries[index].post_tsc = start;
+	wq->srm_timing_entries[index].shared_timestamp = shared;
 	wq->srm_timing_count++;
 	mlx5_spin_unlock(&cq->lock);
 }
@@ -194,6 +270,7 @@ static void mlx5_srm_timing_publish(struct mlx5_qp *qp, struct mlx5_wq *wq,
 void mlx5_srm_timing_complete_wq(struct mlx5_wq *wq, uint16_t counter,
 				 enum ibv_wc_status status)
 {
+	struct mlx5_srm_wqe_timing_stats *stats = &srm_wqe_timing_stats;
 	uint64_t sum = 0;
 	uint32_t n;
 
@@ -202,6 +279,23 @@ void mlx5_srm_timing_complete_wq(struct mlx5_wq *wq, uint16_t counter,
 			(wq->srm_timing_head + n) & (wq->srm_timing_capacity - 1)];
 		sum += entry->post_tsc;
 		if ((uint16_t)entry->slot == counter) {
+			struct mlx5_srm_wqe_timestamp *shared =
+				entry->shared_timestamp;
+			uint64_t sequence = shared ? __atomic_load_n(
+				&shared->kernel_cqe_sequence,
+				__ATOMIC_ACQUIRE) : 0;
+			uint64_t kernel_tsc = shared ? __atomic_load_n(
+				&shared->kernel_cqe_tsc,
+				__ATOMIC_RELAXED) : 0;
+
+			if (sequence == entry->slot + 1 && kernel_tsc) {
+				stats->poll_kernel_tsc_sum += kernel_tsc;
+				stats->poll_kernel_cqes++;
+			} else if (sequence) {
+				stats->kernel_to_user_invalid++;
+			} else {
+				stats->kernel_to_user_missing++;
+			}
 			wq->srm_timing_head = (wq->srm_timing_head + n + 1) &
 				(wq->srm_timing_capacity - 1);
 			wq->srm_timing_count -= n + 1;
@@ -210,6 +304,125 @@ void mlx5_srm_timing_complete_wq(struct mlx5_wq *wq, uint16_t counter,
 		}
 	}
 	mlx5_srm_timing_complete(0, 0, status);
+}
+#endif
+
+#if MLX5_RC_ENABLE_TIMING
+struct mlx5_rc_timing_stats {
+	uint64_t post_calls;
+	uint64_t post_cycles;
+	uint64_t user_db_calls;
+	uint64_t user_db_cycles;
+	uint64_t poll_calls;
+	uint64_t poll_cycles;
+	uint64_t cqe_wqes;
+	uint64_t post_to_cqe_cycles;
+	uint64_t missing_timestamps;
+	uint64_t invalid_timestamps;
+	uint64_t error_wqes;
+	uint64_t poll_start_tsc;
+	uint64_t poll_post_tsc_sum;
+	uint32_t poll_post_cqes;
+	uint32_t report_check_cqes;
+};
+
+static __thread struct mlx5_rc_timing_stats rc_timing_stats;
+
+static inline uint64_t mlx5_rc_timing_rdtsc(void)
+{
+	unsigned int lo, hi;
+
+	__asm__ __volatile__("lfence\n\trdtsc" : "=a"(lo), "=d"(hi) :: "memory");
+	return ((uint64_t)hi << 32) | lo;
+}
+
+static inline void mlx5_rc_timing_record_post(uint64_t cycles)
+{
+	rc_timing_stats.post_calls++;
+	rc_timing_stats.post_cycles += cycles;
+}
+
+static inline void mlx5_rc_timing_record_db(uint64_t cycles)
+{
+	rc_timing_stats.user_db_calls++;
+	rc_timing_stats.user_db_cycles += cycles;
+}
+
+void mlx5_rc_timing_complete_wq(struct mlx5_wq *wq, uint16_t counter,
+				enum ibv_wc_status status)
+{
+	struct mlx5_rc_timing_entry *entry;
+	uint32_t idx;
+
+	if (!wq->rc_timing_entries || !wq->wqe_cnt)
+		return;
+	idx = counter & (wq->wqe_cnt - 1);
+	entry = &wq->rc_timing_entries[idx];
+	if (status != IBV_WC_SUCCESS) {
+		rc_timing_stats.error_wqes++;
+	} else if ((uint16_t)entry->sequence != counter || !entry->post_tsc) {
+		rc_timing_stats.missing_timestamps++;
+	} else {
+		rc_timing_stats.poll_post_tsc_sum += entry->post_tsc;
+		rc_timing_stats.poll_post_cqes++;
+	}
+	entry->post_tsc = 0;
+	entry->sequence = 0;
+	rc_timing_stats.report_check_cqes++;
+}
+
+void mlx5_rc_timing_poll_begin(void)
+{
+	rc_timing_stats.poll_start_tsc = mlx5_rc_timing_rdtsc();
+	rc_timing_stats.poll_post_tsc_sum = 0;
+	rc_timing_stats.poll_post_cqes = 0;
+}
+
+void mlx5_rc_timing_poll_end(void)
+{
+	struct mlx5_rc_timing_stats *stats = &rc_timing_stats;
+	uint64_t end = mlx5_rc_timing_rdtsc();
+	uint64_t elapsed;
+
+	stats->poll_calls++;
+	stats->poll_cycles += end - stats->poll_start_tsc;
+	if (stats->poll_post_cqes) {
+		elapsed = end * stats->poll_post_cqes - stats->poll_post_tsc_sum;
+		if ((int64_t)elapsed < 0)
+			stats->invalid_timestamps += stats->poll_post_cqes;
+		else {
+			stats->cqe_wqes += stats->poll_post_cqes;
+			stats->post_to_cqe_cycles += elapsed;
+		}
+	}
+	stats->poll_post_tsc_sum = 0;
+	stats->poll_post_cqes = 0;
+
+	if (stats->report_check_cqes < MLX5_RC_TIMING_REPORT_CQES)
+		return;
+	fprintf(stderr,
+		"RC_TIMING post_scope=ibv_post_send user_db_scope=doorbell_helper poll_scope=ibv_poll_cq post_to_cqe_scope=post_entry_to_poll_return pid=%d thread=%lu post_calls=%llu post_cycles=%llu post_avg_cycles=%.2f user_db_calls=%llu user_db_cycles=%llu user_db_avg_cycles=%.2f poll_calls=%llu poll_cycles=%llu poll_avg_cycles=%.2f cqe_wqes=%llu post_to_cqe_cycles=%llu post_to_cqe_avg_cycles=%.2f missing_timestamps=%llu invalid_timestamps=%llu error_wqes=%llu\n",
+		getpid(), (unsigned long)pthread_self(),
+		(unsigned long long)stats->post_calls,
+		(unsigned long long)stats->post_cycles,
+		stats->post_calls ?
+			(double)stats->post_cycles / stats->post_calls : 0.0,
+		(unsigned long long)stats->user_db_calls,
+		(unsigned long long)stats->user_db_cycles,
+		stats->user_db_calls ?
+			(double)stats->user_db_cycles / stats->user_db_calls : 0.0,
+		(unsigned long long)stats->poll_calls,
+		(unsigned long long)stats->poll_cycles,
+		stats->poll_calls ?
+			(double)stats->poll_cycles / stats->poll_calls : 0.0,
+		(unsigned long long)stats->cqe_wqes,
+		(unsigned long long)stats->post_to_cqe_cycles,
+		stats->cqe_wqes ?
+			(double)stats->post_to_cqe_cycles / stats->cqe_wqes : 0.0,
+		(unsigned long long)stats->missing_timestamps,
+		(unsigned long long)stats->invalid_timestamps,
+		(unsigned long long)stats->error_wqes);
+	memset(stats, 0, sizeof(*stats));
 }
 #endif
 
@@ -1889,6 +2102,9 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 #if MLX5_SRM_ENABLE_WQE_TIMING
 				  , uint64_t wqe_timing_start
 #endif
+#if MLX5_RC_ENABLE_TIMING
+				  , uint64_t rc_post_start
+#endif
 				  )
 {
 	struct mlx5_qp *qp = to_mqp(ibqp);
@@ -1920,6 +2136,9 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	bool srm_fast = qp->srm_fast_ready &&
 		(!MLX5_SRM_ENABLE_LARGE_KERNEL_QP || qp->srm_large_fast_ready);
 	bool lock_sq = !srm_fast;
+#if MLX5_RC_ENABLE_TIMING
+	bool rc_timing = ibqp->qp_type == IBV_QPT_RC && !qp->hollow_rc;
+#endif
 	int phase_stats =
 		qp->hollow_rc && qp->sender_side && srm_stats_is_enabled();
 	uint64_t phase_start = phase_stats ? rdtsc() : 0;
@@ -2368,6 +2587,12 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 				publish_start - build_start;
 		}
 		post_wq->wrid[idx] = wr->wr_id;
+#if MLX5_RC_ENABLE_TIMING
+		if (rc_timing && post_wq->rc_timing_entries) {
+			post_wq->rc_timing_entries[idx].post_tsc = rc_post_start;
+			post_wq->rc_timing_entries[idx].sequence = post_wq->cur_post;
+		}
+#endif
 		if (srm_fast)
 			;
 		else
@@ -2383,7 +2608,8 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			__atomic_store_n(&entry->post_tsc, wqe_timing_start,
 					 __ATOMIC_RELAXED);
 			__atomic_store_n(&entry->sequence, slot + 1, __ATOMIC_RELEASE);
-			mlx5_srm_timing_publish(qp, post_wq, slot, wqe_timing_start);
+			mlx5_srm_timing_publish(qp, post_wq, slot,
+					       wqe_timing_start, entry);
 		}
 #endif
 		if (srm_fast)
@@ -2440,10 +2666,18 @@ out:
 		cleanup_start = rdtsc();
 	qp->fm_cache = next_fence;
 	if (!err && !(qp->hollow_rc && qp->sender_side)) {
+#if MLX5_RC_ENABLE_TIMING
+		uint64_t rc_db_start = rc_timing ? mlx5_rc_timing_rdtsc() : 0;
+#endif
 		if (ibqp->qp_type == IBV_QPT_RC && qp->sender_side)
 			fc_post_send_db(qp, bf, nreq, inl, size, ctrl);
 		else
 			post_send_db(qp, bf, nreq, inl, size, ctrl);
+#if MLX5_RC_ENABLE_TIMING
+		if (rc_timing)
+			mlx5_rc_timing_record_db(mlx5_rc_timing_rdtsc() -
+						     rc_db_start);
+#endif
 	}
 	//st_wr->wr_id = rdtsc();
 	if (phase_stats) {
@@ -2474,6 +2708,10 @@ int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	uint64_t timing_start = mqp->hollow_rc && mqp->sender_side ?
 		mlx5_srm_timing_rdtsc() : 0;
 #endif
+#if MLX5_RC_ENABLE_TIMING
+	bool rc_timing = ibqp->qp_type == IBV_QPT_RC && !mqp->hollow_rc;
+	uint64_t rc_start = rc_timing ? mlx5_rc_timing_rdtsc() : 0;
+#endif
 	int ret;
 #ifdef MW_DEBUG
 	if (wr->opcode == IBV_WR_BIND_MW) {
@@ -2499,9 +2737,23 @@ int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 #if MLX5_SRM_ENABLE_WQE_TIMING
 				      , timing_start
 #endif
+#if MLX5_RC_ENABLE_TIMING
+				      , rc_start
+#endif
 				      );
-		if (ret)
+		if (ret) {
+#if MLX5_SRM_ENABLE_WQE_TIMING
+			if (timing_start)
+				mlx5_srm_timing_record_post_call(
+					mlx5_srm_timing_rdtsc() - timing_start);
+#endif
+#if MLX5_RC_ENABLE_TIMING
+			if (rc_timing)
+				mlx5_rc_timing_record_post(
+					mlx5_rc_timing_rdtsc() - rc_start);
+#endif
 			return ret;
+		}
 			
 
 		// if (mqp->srm_proxy_enabled && mqp->srm_proxy_qp) {
@@ -2597,14 +2849,33 @@ int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		// 	}
 		// }
 
+#if MLX5_RC_ENABLE_TIMING
+		if (rc_timing)
+			mlx5_rc_timing_record_post(
+				mlx5_rc_timing_rdtsc() - rc_start);
+#endif
+#if MLX5_SRM_ENABLE_WQE_TIMING
+		if (timing_start)
+			mlx5_srm_timing_record_post_call(
+				mlx5_srm_timing_rdtsc() - timing_start);
+#endif
 		return 0;
 	}
 
-	return _mlx5_post_send(ibqp, wr, bad_wr
+	ret = _mlx5_post_send(ibqp, wr, bad_wr
 #if MLX5_SRM_ENABLE_WQE_TIMING
 			       , timing_start
 #endif
+#if MLX5_RC_ENABLE_TIMING
+			       , rc_start
+#endif
 			       );
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	if (timing_start)
+		mlx5_srm_timing_record_post_call(
+			mlx5_srm_timing_rdtsc() - timing_start);
+#endif
+	return ret;
 }
 
 enum {
@@ -5154,6 +5425,9 @@ int mlx5_bind_mw(struct ibv_qp *qp, struct ibv_mw *mw,
 
 	ret = _mlx5_post_send(qp, &wr, &bad_wr
 #if MLX5_SRM_ENABLE_WQE_TIMING
+			      , 0
+#endif
+#if MLX5_RC_ENABLE_TIMING
 			      , 0
 #endif
 			      );
