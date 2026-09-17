@@ -1653,7 +1653,17 @@ static inline int srm_reserve_wqe_blocking(struct mlx5_sq_ctrl_page *ctrl,
 		 */
 		cons = __atomic_load_n(&ctrl->cons_idx, __ATOMIC_ACQUIRE);
 		resv = __atomic_load_n(&ctrl->resv_idx, __ATOMIC_ACQUIRE);
+#if MLX5_SRM_ENABLE_REROUTE
+		/* Freeze must be interpreted BEFORE the historical cursor repair. */
+		if (__atomic_load_n(&ctrl->route.state, __ATOMIC_ACQUIRE) ==
+		    MLX5_SRM_ROUTE_FAILED)
+			return EIO;
+		if (resv & MLX5_SRM_REROUTE_FROZEN)
+			return EAGAIN;
+		distance = mlx5_srm_rr_delta(resv, cons);
+#else
 		distance = (int64_t)(resv - cons);
+#endif
 		if (unlikely(distance < 0)) {
 			static unsigned int repair_reports;
 			uint64_t expected = resv;
@@ -1681,8 +1691,17 @@ static inline int srm_reserve_wqe_blocking(struct mlx5_sq_ctrl_page *ctrl,
 		if (stats_enabled && occupancy > stats->max_occupancy)
 			stats->max_occupancy = occupancy;
 		if (occupancy < limit) {
+#if MLX5_SRM_ENABLE_REROUTE
+			uint64_t next = mlx5_srm_rr_seq(resv + 1);
+			/* CAS makes the freeze/reservation boundary exact; there is no
+			 * invalid speculative reservation to roll back. */
+			if (!__atomic_compare_exchange_n(&ctrl->resv_idx, &resv,
+					 next, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+				continue;
+#else
 			resv = __atomic_fetch_add(&ctrl->resv_idx, 1,
 						  __ATOMIC_RELAXED);
+#endif
 			if (slot)
 				*slot = resv;
 			if (cons_out)
@@ -1738,6 +1757,29 @@ static inline int srm_reserve_wqe_blocking(struct mlx5_sq_ctrl_page *ctrl,
 			attempt++;
 	}
 }
+
+#if MLX5_SRM_ENABLE_REROUTE && MLX5_SRM_REROUTE_TEST_HOOKS
+static void srm_rr_test_delay(uint32_t user, uint32_t path, uint64_t slot)
+{
+	static __thread bool used;
+	const char *value, *which;
+	unsigned long delay;
+	struct timespec ts;
+	if (used) return;
+	value = getenv("MLX5_SRM_REROUTE_DELAY_US");
+	if (!value) return;
+	which = getenv("MLX5_SRM_REROUTE_DELAY_USER");
+	if (which && strtoul(which, NULL, 0) != user) return;
+	delay = strtoul(value, NULL, 0);
+	if (!delay || delay > 10000000) return;
+	used = true;
+	fprintf(stderr, "SRM_REROUTE_TEST delay_token user=%u path=%u slot=%llu us=%lu\n",
+		user, path, (unsigned long long)slot, delay);
+	ts.tv_sec = delay / 1000000;
+	ts.tv_nsec = delay % 1000000 * 1000;
+	while (nanosleep(&ts, &ts) && errno == EINTR) {}
+}
+#endif
 
 static inline void srm_mark_wqe_ready(struct mlx5_sq_ctrl_page *ctrl,
 				      uint64_t *publish_token,
@@ -1873,11 +1915,18 @@ static inline void srm_try_direct_user_db(
 	int stats_enabled;
 	bool require_full_prefix;
 	bool notify_kernel_hot = false;
+#if MLX5_SRM_ENABLE_REROUTE
+	uint64_t posted_bytes = 0;
+#endif
 
 	if (unlikely(!mapping || !mapping->farm_credit_ctrl ||
 		     !mapping->farm_uar_reg || !mapping->farm_db))
 		return;
 	stats_enabled = srm_direct_db_stats_begin(mapping, ctrl_page, stats);
+#if MLX5_SRM_ENABLE_REROUTE
+	if (!__atomic_load_n(&ctrl_page->route.user_db, __ATOMIC_ACQUIRE))
+		return;
+#endif
 
 	/* Only the producer that closes the current head gap attempts ownership. */
 	tail = __atomic_load_n(&ctrl_page->db_tail, __ATOMIC_ACQUIRE);
@@ -1906,9 +1955,15 @@ static inline void srm_try_direct_user_db(
 	if (stats_enabled)
 		stats->owner_acquired++;
 
+#if MLX5_SRM_ENABLE_REROUTE
+	if (!__atomic_load_n(&ctrl_page->route.user_db, __ATOMIC_ACQUIRE))
+		goto out_unlock;
+#endif
+
 	tail = __atomic_load_n(&ctrl_page->db_tail, __ATOMIC_ACQUIRE);
 	resv = __atomic_load_n(&ctrl_page->resv_idx, __ATOMIC_ACQUIRE);
-	pending = (int64_t)(resv - tail);
+	pending = MLX5_SRM_ENABLE_REROUTE ? mlx5_srm_rr_delta(resv, tail) :
+		(int64_t)(resv - tail);
 	if (unlikely(pending <= 0)) {
 		if (stats_enabled)
 			stats->no_pending++;
@@ -1916,7 +1971,8 @@ static inline void srm_try_direct_user_db(
 	}
 
 	if (require_full_prefix) {
-		int64_t target_pending =
+		int64_t target_pending = MLX5_SRM_ENABLE_REROUTE ?
+			mlx5_srm_rr_delta(published_slot + 1, tail) :
 			(int64_t)((published_slot + 1) - tail);
 
 		/*
@@ -1987,6 +2043,12 @@ static inline void srm_try_direct_user_db(
 			     (uint16_t)post || (qpn_ds >> 8) != kernel_qpn))
 			break;
 		last_ctrl = wqe_ctrl;
+#if MLX5_SRM_ENABLE_REROUTE
+		/* Read before ringing: after MMIO a concurrent CQ poll may recycle
+		 * this slot. Count only the prefix actually sent below. */
+		posted_bytes += be32toh(((struct mlx5_wqe_data_seg *)
+					((char *)wqe_ctrl + 48))->byte_count);
+#endif
 		sent++;
 	}
 	if (stats_enabled)
@@ -2012,11 +2074,17 @@ static inline void srm_try_direct_user_db(
 	srm_direct_ring_db(mapping, ctrl_page,
 			   require_full_prefix ? target_tail : tail + sent,
 			   last_ctrl);
+#if MLX5_SRM_ENABLE_REROUTE
+	__atomic_store_n(&ctrl_page->route.posted_bytes,
+		__atomic_load_n(&ctrl_page->route.posted_bytes,
+			       __ATOMIC_RELAXED) + posted_bytes, __ATOMIC_RELEASE);
+#endif
 #if MLX5_SRM_ENABLE_DB_SHARE_STATS
 	mlx5_srm_record_user_db_share(ctrl_page, sent);
 #endif
 	__atomic_store_n(&ctrl_page->db_tail,
-			 require_full_prefix ? target_tail : tail + sent,
+			 MLX5_SRM_ENABLE_REROUTE ? mlx5_srm_rr_seq(tail + sent) :
+			 (require_full_prefix ? target_tail : tail + sent),
 			 __ATOMIC_RELEASE);
 	if (stats_enabled) {
 		stats->db_calls++;
@@ -2174,6 +2242,9 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	struct ibv_send_wr *st_wr = wr;
 
 	for (nreq = 0; wr; ++nreq, wr = wr->next) {
+	#if MLX5_SRM_ENABLE_REROUTE
+		uint64_t rr_wait_start = 0;
+	#endif
 		uint64_t slot = 0;
 		uint64_t cons = 0;
 		struct mlx5_wq *post_wq = &qp->sq;
@@ -2185,6 +2256,52 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		uint32_t post_ctrl_slot_idx = qp->sq_ctrl_slot_idx;
 		struct mlx5_srm_mapping_bundle *post_mapping = qp->srm_mapping;
 
+#if MLX5_SRM_ENABLE_REROUTE
+		if (srm_fast &&
+		    (wr->num_sge != 1 || !wr->sg_list || !wr->sg_list[0].length ||
+		     (wr->opcode != IBV_WR_RDMA_READ &&
+		      wr->opcode != IBV_WR_RDMA_WRITE) ||
+		     !(wr->send_flags & IBV_SEND_SIGNALED) ||
+		     (wr->send_flags & ~(IBV_SEND_SIGNALED | IBV_SEND_FENCE)) ||
+		     qp->wq_sig)) {
+			err = EOPNOTSUPP;
+			if (bad_wr)
+				*bad_wr = wr;
+			goto out;
+		}
+rr_retry:
+		if (srm_fast) {
+			uint64_t generation;
+			struct mlx5_qp *path;
+			if (!qp->rr_route) {
+				err = EPROTO;
+				if (bad_wr) *bad_wr = wr;
+				goto out;
+			}
+			generation = __atomic_load_n(&qp->rr_route->route.generation,
+						     __ATOMIC_ACQUIRE);
+			if (generation != qp->rr_generation) {
+				qp->rr_selected = __atomic_load_n(
+					&qp->rr_route->route.active[qp->rr_active_slot],
+					__ATOMIC_ACQUIRE);
+				qp->rr_generation = generation;
+			}
+			if (qp->rr_selected >= MLX5_SRM_REROUTE_PATHS ||
+			    !(path = qp->rr_paths[qp->rr_selected])) {
+				err = EPROTO;
+				if (bad_wr) *bad_wr = wr;
+				goto out;
+			}
+			post_wq = &path->sq;
+			post_sq_start = path->sq_start;
+			post_ctrl = path->sq_ctrl;
+			post_publish_token = path->sq_publish_token;
+			post_publish_depth = path->sq_publish_depth;
+			post_kernel_qpn = path->srm_kernel_qpn;
+			post_ctrl_slot_idx = path->sq_ctrl_slot_idx;
+			post_mapping = path->srm_mapping;
+		}
+#endif
 		if (MLX5_SRM_ENABLE_LARGE_KERNEL_QP && srm_fast &&
 		    mlx5_srm_wr_data_bytes(wr) > MLX5_SRM_LARGE_MSG_THRESHOLD) {
 			post_wq = &qp->srm_large_sq;
@@ -2227,6 +2344,20 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 						       post_ctrl_slot_idx,
 						       post_kernel_qpn,
 						       &slot, &cons);
+#if MLX5_SRM_ENABLE_REROUTE
+			if (err == EAGAIN) {
+				uint64_t now = srm_monotonic_ns();
+				if (!rr_wait_start) rr_wait_start = now;
+				if (now - rr_wait_start < SRM_RESERVE_MAX_WAIT_NS) {
+					srm_queue_backoff(64, SRM_RESERVE_MAX_WAIT_NS -
+							  (now - rr_wait_start));
+					goto rr_retry;
+				}
+				err = ETIMEDOUT;
+				fprintf(stderr, "SRM reroute wait timeout: slot=%u qpn=%u\n",
+					post_ctrl_slot_idx, post_kernel_qpn);
+			}
+#endif
 			if (err) {
 				if (bad_wr)
 					*bad_wr = wr;
@@ -2611,6 +2742,10 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 			mlx5_srm_timing_publish(qp, post_wq, slot,
 					       wqe_timing_start, entry);
 		}
+#endif
+#if MLX5_SRM_ENABLE_REROUTE && MLX5_SRM_REROUTE_TEST_HOOKS
+		if (srm_fast)
+			srm_rr_test_delay(qp->usr_rc_cnt, post_ctrl_slot_idx, slot);
 #endif
 		if (srm_fast)
 			srm_mark_wqe_ready(post_ctrl, post_publish_token,

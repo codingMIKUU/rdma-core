@@ -474,6 +474,8 @@ struct mlx5_pd {
 	};
 };
 
+#include <rdma/mlx5-srm-reroute.h>
+
 /* Match scheduler.h; the reserved control-slot layout stays 512 bytes. */
 #ifndef MLX5_SRM_ENABLE_DB_SHARE_STATS
 #define MLX5_SRM_ENABLE_DB_SHARE_STATS 0
@@ -532,7 +534,7 @@ struct mlx5_sq_ctrl_page {
 	uint8_t hot_hint_pad[56];
 	/* A power-of-two stride keeps every control slot within one mmap page. */
 	struct mlx5_srm_db_share db_share;
-	uint8_t slot_pad[128];
+	struct mlx5_srm_route_ctrl route;
 } __attribute__((aligned(64)));
 _Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 512,
 	       "hollow RC ctrl ABI must occupy eight cachelines");
@@ -629,7 +631,9 @@ static inline void mlx5_srm_record_user_db_share(
 #define MLX5_SRM_ENABLE_READY_FASTPATH 0
 
 /* Direct user MMIO is the FARM fast path; the syscall experiment stays off. */
+#ifndef MLX5_SRM_ENABLE_DIRECT_USER_DB
 #define MLX5_SRM_ENABLE_DIRECT_USER_DB 1
+#endif
 
 /* Must be a positive power of two; change and rebuild rdma-core to tune. */
 #define MLX5_SRM_DIRECT_DB_HELP_STRIDE 4U
@@ -923,6 +927,14 @@ struct mlx5_qp {
 	void				*sq_mmap_buf;
 	size_t				sq_mmap_len;
 	struct mlx5_srm_mapping_bundle *srm_mapping;
+#if MLX5_SRM_ENABLE_REROUTE
+	struct mlx5_qp *rr_paths[MLX5_SRM_REROUTE_PATHS];
+	struct mlx5_sq_ctrl_page *rr_route;
+	struct mlx5_srm_migration_completion *rr_completion;
+	uint64_t rr_generation;
+	uint32_t rr_selected;
+	uint32_t rr_active_slot;
+#endif
 	struct mlx5_sq_ctrl_page	*sq_ctrl;
 	uint32_t		sq_ctrl_slot_idx;
 	uint64_t		*sq_publish_token;

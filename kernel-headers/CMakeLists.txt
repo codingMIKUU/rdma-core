@@ -1,4 +1,5 @@
 publish_internal_headers(rdma
+  rdma/mlx5-srm-reroute.h
   rdma/bnxt_re-abi.h
   rdma/cxgb4-abi.h
   rdma/efa-abi.h
@@ -85,4 +86,3 @@ rdma_kernel_provider_abi(
 publish_headers(infiniband
   rdma/ib_user_ioctl_verbs.h
   )
-

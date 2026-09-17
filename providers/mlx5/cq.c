@@ -784,6 +784,18 @@ again:
 			return CQ_POLL_ERR;
 		wq = &mqp->sq;
 		sq_start = mqp->sq_start;
+#if MLX5_SRM_ENABLE_REROUTE
+		if (mqp->hollow_rc && mqp->rr_route) {
+			unsigned int p;
+			for (p = 0; p < MLX5_SRM_REROUTE_PATHS; p++)
+				if (mqp->rr_paths[p]->srm_kernel_qpn == qpn) {
+					wq = &mqp->rr_paths[p]->sq;
+					sq_start = mqp->rr_paths[p]->sq_start;
+					break;
+				}
+			if (p == MLX5_SRM_REROUTE_PATHS) return CQ_POLL_ERR;
+		}
+#endif
 		if (mqp->hollow_rc && mqp->srm_large_kernel_qpn_valid &&
 		    qpn == mqp->srm_large_kernel_qpn) {
 			wq = &mqp->srm_large_sq;
@@ -970,6 +982,17 @@ again:
 			if (unlikely(!mqp))
 				return CQ_POLL_ERR;
 			wq = &mqp->sq;
+#if MLX5_SRM_ENABLE_REROUTE
+			if (mqp->hollow_rc && mqp->rr_route) {
+				unsigned int p;
+				for (p = 0; p < MLX5_SRM_REROUTE_PATHS; p++)
+					if (mqp->rr_paths[p]->srm_kernel_qpn == qpn) {
+						wq = &mqp->rr_paths[p]->sq;
+						break;
+					}
+				if (p == MLX5_SRM_REROUTE_PATHS) return CQ_POLL_ERR;
+			}
+#endif
 			if (unlikely(!wq->wqe_cnt || !wq->wrid ||
 				     !wq->wqe_head)) {
 				*cur_rsc = NULL;
@@ -1101,7 +1124,19 @@ static inline int mlx5_srm_poll_watermarks(struct mlx5_cq *cq, int ne,
 		completed = __atomic_load_n(&ctrl->cons_idx, __ATOMIC_ACQUIRE);
 		/* Signed modular comparison is valid while the live SQ window is
 		 * below 2^63 entries and remains correct across u64 wrap. */
+#if MLX5_SRM_ENABLE_REROUTE
+		ready = mlx5_srm_rr_delta(completed, target) >= 0;
+		if (qp->rr_completion &&
+		    __atomic_load_n(&qp->rr_completion->sequence, __ATOMIC_ACQUIRE) ==
+						      mlx5_srm_rr_seq(target) &&
+		    qp->rr_completion->reserved &&
+		    qp->rr_completion->origin_slot ==
+			(uint32_t)(ctrl - (struct mlx5_sq_ctrl_page *)
+				to_mctx(qp->ibv_qp->context)->srm_ctrl_map))
+			ready = 2;
+#else
 		ready = (int64_t)(completed - target) >= 0;
+#endif
 		if (!qp->srm_completion_pending || ready) {
 			if (prev)
 				prev->srm_completion_next = next;
@@ -1137,6 +1172,12 @@ static inline int mlx5_srm_poll_watermarks(struct mlx5_cq *cq, int ne,
 				} else {
 					cur->status = IBV_WC_SUCCESS;
 				}
+#if MLX5_SRM_ENABLE_REROUTE
+				if (ready == 2) {
+					cur->status = qp->rr_completion->status;
+					cur->vendor_err = qp->rr_completion->vendor;
+				}
+#endif
 #if MLX5_SRM_ENABLE_WQE_TIMING
 				mlx5_srm_timing_complete_wq(qp->srm_completion_timing_wq,
 					(uint16_t)qp->srm_completion_idx, cur->status);
