@@ -637,8 +637,8 @@ static inline void mlx5_srm_record_user_db_share(
 
 /* Keep the large-KQP selector and its per-doorbell cap in sync with the
  * matching kernel scheduler.h.  The large lane is currently enabled there. */
-#define MLX5_SRM_ENABLE_LARGE_KERNEL_QP 1
-#define MLX5_SRM_ENABLE_LARGE_DB_LIMIT 1
+#define MLX5_SRM_ENABLE_LARGE_KERNEL_QP 0
+#define MLX5_SRM_ENABLE_LARGE_DB_LIMIT 0
 #define MLX5_SRM_LARGE_DB_LIMIT 1000U
 #define MLX5_SRM_LARGE_DB_LIMIT_ACTIVE \
 	(MLX5_SRM_ENABLE_LARGE_KERNEL_QP && \
