@@ -1922,7 +1922,7 @@ static inline void srm_try_direct_user_db(
 		     !mapping->farm_uar_reg || !mapping->farm_db))
 		return;
 	stats_enabled = srm_direct_db_stats_begin(mapping, ctrl_page, stats);
-#if MLX5_SRM_ENABLE_REROUTE
+#if MLX5_SRM_ENABLE_REROUTE || MLX5_SRM_ENABLE_UDP_INPLACE_REROUTE
 	if (!__atomic_load_n(&ctrl_page->route.user_db, __ATOMIC_ACQUIRE))
 		return;
 #endif
@@ -1954,7 +1954,7 @@ static inline void srm_try_direct_user_db(
 	if (stats_enabled)
 		stats->owner_acquired++;
 
-#if MLX5_SRM_ENABLE_REROUTE
+#if MLX5_SRM_ENABLE_REROUTE || MLX5_SRM_ENABLE_UDP_INPLACE_REROUTE
 	if (!__atomic_load_n(&ctrl_page->route.user_db, __ATOMIC_ACQUIRE))
 		goto out_unlock;
 #endif

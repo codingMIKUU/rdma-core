@@ -3635,6 +3635,20 @@ static int mlx5_srm_check_timing_mapping(struct mlx5_sq_ctrl_page *ctrl,
 			MLX5_SRM_ENABLE_REROUTE, kernel_reroute);
 		return EPROTO;
 	}
+	bool kernel_udp_reroute =
+		__atomic_load_n(&ctrl->flags, __ATOMIC_ACQUIRE) &
+		MLX5_SRM_CTRL_F_UDP_INPLACE_REROUTE;
+	if (kernel_udp_reroute != !!MLX5_SRM_ENABLE_UDP_INPLACE_REROUTE ||
+	    (kernel_udp_reroute &&
+	     __atomic_load_n(&ctrl->route.abi, __ATOMIC_ACQUIRE) !=
+		MLX5_SRM_UDP_REROUTE_ABI)) {
+		fprintf(stderr,
+			"Hollow UDP reroute ABI mismatch: provider=%d kernel=%d provider_abi=%x kernel_abi=%x\n",
+			MLX5_SRM_ENABLE_UDP_INPLACE_REROUTE,
+			kernel_udp_reroute, MLX5_SRM_UDP_REROUTE_ABI,
+			__atomic_load_n(&ctrl->route.abi, __ATOMIC_ACQUIRE));
+		return EPROTO;
+	}
 	bool kernel_timing = __atomic_load_n(&ctrl->flags, __ATOMIC_ACQUIRE) &
 		MLX5_SRM_CTRL_F_WQE_TIMING;
 
