@@ -1543,8 +1543,7 @@ static inline void srm_queue_backoff(unsigned int attempt,
 	clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
 }
 
-#define MLX5_SRM_ENABLE_LARGE_KERNEL_QP 0
-#define MLX5_SRM_LARGE_MSG_THRESHOLD (10U * 1024U)
+#define MLX5_SRM_LARGE_MSG_THRESHOLD (1U * 1024U)
 
 static inline uint32_t mlx5_srm_wr_data_bytes(const struct ibv_send_wr *wr)
 {
@@ -1900,7 +1899,7 @@ static inline void srm_try_direct_user_db(
 	struct mlx5_srm_mapping_bundle *mapping,
 	struct mlx5_sq_ctrl_page *ctrl_page, uint64_t *publish_token,
 	uint32_t publish_depth, struct mlx5_wq *wq, uint32_t kernel_qpn,
-	uint64_t published_slot)
+	uint64_t published_slot, bool large_kqp)
 {
 	struct srm_direct_db_stats *stats = &srm_direct_db_stats;
 	struct mlx5_wqe_ctrl_seg *last_ctrl = NULL;
@@ -1991,6 +1990,16 @@ static inline void srm_try_direct_user_db(
 	} else {
 		max_batch = min_t(uint64_t, mapping->farm_direct_db_batch,
 				  (uint64_t)pending);
+	}
+	if (MLX5_SRM_LARGE_DB_LIMIT_ACTIVE && large_kqp &&
+	    max_batch > MLX5_SRM_LARGE_DB_LIMIT) {
+		if (require_full_prefix) {
+			/* A helper must DB through its own slot, never a truncated
+			 * prefix. Let the kernel advance the large KQP first. */
+			notify_kernel_hot = true;
+			goto out_unlock;
+		}
+		max_batch = MLX5_SRM_LARGE_DB_LIMIT;
 	}
 	/*
 	 * Reserve shared outstanding credit before touching publish tokens or
@@ -2255,6 +2264,7 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		uint32_t post_kernel_qpn = qp->srm_kernel_qpn;
 		uint32_t post_ctrl_slot_idx = qp->sq_ctrl_slot_idx;
 		struct mlx5_srm_mapping_bundle *post_mapping = qp->srm_mapping;
+		bool post_large_kqp = false;
 
 #if MLX5_SRM_ENABLE_REROUTE
 		if (srm_fast &&
@@ -2312,6 +2322,7 @@ rr_retry:
 			post_kernel_qpn = qp->srm_large_kernel_qpn;
 			post_ctrl_slot_idx = qp->srm_large_sq_ctrl_slot_idx;
 			post_mapping = qp->srm_large_mapping;
+			post_large_kqp = true;
 		}
 #if MLX5_SRM_ENABLE_CQE_SIMPLIFY
 		if (srm_fast && (wr->send_flags & IBV_SEND_SIGNALED) &&
@@ -2755,7 +2766,8 @@ rr_retry:
 			srm_try_direct_user_db(post_mapping, post_ctrl,
 					       post_publish_token,
 					       post_publish_depth, post_wq,
-					       post_kernel_qpn, slot);
+					       post_kernel_qpn, slot,
+					       post_large_kqp);
 #if MLX5_SRM_ENABLE_CQE_SIMPLIFY
 		if (srm_fast && (wr->send_flags & IBV_SEND_SIGNALED))
 			mlx5_srm_queue_completion(qp, post_ctrl, slot, wr_id, wr

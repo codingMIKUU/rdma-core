@@ -2702,6 +2702,15 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 	struct mlx5_ib_create_qp_resp  *resp_drv;
 	bool use_kernel_sq;
 	bool skip_kern_qp;
+	struct ibv_qp_init_attr_ex kernel_attr;
+	bool latency_cq = (attr->comp_mask & IBV_QP_INIT_ATTR_CREATE_FLAGS) &&
+		(attr->create_flags & IBV_QP_CREATE_SRM_LATENCY_CQ);
+
+	if (latency_cq && (attr->qp_type != IBV_QPT_RC ||
+			   !attr->sender_side || attr->skip_kern_qp)) {
+		errno = EINVAL;
+		return NULL;
+	}
 
 	if (attr->comp_mask & ~MLX5_CREATE_QP_SUP_COMP_MASK)
 		return NULL;
@@ -2918,6 +2927,8 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 		cmd.flags |= MLX5_QP_FLAG_SRM_SENDER;
 	if (attr->qp_type == IBV_QPT_RC && attr->skip_kern_qp)
 		cmd.flags |= MLX5_QP_FLAG_SRM_SKIP_KERN_QP;
+	if (latency_cq)
+		cmd.flags |= MLX5_QP_FLAG_SRM_LATENCY_CQ;
 	qp->wq_sig = qp_sig_enabled();
 	if (qp->wq_sig)
 		cmd.flags |= MLX5_QP_FLAG_SIGNATURE;
@@ -3060,12 +3071,16 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 		/* Create QP should start from ECE version 1 as a trigger */
 		cmd.ece_options = 0x10000000;
 
+	/* Strip the provider-only hint before generic uverbs flag validation. */
+	kernel_attr = *attr;
+	kernel_attr.create_flags &= ~IBV_QP_CREATE_SRM_LATENCY_CQ;
 	if (attr->comp_mask & MLX5_CREATE_QP_EX2_COMP_MASK)
-		ret = mlx5_cmd_create_qp_ex(context, attr, &cmd, qp, &resp_ex);
+		ret = mlx5_cmd_create_qp_ex(context, &kernel_attr, &cmd, qp, &resp_ex);
 	else
 		ret = ibv_cmd_create_qp_ex(context, &qp->verbs_qp,
-					   attr, &cmd.ibv_cmd, sizeof(cmd),
+					   &kernel_attr, &cmd.ibv_cmd, sizeof(cmd),
 					   &resp.ibv_resp, sizeof(resp));
+	attr->cap = kernel_attr.cap;
 	if (ret) {
 		mlx5_dbg(fp, MLX5_DBG_QP, "ret %d\n", ret);
 		goto err_free_uidx;
@@ -3609,8 +3624,6 @@ void mlx5_srm_release_mappings(struct mlx5_context *ctx)
 	}
 	pthread_mutex_unlock(&ctx->srm_mapping_mutex);
 }
-
-#define MLX5_SRM_ENABLE_LARGE_KERNEL_QP 0
 
 static int mlx5_srm_check_timing_mapping(struct mlx5_sq_ctrl_page *ctrl,
 				       uint32_t depth, size_t mapped_bytes)

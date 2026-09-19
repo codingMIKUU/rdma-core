@@ -991,6 +991,10 @@ enum ibv_qp_create_flags {
 	IBV_QP_CREATE_PCI_WRITE_END_PADDING	= 1 << 11,
 };
 
+/* Private Hollow RC hint; consumed by mlx5, never sent as a generic flag.
+ * Does not change ibv_qp_init_attr_ex layout. */
+#define IBV_QP_CREATE_SRM_LATENCY_CQ (1U << 31)
+
 enum ibv_qp_create_send_ops_flags {
 	IBV_QP_EX_WITH_RDMA_WRITE		= 1 << 0,
 	IBV_QP_EX_WITH_RDMA_WRITE_WITH_IMM	= 1 << 1,
