@@ -2924,7 +2924,7 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 
 	cmd.flags = mlx5_create_flags;
 	if (attr->qp_type == IBV_QPT_RC && attr->sender_side)
-		cmd.flags |= MLX5_QP_FLAG_SRM_SENDER;
+		cmd.flags |= MLX5_QP_FLAG_SRM_SENDER | MLX5_QP_FLAG_SRM_BYTE_WINDOW;
 	if (attr->qp_type == IBV_QPT_RC && attr->skip_kern_qp)
 		cmd.flags |= MLX5_QP_FLAG_SRM_SKIP_KERN_QP;
 	if (latency_cq)
@@ -3628,6 +3628,11 @@ void mlx5_srm_release_mappings(struct mlx5_context *ctx)
 static int mlx5_srm_check_timing_mapping(struct mlx5_sq_ctrl_page *ctrl,
 				       uint32_t depth, size_t mapped_bytes)
 {
+	if (!(__atomic_load_n(&ctrl->flags, __ATOMIC_ACQUIRE) &
+	      MLX5_SRM_CTRL_F_BYTE_WINDOW)) {
+		fprintf(stderr, "Hollow byte-window ABI mismatch: rebuild/reload matching kernel driver\n");
+		return EPROTO;
+	}
 	bool kernel_reroute = __atomic_load_n(&ctrl->flags, __ATOMIC_ACQUIRE) &
 		MLX5_SRM_CTRL_F_REROUTE;
 	if (kernel_reroute != !!MLX5_SRM_ENABLE_REROUTE) {

@@ -577,7 +577,7 @@ struct mlx5_srm_timing_entry {
 
 /* Ordinary RC-only provider timing.  Off removes all data-path hooks. */
 #ifndef MLX5_RC_ENABLE_TIMING
-#define MLX5_RC_ENABLE_TIMING 1
+#define MLX5_RC_ENABLE_TIMING 0
 #endif
 #if MLX5_RC_ENABLE_TIMING != 0 && MLX5_RC_ENABLE_TIMING != 1
 #error "MLX5_RC_ENABLE_TIMING must be 0 or 1"
@@ -632,13 +632,13 @@ static inline void mlx5_srm_record_user_db_share(
 
 /* Direct user MMIO is the FARM fast path; the syscall experiment stays off. */
 #ifndef MLX5_SRM_ENABLE_DIRECT_USER_DB
-#define MLX5_SRM_ENABLE_DIRECT_USER_DB 1
+#define MLX5_SRM_ENABLE_DIRECT_USER_DB 4
 #endif
 
 /* Keep the large-KQP selector and its per-doorbell cap in sync with the
  * matching kernel scheduler.h.  The large lane is currently enabled there. */
 #define MLX5_SRM_ENABLE_LARGE_KERNEL_QP 1
-#define MLX5_SRM_ENABLE_LARGE_DB_LIMIT 1
+#define MLX5_SRM_ENABLE_LARGE_DB_LIMIT 0
 #define MLX5_SRM_LARGE_DB_LIMIT 1000U
 #define MLX5_SRM_LARGE_DB_LIMIT_ACTIVE \
 	(MLX5_SRM_ENABLE_LARGE_KERNEL_QP && \

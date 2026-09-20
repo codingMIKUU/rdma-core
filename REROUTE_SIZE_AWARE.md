@@ -60,6 +60,39 @@ env LD_LIBRARY_PATH="$reroute_libdir${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" \
 
 ## 验证状态
 
+### 每物理 KQP 的在途字节窗口（独立于换路开关）
+
+配套内核的 `MLX5_SRM_MAX_INFLIGHT_BYTES` 控制窗口，如 32768U 为 32KiB，设 0 关闭。
+上限由内核 `include/uapi/rdma/mlx5-srm-reroute.h` 决定，并通过控制页
+`route.inflight_limit_bytes` 告诉用户库；本仓库镜像头文件位于
+`kernel-headers/rdma/mlx5-srm-reroute.h`。
+
+用户 DB 取得 owner 后用物理 QP 的 posted/completed payload 字节计算剩余额度，
+扫描时限制连续前缀，实际 DB 才记提交字节；仍保留原队头/stride 和 worker
+WQE 信用规则。单个 READ/WRITE 长度超过非零上限时，不再因字节窗口返回
+`EMSGSIZE`：允许正常预留/预写，等该物理 QP 的在途 payload 为 0 后单独 DB
+这一条，不能带上前后其他 WQE。完整长度照常记账，后续发送等待其 CQ 完成归还
+额度；普通 WR 超过当前剩余额度仍要等待。stride 用户的完整前缀要求不变，无法
+满足时由内核 fallback 推进。换路中的 drain 旧源由内核豁免字节窗口，仍保留
+worker 信用、CQ 容量和冻结边界检查；新目标及正常活动 QP 保留上述限流规则。
+
+本次换路 ABI 保持 `0x52520103`，512B 控制槽大小未变，增加字节窗口能力握手。
+新用户库拒绝旧模块；开启非零上限的新模块拒绝未声明字节记账能力的旧用户库。
+需重编配套两驱动。之后仅调整内核上限值，用户库无需跟着改数值。
+普通 RC 不受影响；`MLX5_SRM_ENABLE_REROUTE=0` 的空心 RC 同样执行字节限流，
+完成时由内核归还额度，支持 CQE 简化开/关和独立/共享 CQ。
+上限 0 时，非换路路径跳过字节计数读写和 payload 累加；不改原有 WQE 信用限制。
+未 signaled 的 WR 必须在字节窗口耗尽前安排可产生完成通知的请求，避免信用无法归还。
+
+```bash
+python3 tests/test_srm_reroute_byte_window.py
+bash ../rdma-kerndriver/tests/run_reroute_offline.sh
+```
+
+上述是无硬件离线测试，不安装库，不加载模块。对现有 build 的 CMake 编译标志
+另行进行了 qp.c/verbs.c 的换路 0/1 × CQE 简化 0/1 语法检查；没有修改编译、
+链接、安装目录或环境变量。真实性能和换路是否被触发仍需安装后实测。
+
 已编译 mlx5 provider：关闭、开启简化、开启直接分发＋时间戳、开启简化＋时间戳＋
 关闭用户 DB＋启用延迟钩子。内核离线模拟验证两种完成方式和回绕边界。
 尚未加载此版本模块，没有网卡 READ/WRITE 正确性/压力/吞吐结论。

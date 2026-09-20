@@ -1543,7 +1543,7 @@ static inline void srm_queue_backoff(unsigned int attempt,
 	clock_nanosleep(CLOCK_MONOTONIC, 0, &ts, NULL);
 }
 
-#define MLX5_SRM_LARGE_MSG_THRESHOLD (1U * 1024U)
+#define MLX5_SRM_LARGE_MSG_THRESHOLD (10U * 1024U)
 
 static inline uint32_t mlx5_srm_wr_data_bytes(const struct ibv_send_wr *wr)
 {
@@ -1914,13 +1914,14 @@ static inline void srm_try_direct_user_db(
 	int stats_enabled;
 	bool require_full_prefix;
 	bool notify_kernel_hot = false;
-#if MLX5_SRM_ENABLE_REROUTE
 	uint64_t posted_bytes = 0;
-#endif
+	uint64_t available_bytes = UINT64_MAX;
+	uint32_t byte_limit;
 
 	if (unlikely(!mapping || !mapping->farm_credit_ctrl ||
 		     !mapping->farm_uar_reg || !mapping->farm_db))
 		return;
+	byte_limit = ctrl_page->route.inflight_limit_bytes;
 	stats_enabled = srm_direct_db_stats_begin(mapping, ctrl_page, stats);
 #if MLX5_SRM_ENABLE_REROUTE
 	if (!__atomic_load_n(&ctrl_page->route.user_db, __ATOMIC_ACQUIRE))
@@ -1958,6 +1959,15 @@ static inline void srm_try_direct_user_db(
 	if (!__atomic_load_n(&ctrl_page->route.user_db, __ATOMIC_ACQUIRE))
 		goto out_unlock;
 #endif
+	/* The loaded kernel publishes the cap. Both DB writers hold db_owner;
+	 * a stale completion snapshot can only reduce the batch, never overbook. */
+	if (byte_limit)
+		available_bytes = mlx5_srm_rr_byte_available(
+		__atomic_load_n(&ctrl_page->route.posted_bytes, __ATOMIC_RELAXED),
+		__atomic_load_n(&ctrl_page->route.completed_bytes, __ATOMIC_ACQUIRE),
+		byte_limit);
+	if (!available_bytes)
+		goto out_unlock;
 
 	tail = __atomic_load_n(&ctrl_page->db_tail, __ATOMIC_ACQUIRE);
 	resv = __atomic_load_n(&ctrl_page->resv_idx, __ATOMIC_ACQUIRE);
@@ -2051,13 +2061,21 @@ static inline void srm_try_direct_user_db(
 		if (unlikely((uint16_t)(opmod_idx_opcode >> 8) !=
 			     (uint16_t)post || (qpn_ds >> 8) != kernel_qpn))
 			break;
-		last_ctrl = wqe_ctrl;
-#if MLX5_SRM_ENABLE_REROUTE
 		/* Read before ringing: after MMIO a concurrent CQ poll may recycle
 		 * this slot. Count only the prefix actually sent below. */
-		posted_bytes += be32toh(((struct mlx5_wqe_data_seg *)
-					((char *)wqe_ctrl + 48))->byte_count);
+		if (MLX5_SRM_ENABLE_REROUTE || byte_limit) {
+#if MLX5_SRM_ENABLE_REROUTE
+			uint32_t payload = be32toh(((struct mlx5_wqe_data_seg *)
+				((char *)wqe_ctrl + 48))->byte_count);
+#else
+			uint64_t payload = mlx5_srm_payload_bytes(wqe_ctrl);
 #endif
+			if (!mlx5_srm_rr_byte_can_post(available_bytes, posted_bytes,
+					payload, byte_limit, sent))
+				break;
+			posted_bytes += payload;
+		}
+		last_ctrl = wqe_ctrl;
 		sent++;
 	}
 	if (stats_enabled)
@@ -2083,11 +2101,10 @@ static inline void srm_try_direct_user_db(
 	srm_direct_ring_db(mapping, ctrl_page,
 			   require_full_prefix ? target_tail : tail + sent,
 			   last_ctrl);
-#if MLX5_SRM_ENABLE_REROUTE
-	__atomic_store_n(&ctrl_page->route.posted_bytes,
+	if (MLX5_SRM_ENABLE_REROUTE || byte_limit)
+		__atomic_store_n(&ctrl_page->route.posted_bytes,
 		__atomic_load_n(&ctrl_page->route.posted_bytes,
 			       __ATOMIC_RELAXED) + posted_bytes, __ATOMIC_RELEASE);
-#endif
 #if MLX5_SRM_ENABLE_DB_SHARE_STATS
 	mlx5_srm_record_user_db_share(ctrl_page, sent);
 #endif
@@ -2305,6 +2322,8 @@ rr_retry:
 			post_wq = &path->sq;
 			post_sq_start = path->sq_start;
 			post_ctrl = path->sq_ctrl;
+			/* Oversized WRs reserve normally; user/kernel DB admit one alone
+			 * once the physical QP's outstanding payload has completed. */
 			post_publish_token = path->sq_publish_token;
 			post_publish_depth = path->sq_publish_depth;
 			post_kernel_qpn = path->srm_kernel_qpn;
