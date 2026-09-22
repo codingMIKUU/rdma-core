@@ -474,7 +474,6 @@ struct mlx5_pd {
 	};
 };
 
-#include <rdma/mlx5-srm-reroute.h>
 
 /* Match scheduler.h; the reserved control-slot layout stays 512 bytes. */
 #ifndef MLX5_SRM_ENABLE_DB_SHARE_STATS
@@ -534,7 +533,7 @@ struct mlx5_sq_ctrl_page {
 	uint8_t hot_hint_pad[56];
 	/* A power-of-two stride keeps every control slot within one mmap page. */
 	struct mlx5_srm_db_share db_share;
-	struct mlx5_srm_route_ctrl route;
+	uint8_t slot_pad[128];
 } __attribute__((aligned(64)));
 _Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 512,
 	       "hollow RC ctrl ABI must occupy eight cachelines");
@@ -638,14 +637,14 @@ static inline void mlx5_srm_record_user_db_share(
 /* Keep the large-KQP selector and its per-doorbell cap in sync with the
  * matching kernel scheduler.h.  The large lane is currently enabled there. */
 #define MLX5_SRM_ENABLE_LARGE_KERNEL_QP 1
-#define MLX5_SRM_ENABLE_LARGE_DB_LIMIT 1
+#define MLX5_SRM_ENABLE_LARGE_DB_LIMIT 0
 #define MLX5_SRM_LARGE_DB_LIMIT 1000U
 #define MLX5_SRM_LARGE_DB_LIMIT_ACTIVE \
 	(MLX5_SRM_ENABLE_LARGE_KERNEL_QP && \
 	 MLX5_SRM_ENABLE_LARGE_DB_LIMIT && MLX5_SRM_LARGE_DB_LIMIT > 0)
 
 /* Must be a positive power of two; change and rebuild rdma-core to tune. */
-#define MLX5_SRM_DIRECT_DB_HELP_STRIDE 1U
+#define MLX5_SRM_DIRECT_DB_HELP_STRIDE 4U
 _Static_assert(MLX5_SRM_DIRECT_DB_HELP_STRIDE > 0 &&
 	       !(MLX5_SRM_DIRECT_DB_HELP_STRIDE &
 		 (MLX5_SRM_DIRECT_DB_HELP_STRIDE - 1)),
@@ -936,14 +935,6 @@ struct mlx5_qp {
 	void				*sq_mmap_buf;
 	size_t				sq_mmap_len;
 	struct mlx5_srm_mapping_bundle *srm_mapping;
-#if MLX5_SRM_ENABLE_REROUTE
-	struct mlx5_qp *rr_paths[MLX5_SRM_REROUTE_PATHS];
-	struct mlx5_sq_ctrl_page *rr_route;
-	struct mlx5_srm_migration_completion *rr_completion;
-	uint64_t rr_generation;
-	uint32_t rr_selected;
-	uint32_t rr_active_slot;
-#endif
 	struct mlx5_sq_ctrl_page	*sq_ctrl;
 	uint32_t		sq_ctrl_slot_idx;
 	uint64_t		*sq_publish_token;

@@ -3540,25 +3540,6 @@ static void mlx5_srm_release_mapping(struct mlx5_context *ctx,
 	struct mlx5_srm_mapping_bundle *bundle;
 	int lane;
 
-#if MLX5_SRM_ENABLE_REROUTE
-	for (lane = 1; lane < MLX5_SRM_REROUTE_PATHS; lane++) {
-		struct mlx5_qp *path = qp->rr_paths[lane];
-		if (!path) continue;
-		mlx5_srm_release_mapping(ctx, path);
-		free(path->sq.wrid);
-		free(path->sq.wqe_head);
-		free(path->sq.wr_data);
-#if MLX5_RC_ENABLE_TIMING
-		free(path->sq.rc_timing_entries);
-#endif
-#if MLX5_SRM_ENABLE_WQE_TIMING
-		free(path->sq.srm_timing_entries);
-#endif
-		free(path);
-		qp->rr_paths[lane] = NULL;
-	}
-	qp->rr_route = NULL;
-#endif
 
 	for (lane = 0; lane < 2; lane++) {
 		bundle = lane ? qp->srm_large_mapping : qp->srm_mapping;
@@ -3628,13 +3609,6 @@ void mlx5_srm_release_mappings(struct mlx5_context *ctx)
 static int mlx5_srm_check_timing_mapping(struct mlx5_sq_ctrl_page *ctrl,
 				       uint32_t depth, size_t mapped_bytes)
 {
-	bool kernel_reroute = __atomic_load_n(&ctrl->flags, __ATOMIC_ACQUIRE) &
-		MLX5_SRM_CTRL_F_REROUTE;
-	if (kernel_reroute != !!MLX5_SRM_ENABLE_REROUTE) {
-		fprintf(stderr, "Hollow reroute ABI mismatch: provider=%d kernel=%d\n",
-			MLX5_SRM_ENABLE_REROUTE, kernel_reroute);
-		return EPROTO;
-	}
 	bool kernel_timing = __atomic_load_n(&ctrl->flags, __ATOMIC_ACQUIRE) &
 		MLX5_SRM_CTRL_F_WQE_TIMING;
 
@@ -3822,63 +3796,6 @@ err_unlock:
 	return errno;
 }
 
-#if MLX5_SRM_ENABLE_REROUTE
-static int mlx5_srm_acquire_reroute(struct mlx5_context *ctx,
-	struct mlx5_qp *qp, const struct mlx5_ib_modify_qp_resp *resp)
-{
-	struct mlx5_ib_modify_qp_resp *part;
-	unsigned int p;
-	int ret = 0;
-
-	if (resp->reroute_abi != (MLX5_SRM_REROUTE_ABI |
-					 MLX5_SRM_ENABLE_CQE_SIMPLIFY << 16) ||
-	    resp->reroute_paths != MLX5_SRM_REROUTE_PATHS ||
-	    (uint64_t)resp->reroute_completion_offset +
-		 sizeof(*qp->rr_completion) > ctx->srm_ctrl_map_len ||
-	    resp->reroute_route_slot >= ctx->srm_ctrl_map_len / 512)
-		return EPROTO;
-	_Static_assert(sizeof(struct mlx5_ib_srm_path_resp) ==
-		       offsetof(struct mlx5_ib_modify_qp_resp, large_sq_state_slot_idx),
-		       "reroute path response must match the original mapping prefix");
-	_Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 512,
-		       "reroute control slot must remain 512 bytes");
-	_Static_assert(offsetof(struct mlx5_sq_ctrl_page, route) == 384,
-		       "reroute route/gate cacheline must remain isolated");
-	if (qp->rr_route) return 0;
-	part = calloc(1, sizeof(*part));
-	if (!part) return ENOMEM;
-	qp->rr_paths[0] = qp;
-	for (p = 1; p < MLX5_SRM_REROUTE_PATHS; p++) {
-		struct mlx5_qp *path = qp->rr_paths[p];
-		if (!path) path = calloc(1, sizeof(*path));
-		if (!path) { ret = ENOMEM; break; }
-		qp->rr_paths[p] = path;
-		memcpy(part, &resp->reroute[p], sizeof(resp->reroute[p]));
-		path->hollow_rc = path->sender_side = 1;
-		path->sq.wqe_cnt = part->kernel_sq_wqe_cnt;
-		path->sq.wqe_shift = part->kernel_sq_wqe_shift;
-		path->sq.max_post = part->kernel_sq_max_post;
-		path->sq.max_gs = part->kernel_sq_max_gs;
-		path->sq.qp_state_max_gs = part->kernel_sq_qp_state_max_gs;
-		path->srm_kernel_qpn = part->kernel_qpn;
-		ret = mlx5_resize_qp_sq_metadata(path, path->sq.wqe_cnt);
-		if (!ret && !path->srm_mapping)
-			ret = mlx5_srm_acquire_mapping(ctx, path, part);
-		if (!ret && __atomic_load_n(&path->sq_ctrl->route.abi,
-					    __ATOMIC_ACQUIRE) != resp->reroute_abi)
-			ret = EPROTO;
-		if (ret) break;
-	}
-	free(part);
-	if (ret) return ret; /* destroy_qp unwinds partial mappings */
-	qp->rr_completion = ctx->srm_ctrl_map + resp->reroute_completion_offset;
-	qp->rr_route = (struct mlx5_sq_ctrl_page *)ctx->srm_ctrl_map +
-		resp->reroute_route_slot;
-	qp->rr_generation = 0;
-	qp->rr_active_slot = qp->usr_rc_cnt & 1;
-	return 0;
-}
-#endif
 
 static int mlx5_srm_acquire_large_mapping(struct mlx5_context *ctx,
 					  struct mlx5_qp *qp,
@@ -4137,10 +4054,6 @@ int __mlx5_modify_qp(struct ibv_qp *qp, struct ibv_qp_attr *attr,
 		mqp->sq.max_post = resp.drv_payload.kernel_sq_max_post;
 		mqp->sq.max_gs = resp.drv_payload.kernel_sq_max_gs;
 		mqp->sq.qp_state_max_gs = resp.drv_payload.kernel_sq_qp_state_max_gs;
-#if MLX5_SRM_ENABLE_REROUTE
-		ret = mlx5_srm_acquire_reroute(context, mqp, &resp.drv_payload);
-		if (ret) { errno = ret; return ret; }
-#endif
 		mqp->max_inline_data = resp.drv_payload.kernel_max_inline_data;
 		fprintf(stderr,
 			"SRM_KERNEL_SQ qpn=%u wqe_cnt=%u max_post=%u wqe_shift=%u max_gs=%u reserve_limit=%llu\n",
