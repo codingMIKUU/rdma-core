@@ -478,7 +478,7 @@ struct mlx5_pd {
 
 /* Match scheduler.h; the reserved control-slot layout stays 512 bytes. */
 #ifndef MLX5_SRM_ENABLE_DB_SHARE_STATS
-#define MLX5_SRM_ENABLE_DB_SHARE_STATS 0
+#define MLX5_SRM_ENABLE_DB_SHARE_STATS 1
 #endif
 
 struct mlx5_srm_db_share {
@@ -488,7 +488,10 @@ struct mlx5_srm_db_share {
 	uint64_t user_wqes;
 	uint64_t kernel_calls;
 	uint64_t kernel_wqes;
-	uint8_t pad[24];
+	/* WQE_TIMING: cumulative, updated under the existing db_owner/seq. */
+	uint64_t user_post_to_db_cycles;
+	uint64_t user_timed_wqes;
+	uint64_t user_timing_excluded;
 };
 _Static_assert(sizeof(struct mlx5_srm_db_share) == 64,
 	       "DB share counters must occupy one reserved cacheline");
@@ -547,7 +550,7 @@ _Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 512,
 
 /* Match both driver builds. Off: no timestamp storage or hot-path hooks. */
 #ifndef MLX5_SRM_ENABLE_WQE_TIMING
-#define MLX5_SRM_ENABLE_WQE_TIMING 0
+#define MLX5_SRM_ENABLE_WQE_TIMING 1
 #endif
 #if MLX5_SRM_ENABLE_WQE_TIMING != 0 && MLX5_SRM_ENABLE_WQE_TIMING != 1
 #error "MLX5_SRM_ENABLE_WQE_TIMING must be 0 or 1"
@@ -555,6 +558,8 @@ _Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 512,
 #define MLX5_SRM_TIMING_REPORT_WQES 1000000U
 /* Bit 1 belongs to DB_SHARE_STATS in this branch; do not reuse it. */
 #define MLX5_SRM_CTRL_F_WQE_TIMING (1U << 2)
+/* Timing v2: includes user DB in the kernel's weighted report. */
+#define MLX5_SRM_CTRL_F_DB_TIMING_ALL (1U << 5)
 
 struct mlx5_srm_wqe_timestamp {
     uint64_t post_tsc;
@@ -563,6 +568,13 @@ struct mlx5_srm_wqe_timestamp {
     uint64_t kernel_cqe_sequence;
 };
 #if MLX5_SRM_ENABLE_WQE_TIMING
+struct mlx5_srm_db_timing_batch {
+	uint64_t post_tsc_sum;
+	uint64_t latest_tsc;
+	uint32_t valid;
+	uint32_t missing;
+};
+
 struct mlx5_srm_timing_entry {
     uint64_t slot;
     uint64_t post_tsc;
@@ -590,20 +602,26 @@ struct mlx5_rc_timing_entry {
 };
 #endif
 
-#if MLX5_SRM_ENABLE_DB_SHARE_STATS
+#if MLX5_SRM_ENABLE_DB_SHARE_STATS || MLX5_SRM_ENABLE_WQE_TIMING
 /* Called only after an actual DB, while holding this KQP's db_owner.
  * All producers and the kernel already serialize through that owner, so
  * counter updates need no additional lock or atomic read-modify-write.
  * seq lets the diagnostic reader reject an overlapping update. */
 static inline void mlx5_srm_record_user_db_share(
-	struct mlx5_sq_ctrl_page *ctrl, uint32_t sent)
+	struct mlx5_sq_ctrl_page *ctrl, uint32_t sent
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	, const struct mlx5_srm_db_timing_batch *batch, uint64_t done
+#endif
+	)
 {
 	struct mlx5_srm_db_share *share = &ctrl->db_share;
 	uint32_t seq;
 
+#if !MLX5_SRM_ENABLE_WQE_TIMING
 	if (!(__atomic_load_n(&ctrl->flags, __ATOMIC_RELAXED) &
 	      MLX5_SRM_CTRL_F_DB_SHARE_STATS))
 		return;
+#endif
 	seq = __atomic_load_n(&share->seq, __ATOMIC_RELAXED);
 	__atomic_store_n(&share->seq, seq + 1, __ATOMIC_RELAXED);
 	__atomic_thread_fence(__ATOMIC_RELEASE);
@@ -613,6 +631,30 @@ static inline void mlx5_srm_record_user_db_share(
 	__atomic_store_n(&share->user_wqes,
 		__atomic_load_n(&share->user_wqes, __ATOMIC_RELAXED) + sent,
 		__ATOMIC_RELAXED);
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	{
+		uint64_t cycles = done * batch->valid - batch->post_tsc_sum;
+		uint32_t valid = batch->valid;
+
+		/* A future timestamp/negative aggregate invalidates this batch.
+		 * No per-WQE clock read; a later producer may publish during scan. */
+		if (valid && ((int64_t)(done - batch->latest_tsc) < 0 ||
+			      (int64_t)cycles < 0)) {
+			valid = 0;
+			cycles = 0;
+		}
+		__atomic_store_n(&share->user_post_to_db_cycles,
+			__atomic_load_n(&share->user_post_to_db_cycles,
+					__ATOMIC_RELAXED) + cycles, __ATOMIC_RELAXED);
+		__atomic_store_n(&share->user_timed_wqes,
+			__atomic_load_n(&share->user_timed_wqes,
+					__ATOMIC_RELAXED) + valid, __ATOMIC_RELAXED);
+		__atomic_store_n(&share->user_timing_excluded,
+			__atomic_load_n(&share->user_timing_excluded,
+					__ATOMIC_RELAXED) + sent - valid,
+			__ATOMIC_RELAXED);
+	}
+#endif
 	__atomic_store_n(&share->seq, seq + 2, __ATOMIC_RELEASE);
 }
 #endif
@@ -632,12 +674,12 @@ static inline void mlx5_srm_record_user_db_share(
 
 /* Direct user MMIO is the FARM fast path; the syscall experiment stays off. */
 #ifndef MLX5_SRM_ENABLE_DIRECT_USER_DB
-#define MLX5_SRM_ENABLE_DIRECT_USER_DB 4
+#define MLX5_SRM_ENABLE_DIRECT_USER_DB 1
 #endif
 
 /* Keep the large-KQP selector and its per-doorbell cap in sync with the
  * matching kernel scheduler.h.  The large lane is currently enabled there. */
-#define MLX5_SRM_ENABLE_LARGE_KERNEL_QP 1
+#define MLX5_SRM_ENABLE_LARGE_KERNEL_QP 0
 #define MLX5_SRM_ENABLE_LARGE_DB_LIMIT 0
 #define MLX5_SRM_LARGE_DB_LIMIT 1000U
 #define MLX5_SRM_LARGE_DB_LIMIT_ACTIVE \
@@ -645,7 +687,7 @@ static inline void mlx5_srm_record_user_db_share(
 	 MLX5_SRM_ENABLE_LARGE_DB_LIMIT && MLX5_SRM_LARGE_DB_LIMIT > 0)
 
 /* Must be a positive power of two; change and rebuild rdma-core to tune. */
-#define MLX5_SRM_DIRECT_DB_HELP_STRIDE 1U
+#define MLX5_SRM_DIRECT_DB_HELP_STRIDE 4U
 _Static_assert(MLX5_SRM_DIRECT_DB_HELP_STRIDE > 0 &&
 	       !(MLX5_SRM_DIRECT_DB_HELP_STRIDE &
 		 (MLX5_SRM_DIRECT_DB_HELP_STRIDE - 1)),

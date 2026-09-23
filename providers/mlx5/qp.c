@@ -1895,6 +1895,28 @@ srm_publish_kernel_hot_hint(struct mlx5_srm_mapping_bundle *mapping)
 			 __ATOMIC_RELEASE);
 }
 
+#if MLX5_SRM_ENABLE_WQE_TIMING
+/* Called from the existing completeness scan, before the MMIO doorbell.
+ * No second walk and no clock read per WQE. Failed helper attempts discard
+ * their local batch; only the actually doorbelled prefix is committed. */
+static inline void mlx5_srm_timing_db_add(
+	struct mlx5_srm_db_timing_batch *batch,
+	struct mlx5_srm_wqe_timestamp *entry, uint64_t slot)
+{
+	uint64_t sequence = __atomic_load_n(&entry->sequence, __ATOMIC_ACQUIRE);
+	uint64_t start = __atomic_load_n(&entry->post_tsc, __ATOMIC_RELAXED);
+
+	if (sequence != slot + 1 || !start) {
+		batch->missing++;
+		return;
+	}
+	if (!batch->valid || (int64_t)(start - batch->latest_tsc) > 0)
+		batch->latest_tsc = start;
+	batch->post_tsc_sum += start;
+	batch->valid++;
+}
+#endif
+
 static inline void srm_try_direct_user_db(
 	struct mlx5_srm_mapping_bundle *mapping,
 	struct mlx5_sq_ctrl_page *ctrl_page, uint64_t *publish_token,
@@ -1917,6 +1939,10 @@ static inline void srm_try_direct_user_db(
 	uint64_t posted_bytes = 0;
 	uint64_t available_bytes = UINT64_MAX;
 	uint32_t byte_limit;
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	struct mlx5_srm_db_timing_batch timing_batch = {};
+	uint64_t db_done_tsc;
+#endif
 
 	if (unlikely(!mapping || !mapping->farm_credit_ctrl ||
 		     !mapping->farm_uar_reg || !mapping->farm_db))
@@ -2075,6 +2101,12 @@ static inline void srm_try_direct_user_db(
 				break;
 			posted_bytes += payload;
 		}
+#if MLX5_SRM_ENABLE_WQE_TIMING
+		mlx5_srm_timing_db_add(&timing_batch,
+			&mlx5_srm_timestamp_array(publish_token, publish_depth)
+			 [post & (publish_depth - 1)],
+			MLX5_SRM_ENABLE_REROUTE ? mlx5_srm_rr_seq(post) : post);
+#endif
 		last_ctrl = wqe_ctrl;
 		sent++;
 	}
@@ -2101,12 +2133,19 @@ static inline void srm_try_direct_user_db(
 	srm_direct_ring_db(mapping, ctrl_page,
 			   require_full_prefix ? target_tail : tail + sent,
 			   last_ctrl);
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	db_done_tsc = mlx5_srm_timing_rdtsc();
+#endif
 	if (MLX5_SRM_ENABLE_REROUTE || byte_limit)
 		__atomic_store_n(&ctrl_page->route.posted_bytes,
 		__atomic_load_n(&ctrl_page->route.posted_bytes,
 			       __ATOMIC_RELAXED) + posted_bytes, __ATOMIC_RELEASE);
-#if MLX5_SRM_ENABLE_DB_SHARE_STATS
-	mlx5_srm_record_user_db_share(ctrl_page, sent);
+#if MLX5_SRM_ENABLE_DB_SHARE_STATS || MLX5_SRM_ENABLE_WQE_TIMING
+	mlx5_srm_record_user_db_share(ctrl_page, sent
+#if MLX5_SRM_ENABLE_WQE_TIMING
+				      , &timing_batch, db_done_tsc
+#endif
+				      );
 #endif
 	__atomic_store_n(&ctrl_page->db_tail,
 			 MLX5_SRM_ENABLE_REROUTE ? mlx5_srm_rr_seq(tail + sent) :

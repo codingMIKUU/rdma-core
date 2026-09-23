@@ -3644,9 +3644,11 @@ static int mlx5_srm_check_timing_mapping(struct mlx5_sq_ctrl_page *ctrl,
 		MLX5_SRM_CTRL_F_WQE_TIMING;
 
 	if (kernel_timing != !!MLX5_SRM_ENABLE_WQE_TIMING ||
+	    (kernel_timing && !(__atomic_load_n(&ctrl->flags, __ATOMIC_ACQUIRE) &
+				MLX5_SRM_CTRL_F_DB_TIMING_ALL)) ||
 	    (kernel_timing && mapped_bytes < MLX5_SRM_TIMING_MAP_BYTES(depth))) {
 		fprintf(stderr,
-			"Hollow WQE timing mismatch: provider=%d kernel=%d publish_bytes=%zu depth=%u; rebuild rdma-core and kernel with matching MLX5_SRM_ENABLE_WQE_TIMING\n",
+			"Hollow WQE timing v2 mismatch: provider=%d kernel=%d publish_bytes=%zu depth=%u; rebuild rdma-core and kernel with matching MLX5_SRM_ENABLE_WQE_TIMING and user/kernel DB timing support\n",
 			MLX5_SRM_ENABLE_WQE_TIMING, kernel_timing,
 			mapped_bytes, depth);
 		return EPROTO;
