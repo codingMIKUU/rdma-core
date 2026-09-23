@@ -620,7 +620,7 @@ static inline void mlx5_srm_record_user_db_share(
  * 0 = native kernel CQE delivery, 1 = per-KQP completion watermarks.
  * Unlike the later MPI branch, there is no software-dispatch mode 2. */
 #ifndef MLX5_SRM_ENABLE_CQE_SIMPLIFY
-#define MLX5_SRM_ENABLE_CQE_SIMPLIFY 1
+#define MLX5_SRM_ENABLE_CQE_SIMPLIFY 0
 #endif
 #if MLX5_SRM_ENABLE_CQE_SIMPLIFY != 0 && MLX5_SRM_ENABLE_CQE_SIMPLIFY != 1
 #error "MLX5_SRM_ENABLE_CQE_SIMPLIFY must be 0 or 1"
@@ -636,7 +636,7 @@ static inline void mlx5_srm_record_user_db_share(
 
 /* Keep the large-KQP selector and its per-doorbell cap in sync with the
  * matching kernel scheduler.h.  The large lane is currently enabled there. */
-#define MLX5_SRM_ENABLE_LARGE_KERNEL_QP 1
+#define MLX5_SRM_ENABLE_LARGE_KERNEL_QP 0
 #define MLX5_SRM_ENABLE_LARGE_DB_LIMIT 0
 #define MLX5_SRM_LARGE_DB_LIMIT 1000U
 #define MLX5_SRM_LARGE_DB_LIMIT_ACTIVE \
