@@ -550,7 +550,7 @@ _Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 512,
 
 /* Match both driver builds. Off: no timestamp storage or hot-path hooks. */
 #ifndef MLX5_SRM_ENABLE_WQE_TIMING
-#define MLX5_SRM_ENABLE_WQE_TIMING 1
+#define MLX5_SRM_ENABLE_WQE_TIMING 0
 #endif
 #if MLX5_SRM_ENABLE_WQE_TIMING != 0 && MLX5_SRM_ENABLE_WQE_TIMING != 1
 #error "MLX5_SRM_ENABLE_WQE_TIMING must be 0 or 1"
@@ -663,7 +663,7 @@ static inline void mlx5_srm_record_user_db_share(
  * 0 = native kernel CQE delivery, 1 = per-KQP completion watermarks.
  * Unlike the later MPI branch, there is no software-dispatch mode 2. */
 #ifndef MLX5_SRM_ENABLE_CQE_SIMPLIFY
-#define MLX5_SRM_ENABLE_CQE_SIMPLIFY 1
+#define MLX5_SRM_ENABLE_CQE_SIMPLIFY 0
 #endif
 #if MLX5_SRM_ENABLE_CQE_SIMPLIFY != 0 && MLX5_SRM_ENABLE_CQE_SIMPLIFY != 1
 #error "MLX5_SRM_ENABLE_CQE_SIMPLIFY must be 0 or 1"
