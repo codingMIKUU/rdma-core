@@ -2187,10 +2187,14 @@ static void mlx5_free_qp_wrid(struct mlx5_qp *qp)
 	qp->srm_large_sq.srm_timing_post_tsc_sum = NULL;
 	free(qp->srm_large_sq.srm_timing_post_wqes);
 	qp->srm_large_sq.srm_timing_post_wqes = NULL;
+	free(qp->srm_large_sq.srm_timing_kernel_cqe);
+	qp->srm_large_sq.srm_timing_kernel_cqe = NULL;
 	free(qp->sq.srm_timing_post_tsc_sum);
 	qp->sq.srm_timing_post_tsc_sum = NULL;
 	free(qp->sq.srm_timing_post_wqes);
 	qp->sq.srm_timing_post_wqes = NULL;
+	free(qp->sq.srm_timing_kernel_cqe);
+	qp->sq.srm_timing_kernel_cqe = NULL;
 #endif
 	free(qp->srm_large_sq.wqe_head);
 	qp->srm_large_sq.wqe_head = NULL;
@@ -2220,6 +2224,7 @@ static int mlx5_resize_wq_metadata(struct mlx5_wq *wq,
 #if MLX5_SRM_ENABLE_WQE_TIMING
 	uint64_t *timing_sum;
 	uint32_t *timing_wqes;
+	struct mlx5_srm_kernel_cqe_ref *timing_kernel_cqe;
 #endif
 
 	if (*metadata_cnt == wqe_cnt)
@@ -2231,10 +2236,11 @@ static int mlx5_resize_wq_metadata(struct mlx5_wq *wq,
 #if MLX5_SRM_ENABLE_WQE_TIMING
 	timing_sum = calloc(wqe_cnt, sizeof(*timing_sum));
 	timing_wqes = calloc(wqe_cnt, sizeof(*timing_wqes));
+	timing_kernel_cqe = calloc(wqe_cnt, sizeof(*timing_kernel_cqe));
 #endif
 	if (!wrid || !wr_data || !wqe_head
 #if MLX5_SRM_ENABLE_WQE_TIMING
-	    || !timing_sum || !timing_wqes
+	    || !timing_sum || !timing_wqes || !timing_kernel_cqe
 #endif
 	    ) {
 		free(wrid);
@@ -2243,6 +2249,7 @@ static int mlx5_resize_wq_metadata(struct mlx5_wq *wq,
 #if MLX5_SRM_ENABLE_WQE_TIMING
 		free(timing_sum);
 		free(timing_wqes);
+		free(timing_kernel_cqe);
 #endif
 		errno = ENOMEM;
 		return -1;
@@ -2254,6 +2261,7 @@ static int mlx5_resize_wq_metadata(struct mlx5_wq *wq,
 #if MLX5_SRM_ENABLE_WQE_TIMING
 	free(wq->srm_timing_post_tsc_sum);
 	free(wq->srm_timing_post_wqes);
+	free(wq->srm_timing_kernel_cqe);
 #endif
 	wq->wrid = wrid;
 	wq->wr_data = wr_data;
@@ -2261,6 +2269,7 @@ static int mlx5_resize_wq_metadata(struct mlx5_wq *wq,
 #if MLX5_SRM_ENABLE_WQE_TIMING
 	wq->srm_timing_post_tsc_sum = timing_sum;
 	wq->srm_timing_post_wqes = timing_wqes;
+	wq->srm_timing_kernel_cqe = timing_kernel_cqe;
 	wq->srm_timing_pending_tsc_sum = 0;
 	wq->srm_timing_pending_wqes = 0;
 #endif
@@ -3565,6 +3574,23 @@ void mlx5_srm_release_mappings(struct mlx5_context *ctx)
 
 #define MLX5_SRM_ENABLE_LARGE_KERNEL_QP 0
 
+#if MLX5_SRM_ENABLE_WQE_TIMING
+static int mlx5_srm_check_timing_abi(const struct mlx5_sq_ctrl_page *ctrl)
+{
+	uint32_t abi = __atomic_load_n(&ctrl->timing_abi, __ATOMIC_ACQUIRE);
+
+	if (abi == MLX5_SRM_KERNEL_CQE_TIMING_ABI)
+		return 0;
+	fprintf(stderr,
+		"mlx5 FARM: CQ timing ABI mismatch (kernel=%u user=%u); "
+		"rebuild and reload the matching FARM kernel driver with "
+		"MLX5_SRM_ENABLE_WQE_TIMING=1\n",
+		abi, MLX5_SRM_KERNEL_CQE_TIMING_ABI);
+	errno = EPROTO;
+	return -1;
+}
+#endif
+
 static int mlx5_srm_acquire_mapping(struct mlx5_context *ctx,
 				    struct mlx5_qp *qp,
 				    const struct mlx5_ib_modify_qp_resp *resp)
@@ -3593,7 +3619,7 @@ static int mlx5_srm_acquire_mapping(struct mlx5_context *ctx,
 
 	kernel_sq_bytes = (size_t)resp->kernel_sq_wqe_cnt <<
 			  resp->kernel_sq_wqe_shift;
-	publish_bytes = (size_t)resp->publish_depth * sizeof(uint64_t);
+	publish_bytes = MLX5_SRM_PUBLISH_MAP_BYTES(resp->publish_depth);
 	if (kernel_sq_bytes > resp->sq_mmap_len ||
 	    publish_bytes > resp->publish_mmap_len ||
 	    resp->farm_uar_reg_offset > resp->farm_uar_mmap_len ||
@@ -3650,6 +3676,11 @@ static int mlx5_srm_acquire_mapping(struct mlx5_context *ctx,
 		goto err_unlock;
 	}
 
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	ctrl_base = ctx->srm_ctrl_map;
+	if (mlx5_srm_check_timing_abi(&ctrl_base[resp->sq_state_slot_idx]))
+		goto err_unlock;
+#endif
 	sq_map = mmap(NULL, resp->sq_mmap_len, PROT_READ | PROT_WRITE,
 		      MAP_SHARED, ctx->ibv_ctx.context.cmd_fd,
 		      resp->sq_mmap_offset);
@@ -3789,7 +3820,7 @@ static int mlx5_srm_acquire_large_mapping(struct mlx5_context *ctx,
 
 	kernel_sq_bytes = (size_t)resp->large_kernel_sq_wqe_cnt <<
 			  resp->large_kernel_sq_wqe_shift;
-	publish_bytes = (size_t)resp->large_publish_depth * sizeof(uint64_t);
+	publish_bytes = MLX5_SRM_PUBLISH_MAP_BYTES(resp->large_publish_depth);
 	if (kernel_sq_bytes > resp->large_sq_mmap_len ||
 	    publish_bytes > resp->large_publish_mmap_len ||
 	    resp->large_sq_state_slot_idx >=
@@ -3832,6 +3863,11 @@ static int mlx5_srm_acquire_large_mapping(struct mlx5_context *ctx,
 		goto err_unlock;
 	}
 
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	ctrl_base = ctx->srm_ctrl_map;
+	if (mlx5_srm_check_timing_abi(&ctrl_base[resp->large_sq_state_slot_idx]))
+		goto err_unlock;
+#endif
 	sq_map = mmap(NULL, resp->large_sq_mmap_len, PROT_READ | PROT_WRITE,
 		      MAP_SHARED, ctx->ibv_ctx.context.cmd_fd,
 		      resp->large_sq_mmap_offset);

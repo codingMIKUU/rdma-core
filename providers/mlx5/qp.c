@@ -91,6 +91,18 @@ struct mlx5_srm_wqe_timing_stats {
 	uint64_t cqe_wqes;
 	uint64_t post_to_cqe_cycles;
 	uint64_t missing_timestamps;
+	uint64_t kernel_to_user_cqes;
+	uint64_t kernel_to_user_cycles;
+	uint64_t kernel_poll_to_dispatch_cycles;
+	uint64_t dispatch_to_user_cycles;
+	uint64_t kernel_to_user_missing;
+	uint64_t kernel_to_user_invalid;
+	uint64_t poll_kernel_tsc_sum;
+	uint64_t poll_dispatch_tsc_sum;
+	uint64_t poll_post_tsc_sum;
+	uint32_t poll_post_wqes;
+	uint32_t poll_kernel_cqes;
+	bool poll_active;
 	uint32_t report_check_wqes;
 };
 
@@ -120,23 +132,18 @@ void mlx5_srm_timing_record_post(uint64_t total_cycles,
 	stats->db_cycles += db_cycles;
 }
 
-static void mlx5_srm_timing_complete(uint64_t post_tsc_sum, uint32_t wqes)
+static void mlx5_srm_timing_maybe_report(void)
 {
 	struct mlx5_srm_wqe_timing_stats *stats = &srm_wqe_timing_stats;
-	uint64_t now_tsc = mlx5_srm_timing_rdtsc();
 
-	if (post_tsc_sum && wqes) {
-		stats->cqe_wqes += wqes;
-		stats->post_to_cqe_cycles += now_tsc * wqes - post_tsc_sum;
-	} else {
-		stats->missing_timestamps++;
-	}
-	stats->report_check_wqes += wqes ? wqes : 1;
 	if (stats->report_check_wqes < MLX5_SRM_TIMING_REPORT_WQES)
 		return;
 
 	fprintf(stderr,
-		"SRM_WQE_TIMING algorithm=farm pid=%d thread=%lu post_calls=%llu post_wqes=%llu post_excl_db_avg_cycles=%.2f cqe_wqes=%llu post_to_cqe_avg_cycles=%.2f db_calls=%llu db_avg_cycles=%.2f missing_timestamps=%llu\n",
+		"SRM_WQE_TIMING algorithm=farm timing_abi=3 post_to_cqe_scope=post_entry_to_user_poll_return pid=%d thread=%lu post_calls=%llu post_wqes=%llu post_excl_db_avg_cycles=%.2f cqe_wqes=%llu post_to_cqe_avg_cycles=%.2f kernel_to_user_scope=kernel_cqe_poll_to_user_poll_return kernel_to_user_cqes=%llu kernel_to_user_cycles=%llu kernel_to_user_avg_cycles=%.2f "
+		"kernel_poll_to_dispatch_scope=kernel_poll_batch_return_to_cqe_publish kernel_poll_to_dispatch_cycles=%llu kernel_poll_to_dispatch_avg_cycles=%.2f "
+		"dispatch_to_user_scope=cqe_publish_to_user_poll_return dispatch_to_user_cycles=%llu dispatch_to_user_avg_cycles=%.2f "
+		"kernel_to_user_missing=%llu kernel_to_user_invalid=%llu db_calls=%llu db_avg_cycles=%.2f missing_timestamps=%llu\n",
 		getpid(), (unsigned long)pthread_self(),
 		(unsigned long long)stats->post_calls,
 		(unsigned long long)stats->post_wqes,
@@ -144,14 +151,88 @@ static void mlx5_srm_timing_complete(uint64_t post_tsc_sum, uint32_t wqes)
 		(unsigned long long)stats->cqe_wqes,
 		stats->cqe_wqes ?
 			(double)stats->post_to_cqe_cycles / stats->cqe_wqes : 0.0,
+		(unsigned long long)stats->kernel_to_user_cqes,
+		(unsigned long long)stats->kernel_to_user_cycles,
+		stats->kernel_to_user_cqes ?
+			(double)stats->kernel_to_user_cycles /
+			stats->kernel_to_user_cqes : 0.0,
+		(unsigned long long)stats->kernel_poll_to_dispatch_cycles,
+		stats->kernel_to_user_cqes ?
+			(double)stats->kernel_poll_to_dispatch_cycles /
+			stats->kernel_to_user_cqes : 0.0,
+		(unsigned long long)stats->dispatch_to_user_cycles,
+		stats->kernel_to_user_cqes ?
+			(double)stats->dispatch_to_user_cycles /
+			stats->kernel_to_user_cqes : 0.0,
+		(unsigned long long)stats->kernel_to_user_missing,
+		(unsigned long long)stats->kernel_to_user_invalid,
 		(unsigned long long)stats->db_calls,
 		stats->db_calls ? (double)stats->db_cycles / stats->db_calls : 0.0,
 		(unsigned long long)stats->missing_timestamps);
 	memset(stats, 0, sizeof(*stats));
 }
 
-void mlx5_srm_timing_complete_wq(struct mlx5_wq *wq, uint32_t idx)
+void mlx5_srm_timing_poll_begin(void)
 {
+	struct mlx5_srm_wqe_timing_stats *stats = &srm_wqe_timing_stats;
+
+	stats->poll_kernel_tsc_sum = 0;
+	stats->poll_dispatch_tsc_sum = 0;
+	stats->poll_kernel_cqes = 0;
+	stats->poll_post_tsc_sum = 0;
+	stats->poll_post_wqes = 0;
+	stats->poll_active = true;
+}
+
+void mlx5_srm_timing_poll_end(void)
+{
+	struct mlx5_srm_wqe_timing_stats *stats = &srm_wqe_timing_stats;
+	uint64_t end_tsc;
+
+	if (!stats->poll_active)
+		return;
+	end_tsc = mlx5_srm_timing_rdtsc();
+	stats->poll_active = false;
+	/* Use the same poll-return endpoint as both kernel handoff segments. */
+	stats->cqe_wqes += stats->poll_post_wqes;
+	stats->post_to_cqe_cycles += end_tsc * stats->poll_post_wqes -
+				    stats->poll_post_tsc_sum;
+	if (stats->poll_kernel_cqes) {
+		/* Unsigned subtraction first also handles wrap of the absolute
+		 * TSC sums. Raw sum comparisons would reject otherwise valid polls. */
+		uint64_t dispatch = stats->poll_dispatch_tsc_sum -
+				    stats->poll_kernel_tsc_sum;
+		uint64_t user = end_tsc * stats->poll_kernel_cqes -
+			       stats->poll_dispatch_tsc_sum;
+		uint64_t total = dispatch + user;
+
+		if ((int64_t)dispatch >= 0 && (int64_t)user >= 0 &&
+		    (int64_t)total >= 0) {
+			stats->kernel_to_user_cqes += stats->poll_kernel_cqes;
+			stats->kernel_poll_to_dispatch_cycles += dispatch;
+			stats->dispatch_to_user_cycles += user;
+			stats->kernel_to_user_cycles += total;
+		} else {
+			stats->kernel_to_user_invalid += stats->poll_kernel_cqes;
+		}
+	}
+	stats->poll_kernel_tsc_sum = 0;
+	stats->poll_dispatch_tsc_sum = 0;
+	stats->poll_kernel_cqes = 0;
+	stats->poll_post_tsc_sum = 0;
+	stats->poll_post_wqes = 0;
+	mlx5_srm_timing_maybe_report();
+}
+
+void mlx5_srm_timing_complete_wq(struct mlx5_wq *wq, uint32_t idx,
+			       const struct mlx5_cqe64 *cqe)
+{
+	struct mlx5_srm_wqe_timing_stats *stats = &srm_wqe_timing_stats;
+	struct mlx5_srm_kernel_cqe_timestamp record;
+	uint64_t expected;
+	uint64_t kernel_tsc;
+	uint64_t dispatch_tsc;
+	uint64_t now_tsc;
 	uint32_t wqes;
 	uint64_t sum;
 
@@ -161,17 +242,65 @@ void mlx5_srm_timing_complete_wq(struct mlx5_wq *wq, uint32_t idx)
 				     __ATOMIC_ACQ_REL);
 	sum = __atomic_exchange_n(&wq->srm_timing_post_tsc_sum[idx], 0,
 				    __ATOMIC_RELAXED);
-	mlx5_srm_timing_complete(sum, wqes);
+	now_tsc = mlx5_srm_timing_rdtsc();
+	if (wqes && stats->poll_active) {
+		stats->poll_post_wqes += wqes;
+		stats->poll_post_tsc_sum += sum;
+	} else {
+		stats->missing_timestamps++;
+		stats->kernel_to_user_missing++;
+		return;
+	}
+	stats->report_check_wqes += wqes ? wqes : 1;
+
+	if (!wq->srm_timing_kernel_cqe) {
+		stats->kernel_to_user_missing++;
+		return;
+	}
+	/* CQ polling has already observed ownership and executed its DMA read
+	 * barrier. Copy before publishing the CQ consumer index. Unlike the old
+	 * SQ-indexed side record, this survives arbitrary physical SQ reuse. */
+	_Static_assert(offsetof(struct mlx5_cqe64, srqn_uidx) == sizeof(record),
+		       "FARM timing must not overwrite CQE completion fields");
+	memcpy(&record, cqe, sizeof(record));
+	if (record.magic != MLX5_SRM_CQE_TIMING_MAGIC) {
+		stats->kernel_to_user_missing++;
+		return;
+	}
+	expected = wq->srm_timing_kernel_cqe[idx].expected_sequence;
+	if (record.sequence != expected) {
+		stats->kernel_to_user_invalid++;
+		return;
+	}
+	kernel_tsc = record.kernel_cqe_tsc;
+	dispatch_tsc = record.kernel_dispatch_tsc;
+	if (!kernel_tsc || !dispatch_tsc || !stats->poll_active) {
+		stats->kernel_to_user_missing++;
+		return;
+	}
+	if ((int64_t)(dispatch_tsc - kernel_tsc) < 0 ||
+	    (int64_t)(now_tsc - dispatch_tsc) < 0) {
+		stats->kernel_to_user_invalid++;
+		return;
+	}
+	stats->poll_kernel_tsc_sum += kernel_tsc;
+	stats->poll_dispatch_tsc_sum += dispatch_tsc;
+	stats->poll_kernel_cqes++;
 }
 
 static inline void mlx5_srm_timing_publish(struct mlx5_wq *wq, uint32_t idx,
-					    uint64_t post_tsc,
+					    uint64_t slot, uint64_t post_tsc,
 					    bool signaled)
 {
+	struct mlx5_srm_kernel_cqe_ref *ref;
+
 	wq->srm_timing_pending_tsc_sum += post_tsc;
 	wq->srm_timing_pending_wqes++;
 	if (!signaled)
 		return;
+	ref = &wq->srm_timing_kernel_cqe[idx];
+	ref->expected_sequence =
+		(slot + 1) & MLX5_SRM_WRID_POST_MASK;
 	__atomic_store_n(&wq->srm_timing_post_tsc_sum[idx],
 			 wq->srm_timing_pending_tsc_sum, __ATOMIC_RELAXED);
 	__atomic_store_n(&wq->srm_timing_post_wqes[idx],
@@ -1908,7 +2037,8 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		post_wq->cur_post += DIV_ROUND_UP(size * 16, MLX5_SEND_WQE_BB);
 #if MLX5_SRM_ENABLE_WQE_TIMING
 		if (wqe_timing)
-			mlx5_srm_timing_publish(post_wq, idx, wqe_timing_start,
+			mlx5_srm_timing_publish(post_wq, idx, slot,
+						     wqe_timing_start,
 						     ctrl->fm_ce_se &
 						     MLX5_WQE_CTRL_CQ_UPDATE);
 #endif

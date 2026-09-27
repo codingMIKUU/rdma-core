@@ -491,22 +491,47 @@ struct mlx5_sq_ctrl_page {
 	uint64_t resv_idx;
 	uint32_t farm_lock;
 	uint32_t farm_bf_offset;
-	uint8_t resv_pad[48];
+	uint32_t timing_abi;
+	uint8_t resv_pad[44];
 	uint64_t cons_idx;
 	uint8_t cons_pad[56];
 } __attribute__((aligned(64)));
 _Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 128,
 	       "hollow RC ctrl ABI must occupy two cachelines");
 
-/* Compile-time only: zero hot-path cost and zero extra metadata by default. */
+/* Compile-time only: zero hot-path cost and zero extra metadata when disabled. */
+#ifndef MLX5_SRM_ENABLE_WQE_TIMING
 #define MLX5_SRM_ENABLE_WQE_TIMING 1
+#endif
 #if MLX5_SRM_ENABLE_WQE_TIMING != 0 && MLX5_SRM_ENABLE_WQE_TIMING != 1
 #error "MLX5_SRM_ENABLE_WQE_TIMING must be 0 or 1"
 #endif
 
+struct mlx5_srm_kernel_cqe_timestamp {
+	uint64_t kernel_cqe_tsc;
+	uint64_t kernel_dispatch_tsc;
+	uint64_t sequence;
+	uint64_t magic;
+};
+_Static_assert(sizeof(struct mlx5_srm_kernel_cqe_timestamp) == 32,
+	       "FARM send timing must fit in the CQE request-reserved prefix");
+#define MLX5_SRM_KERNEL_CQE_TIMING_ABI 3U
+#define MLX5_SRM_CQE_TIMING_MAGIC 0x4641524d54534333ULL
+
+/* Timestamps now travel with the software send CQE, not a reusable SQ slot.
+ * Bytes 32..63 (routing, byte count, hardware timestamp, errors and owner)
+ * are unchanged. Kernel XRC initiators do not enable scatter-to-CQE. */
+#define MLX5_SRM_PUBLISH_MAP_BYTES(depth) \
+	((size_t)(depth) * sizeof(uint64_t))
+
+struct mlx5_srm_kernel_cqe_ref {
+	uint64_t expected_sequence;
+};
+
 #define MLX5_SRM_PUBLISH_USR_BITS 16
 #define MLX5_SRM_PUBLISH_USR_MASK ((1ULL << MLX5_SRM_PUBLISH_USR_BITS) - 1)
 #define MLX5_SRM_PUBLISH_SEQ_MASK ((1ULL << 48) - 1)
+#define MLX5_SRM_WRID_POST_MASK 0xffffffffULL
 
 static inline uint64_t mlx5_srm_publish_token(uint64_t slot, uint16_t usr_rc)
 {
@@ -680,6 +705,7 @@ struct mlx5_wq {
 #if MLX5_SRM_ENABLE_WQE_TIMING
 	uint64_t			*srm_timing_post_tsc_sum;
 	uint32_t			*srm_timing_post_wqes;
+	struct mlx5_srm_kernel_cqe_ref	*srm_timing_kernel_cqe;
 	uint64_t			srm_timing_pending_tsc_sum;
 	uint32_t			srm_timing_pending_wqes;
 #endif
@@ -1319,7 +1345,10 @@ int mlx5_poll_cq_v1(struct ibv_cq *cq, int ne, struct ibv_wc *wc);
 void mlx5_srm_timing_record_post(uint64_t total_cycles,
 				 uint64_t db_cycles, uint32_t db_calls,
 				 uint32_t wqes);
-void mlx5_srm_timing_complete_wq(struct mlx5_wq *wq, uint32_t idx);
+void mlx5_srm_timing_complete_wq(struct mlx5_wq *wq, uint32_t idx,
+			       const struct mlx5_cqe64 *cqe);
+void mlx5_srm_timing_poll_begin(void);
+void mlx5_srm_timing_poll_end(void);
 #endif
 int mlx5_arm_cq(struct ibv_cq *cq, int solicited);
 void mlx5_cq_event(struct ibv_cq *cq);
