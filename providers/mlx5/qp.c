@@ -69,6 +69,12 @@ static const uint32_t mlx5_ib_opcode[] = {
 struct mlx5_srm_wqe_timing_stats {
 	uint64_t cqe_wqes;
 	uint64_t post_to_cqe_cycles;
+	uint64_t kernel_to_user_cqes;
+	uint64_t kernel_to_user_cycles;
+	uint64_t kernel_to_user_missing;
+	uint64_t kernel_to_user_invalid;
+	uint64_t poll_kernel_tsc_sum;
+	uint32_t poll_kernel_cqes;
 	uint64_t missing_timestamps;
 	uint64_t invalid_timestamps;
 	uint64_t errored_wqes;
@@ -103,26 +109,66 @@ static void mlx5_srm_timing_complete(uint64_t post_tsc_sum, uint32_t wqes,
 		stats->missing_timestamps++;
 	}
 	stats->report_check_wqes += wqes ? wqes : 1;
+}
+
+void mlx5_srm_timing_poll_begin(void)
+{
+	struct mlx5_srm_wqe_timing_stats *stats = &srm_wqe_timing_stats;
+
+	stats->poll_kernel_tsc_sum = 0;
+	stats->poll_kernel_cqes = 0;
+}
+
+void mlx5_srm_timing_poll_end(void)
+{
+	struct mlx5_srm_wqe_timing_stats *stats = &srm_wqe_timing_stats;
+	uint64_t end_tsc = mlx5_srm_timing_rdtsc();
+	uint64_t elapsed;
+
+	if (stats->poll_kernel_cqes) {
+		elapsed = end_tsc * stats->poll_kernel_cqes -
+			  stats->poll_kernel_tsc_sum;
+		if ((int64_t)elapsed < 0)
+			stats->kernel_to_user_invalid += stats->poll_kernel_cqes;
+		else {
+			stats->kernel_to_user_cqes += stats->poll_kernel_cqes;
+			stats->kernel_to_user_cycles += elapsed;
+		}
+	}
+	stats->poll_kernel_tsc_sum = 0;
+	stats->poll_kernel_cqes = 0;
+
 	if (stats->report_check_wqes < MLX5_SRM_TIMING_REPORT_WQES)
 		return;
 
 	fprintf(stderr,
-		"SRM_WQE_TIMING algorithm=srm pid=%d thread=%lu cqe_wqes=%llu post_to_cqe_cycles=%llu post_to_cqe_avg_cycles=%.2f missing_timestamps=%llu invalid_timestamps=%llu error_wqes=%llu\n",
+		"SRM_WQE_TIMING algorithm=srm kernel_to_user_scope=kernel_cqe_poll_to_user_poll_return pid=%d thread=%lu cqe_wqes=%llu post_to_cqe_cycles=%llu post_to_cqe_avg_cycles=%.2f kernel_to_user_cqes=%llu kernel_to_user_cycles=%llu kernel_to_user_avg_cycles=%.2f kernel_to_user_missing=%llu kernel_to_user_invalid=%llu missing_timestamps=%llu invalid_timestamps=%llu error_wqes=%llu\n",
 		getpid(), (unsigned long)pthread_self(),
 		(unsigned long long)stats->cqe_wqes,
 		(unsigned long long)stats->post_to_cqe_cycles,
 		stats->cqe_wqes ?
 			(double)stats->post_to_cqe_cycles / stats->cqe_wqes : 0.0,
+		(unsigned long long)stats->kernel_to_user_cqes,
+		(unsigned long long)stats->kernel_to_user_cycles,
+		stats->kernel_to_user_cqes ?
+			(double)stats->kernel_to_user_cycles /
+			stats->kernel_to_user_cqes : 0.0,
+		(unsigned long long)stats->kernel_to_user_missing,
+		(unsigned long long)stats->kernel_to_user_invalid,
 		(unsigned long long)stats->missing_timestamps,
 		(unsigned long long)stats->invalid_timestamps,
 		(unsigned long long)stats->errored_wqes);
 	memset(stats, 0, sizeof(*stats));
 }
 
-void mlx5_srm_timing_complete_wq(struct mlx5_wq *wq, uint32_t idx, bool error)
+void mlx5_srm_timing_complete_wq(struct mlx5_wq *wq, uint32_t counter,
+				 bool error)
 {
 	uint64_t now_tsc = mlx5_srm_timing_rdtsc();
+	struct mlx5_srm_wqe_timing_stats *stats = &srm_wqe_timing_stats;
+	struct mlx5_srm_timing_slot *timing_slot;
 	struct mlx5_srm_cqe_timing *slot;
+	uint32_t idx = counter & (wq->wqe_cnt - 1);
 	uint32_t wqes = 0;
 	uint64_t sum = 0;
 	if (!wq->srm_cqe_timing)
@@ -138,6 +184,32 @@ void mlx5_srm_timing_complete_wq(struct mlx5_wq *wq, uint32_t idx, bool error)
 		slot->pending_cqes--;
 	}
 	__atomic_store_n(&slot->lock, 0, __ATOMIC_RELEASE);
+
+	timing_slot = &wq->srm_timing_slots[idx];
+	if (__atomic_load_n(&timing_slot->kernel_cqe_valid,
+				    __ATOMIC_ACQUIRE)) {
+		uint32_t post_sequence = __atomic_load_n(&timing_slot->sequence,
+						       __ATOMIC_RELAXED);
+		uint32_t kernel_sequence = __atomic_load_n(
+			&timing_slot->kernel_cqe_sequence, __ATOMIC_RELAXED);
+		uint64_t kernel_tsc = __atomic_load_n(
+			&timing_slot->kernel_cqe_tsc, __ATOMIC_RELAXED);
+
+		/* The legacy SRM route stores only the hardware's 16-bit WQE
+		 * counter.  A live SQ window is smaller than 2^16, so the low bits
+		 * uniquely identify the matching post even after counter wrap. */
+		if ((uint16_t)kernel_sequence == (uint16_t)post_sequence &&
+		    kernel_tsc) {
+			stats->poll_kernel_tsc_sum += kernel_tsc;
+			stats->poll_kernel_cqes++;
+		} else {
+			stats->kernel_to_user_invalid++;
+		}
+		__atomic_store_n(&timing_slot->kernel_cqe_valid, 0,
+				 __ATOMIC_RELEASE);
+	} else {
+		stats->kernel_to_user_missing++;
+	}
 	mlx5_srm_timing_complete(sum, wqes, error, now_tsc);
 }
 
@@ -1323,6 +1395,8 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		if (wqe_timing) {
 			struct mlx5_srm_timing_slot *slot = &qp->sq.srm_timing_slots[idx];
 
+			__atomic_store_n(&slot->kernel_cqe_valid, 0,
+					 __ATOMIC_RELAXED);
 			slot->post_tsc = wqe_timing_start;
 			slot->sequence = qp->sq.cur_post;
 			__atomic_store_n(&slot->valid, 1, __ATOMIC_RELEASE);

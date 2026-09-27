@@ -759,7 +759,7 @@ again:
 		idx = wqe_ctr & (wq->wqe_cnt - 1);
 #if MLX5_SRM_ENABLE_WQE_TIMING
 		if (mqp->ibv_qp && mqp->ibv_qp->qp_type == IBV_QPT_SRM)
-			mlx5_srm_timing_complete_wq(wq, idx, false);
+			mlx5_srm_timing_complete_wq(wq, wqe_ctr, false);
 #endif
 		if (lazy) {
 			uint32_t wc_byte_len;
@@ -916,7 +916,7 @@ again:
 			idx = wqe_ctr & (wq->wqe_cnt - 1);
 #if MLX5_SRM_ENABLE_WQE_TIMING
 			if (mqp->ibv_qp && mqp->ibv_qp->qp_type == IBV_QPT_SRM)
-				mlx5_srm_timing_complete_wq(wq, idx, true);
+				mlx5_srm_timing_complete_wq(wq, wqe_ctr, true);
 #endif
 			if (lazy)
 				cq->verbs_cq.cq_ex.wr_id = wq->wrid[idx];
@@ -1021,6 +1021,9 @@ static inline int poll_cq(struct ibv_cq *ibcq, int ne,
 	struct mlx5_srq *srq = NULL;
 	int npolled;
 	int err = CQ_OK;
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	mlx5_srm_timing_poll_begin();
+#endif
 
 	if (cq->stall_enable) {
 		if (cq->stall_adaptive_enable) {
@@ -1064,6 +1067,9 @@ static inline int poll_cq(struct ibv_cq *ibcq, int ne,
 		}
 	}
 
+#if MLX5_SRM_ENABLE_WQE_TIMING
+	mlx5_srm_timing_poll_end();
+#endif
 	return err == CQ_POLL_ERR ? err : npolled;
 }
 

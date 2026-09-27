@@ -1190,7 +1190,10 @@ int mlx5_destroy_cq(struct ibv_cq *cq);
 int mlx5_poll_cq(struct ibv_cq *cq, int ne, struct ibv_wc *wc);
 int mlx5_poll_cq_v1(struct ibv_cq *cq, int ne, struct ibv_wc *wc);
 #if MLX5_SRM_ENABLE_WQE_TIMING
-void mlx5_srm_timing_complete_wq(struct mlx5_wq *wq, uint32_t idx, bool error);
+void mlx5_srm_timing_complete_wq(struct mlx5_wq *wq, uint32_t counter,
+				 bool error);
+void mlx5_srm_timing_poll_begin(void);
+void mlx5_srm_timing_poll_end(void);
 #endif
 int mlx5_arm_cq(struct ibv_cq *cq, int solicited);
 void mlx5_cq_event(struct ibv_cq *cq);
