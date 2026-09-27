@@ -478,7 +478,7 @@ struct mlx5_pd {
 
 /* Match scheduler.h; the reserved control-slot layout stays 512 bytes. */
 #ifndef MLX5_SRM_ENABLE_DB_SHARE_STATS
-#define MLX5_SRM_ENABLE_DB_SHARE_STATS 1
+#define MLX5_SRM_ENABLE_DB_SHARE_STATS 0
 #endif
 
 struct mlx5_srm_db_share {
@@ -550,7 +550,7 @@ _Static_assert(sizeof(struct mlx5_sq_ctrl_page) == 512,
 
 /* Match both driver builds. Off: no timestamp storage or hot-path hooks. */
 #ifndef MLX5_SRM_ENABLE_WQE_TIMING
-#define MLX5_SRM_ENABLE_WQE_TIMING 0
+#define MLX5_SRM_ENABLE_WQE_TIMING 1
 #endif
 #if MLX5_SRM_ENABLE_WQE_TIMING != 0 && MLX5_SRM_ENABLE_WQE_TIMING != 1
 #error "MLX5_SRM_ENABLE_WQE_TIMING must be 0 or 1"
@@ -674,7 +674,7 @@ static inline void mlx5_srm_record_user_db_share(
 
 /* Direct user MMIO is the FARM fast path; the syscall experiment stays off. */
 #ifndef MLX5_SRM_ENABLE_DIRECT_USER_DB
-#define MLX5_SRM_ENABLE_DIRECT_USER_DB 1
+#define MLX5_SRM_ENABLE_DIRECT_USER_DB 0
 #endif
 
 /* Keep the large-KQP selector and its per-doorbell cap in sync with the
