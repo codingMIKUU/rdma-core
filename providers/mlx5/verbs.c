@@ -259,6 +259,9 @@ static __thread struct ibv_context *tls_srm_ctx;
 static __thread struct ibv_qp *tls_hidden_srm_qp[SRM_NUM_SCHED*SRM_NUM_LEVEL];
 static __thread uint32_t tls_srm_thread_idx;
 static __thread uint32_t tls_next_rc_db_idx;
+/* Slot consumed by the next custom QP create command. */
+static __thread uint32_t tls_srm_create_slot;
+static __thread int tls_srm_create_slot_valid;
 static pthread_mutex_t g_srm_thread_idx_mutex = PTHREAD_MUTEX_INITIALIZER;
 static uint32_t g_srm_next_thread_idx;
 
@@ -2912,6 +2915,10 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 	cmd.sq_wqe_count = qp->sq.wqe_cnt;
 	cmd.rq_wqe_count = qp->rq.wqe_cnt;
 	cmd.rq_wqe_shift = qp->rq.wqe_shift;
+	if (tls_srm_create_slot_valid) {
+		cmd.srm_slot = tls_srm_create_slot;
+		cmd.srm_slot_valid = 1;
+	}
 
 	if (!ctx->cqe_version) {
 		cmd.uidx = 0xffffff;
@@ -3811,10 +3818,24 @@ struct ibv_qp *mlx5_create_qp_ex(struct ibv_context *context,
 	if (attr->qp_type == IBV_QPT_RC && attr->rnode_num > 0) {
 		struct ibv_qp *qp;
 		struct mlx5_qp *mqp;
+		uint32_t qp_index = attr->srm_layout_valid ?
+			attr->srm_qp_index : tls_next_rc_db_idx;
+		uint32_t qps_per_proxy = SRM_NUM_SCHED * SRM_NUM_LEVEL;
+
+		if (attr->sender_side && attr->srm_layout_valid &&
+		    (attr->srm_thread_idx >= attr->srm_app_threads ||
+		     attr->srm_qp_index >=
+			qps_per_proxy * attr->srm_xrc_qp_num_per_srm)) {
+			errno = EINVAL;
+			return NULL;
+		}
 
 		if (attr->sender_side &&
 		    (tls_hidden_srm_qp[0] == NULL || tls_srm_ctx != context)) {
 			struct ibv_qp_init_attr_ex srm_attr;
+			tls_srm_thread_idx = attr->srm_layout_valid ?
+				attr->srm_thread_idx : mlx5_srm_assign_thread_idx();
+			tls_next_rc_db_idx = 0;
 			memcpy(&srm_attr, attr, sizeof(srm_attr));
 			srm_attr.qp_type = IBV_QPT_SRM;
 			srm_attr.cap.max_send_wr = 4096;
@@ -3827,16 +3848,30 @@ struct ibv_qp *mlx5_create_qp_ex(struct ibv_context *context,
 			srm_attr.cap.max_send_sge = 1;
 
 
-			for(int i = 0;i<SRM_NUM_SCHED*SRM_NUM_LEVEL;i++)
+			for (int i = 0; i < SRM_NUM_SCHED * SRM_NUM_LEVEL; i++) {
+				tls_srm_create_slot =
+					tls_srm_thread_idx * qps_per_proxy + i;
+				tls_srm_create_slot_valid = 1;
 				tls_hidden_srm_qp[i] = mlx5_create_srm_bundle_qp(context, &srm_attr);
+				tls_srm_create_slot_valid = 0;
+			}
 			if (!tls_hidden_srm_qp[0])
 				return NULL;
 			tls_srm_ctx = context;
-			tls_srm_thread_idx = mlx5_srm_assign_thread_idx(context);
-			tls_next_rc_db_idx = 0;
 		}
 
+		if (attr->sender_side) {
+			uint32_t proxy_idx = qp_index / qps_per_proxy;
+			uint32_t level_sched_idx = qp_index % qps_per_proxy;
+
+			tls_srm_create_slot =
+				tls_srm_thread_idx * qps_per_proxy *
+					attr->srm_xrc_qp_num_per_srm +
+				proxy_idx * qps_per_proxy + level_sched_idx;
+			tls_srm_create_slot_valid = 1;
+		}
 		qp = create_qp(context, attr, NULL);
+		tls_srm_create_slot_valid = 0;
 		if (!qp)
 			return NULL;
 		if (attr->sender_side) {
@@ -3845,7 +3880,9 @@ struct ibv_qp *mlx5_create_qp_ex(struct ibv_context *context,
 			for(int i =0;i<SRM_NUM_SCHED*SRM_NUM_LEVEL;i++)
 				mqp->srm_proxy_qp[i] = tls_hidden_srm_qp[i];
 			mqp->srm_thread_idx = tls_srm_thread_idx;
-			mqp->srm_proxy_db_idx = tls_next_rc_db_idx++/2 % attr->srm_xrc_qp_num_per_srm;
+			mqp->srm_proxy_db_idx =
+				(qp_index / qps_per_proxy) % attr->srm_xrc_qp_num_per_srm;
+			tls_next_rc_db_idx++;
 			mqp->srm_proxy_enabled = attr->sender_side ? 1 : 0;
 			mqp->srm_num_level = SRM_NUM_LEVEL;
 			mqp->srm_num_sched = SRM_NUM_SCHED;
@@ -3854,6 +3891,7 @@ struct ibv_qp *mlx5_create_qp_ex(struct ibv_context *context,
 			qp->srm_level_table = g_srm_tables.level_table;
 			qp->srm_xrc_table = g_srm_tables.xrc_table;
 			
+#if CHORD_INIT_DEBUG
 			fprintf(stderr,
 				"[mlx5-rc-srm] qpn=%u thread_idx=%u db_idx=%u rnode_num=%u  num_level=%u num_sched=%u\n",
 				qp->qp_num,
@@ -3862,6 +3900,7 @@ struct ibv_qp *mlx5_create_qp_ex(struct ibv_context *context,
 				attr->rnode_num,
 				mqp->srm_num_level,
 				mqp->srm_num_sched);
+#endif
 		}
 		
 		return qp;

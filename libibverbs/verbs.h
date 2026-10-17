@@ -1048,6 +1048,10 @@ struct ibv_qp_init_attr_ex {
 	uint64_t srm_wqe_table_bytes;
 	uint64_t srm_level_table_bytes;
 	uint64_t srm_xrc_table_bytes;
+	/* Explicit CHORD layout; avoids deriving kernel slots from create order. */
+	uint32_t srm_layout_valid;
+	uint32_t srm_thread_idx;
+	uint32_t srm_qp_index;
 };
 
 enum ibv_qp_open_attr_mask {

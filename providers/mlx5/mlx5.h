@@ -54,6 +54,11 @@
 
 #define PFX		"mlx5: "
 
+/* Set to 1 only when diagnosing CHORD resource creation. */
+#ifndef CHORD_INIT_DEBUG
+#define CHORD_INIT_DEBUG 0
+#endif
+
 #ifndef PCI_VENDOR_ID_MELLANOX
 #define PCI_VENDOR_ID_MELLANOX 0x15b3
 #endif

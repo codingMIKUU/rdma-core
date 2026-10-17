@@ -350,6 +350,8 @@ struct mlx5_ib_create_qp {
 	__u32 db_bf_reg_size;
 	__u32 bf_buf_size;
 	__u32 bf_offset;	
+	__u32 srm_slot;
+	__u16 srm_slot_valid;
 	__u16 reserved;
 };
 
