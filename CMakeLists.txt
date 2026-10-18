@@ -63,6 +63,19 @@ else()
 endif()
 project(rdma-core C)
 
+# Compile the CHORD process-wide XRC data-QP pool only when explicitly
+# requested.  Keeping this off removes the pool tests from the ordinary RC
+# mlx5 post-send hot path.
+option(CHORD_XRC_POOL "Enable the private CHORD XRC data-QP pool" OFF)
+if(CHORD_XRC_POOL)
+  add_definitions(-DCHORD_ENABLE_XRC_POOL=1)
+else()
+  # Define the disabled value as well.  Several public/provider structures
+  # are conditional on this macro, so relying on per-header defaults can
+  # give verbs.h and mlx5.h different layouts in the same translation unit.
+  add_definitions(-DCHORD_ENABLE_XRC_POOL=0)
+endif()
+
 # CMake likes to use -rdynamic too much, they fixed it in 3.4.
 if(POLICY CMP0065)
   cmake_policy(SET CMP0065 NEW)

@@ -940,7 +940,18 @@ struct srm_qp_entry{
 	uint64_t ctrl;
 	uint64_t bytes;
 	uint64_t cycles;
+	/* CHORD XRC-pool entries use a per-thread physical lane and an
+	 * absolute WQEBB end position.  The structure remains one cache line. */
+#if CHORD_ENABLE_XRC_POOL
+	uint64_t end_bb;
+	uint32_t flags;
+	uint32_t owner_thread;
+#endif
 }__attribute__((__aligned__(64)));
+
+#if CHORD_ENABLE_XRC_POOL
+#define SRM_QP_ENTRY_F_XRC_POOL (1U << 0)
+#endif
 
 struct srm_xrc_table_entry {
 	uint64_t ctrl;
@@ -1246,6 +1257,13 @@ struct ibv_send_wr {
 	union {
 		struct {
 			uint32_t    remote_srqn;
+#if CHORD_ENABLE_XRC_POOL
+			/* Private CHORD XRC-pool metadata.  Ignored by standard XRC. */
+			struct ibv_qp *schedule_qp;
+			uint32_t pool_lane;
+			uint32_t owner_thread;
+			uint32_t level;
+#endif
 		} xrc;
 		struct {
 			uint32_t 	remote_srqn;
@@ -3237,7 +3255,11 @@ ibv_create_qp_ex(struct ibv_context *context, struct ibv_qp_init_attr_ex *qp_ini
 	struct verbs_context *vctx;
 	uint32_t mask = qp_init_attr_ex->comp_mask;
 
-	if (mask == IBV_QP_INIT_ATTR_PD && qp_init_attr_ex->qp_type != IBV_QPT_RC)
+	if (mask == IBV_QP_INIT_ATTR_PD &&
+	    qp_init_attr_ex->qp_type != IBV_QPT_RC &&
+	    qp_init_attr_ex->qp_type != IBV_QPT_SRM &&
+	    !(qp_init_attr_ex->qp_type == IBV_QPT_XRC_SEND &&
+	      qp_init_attr_ex->sender_side))
 		return ibv_create_qp(qp_init_attr_ex->pd,
 				     (struct ibv_qp_init_attr *)qp_init_attr_ex);
 	vctx = verbs_get_ctx_op(context, create_qp_ex);

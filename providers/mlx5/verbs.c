@@ -308,6 +308,12 @@ static struct ibv_qp *mlx5_create_srm_bundle_qp(struct ibv_context *context,
 		mqp->sq.wqe_cnt << MLX5_SEND_WQE_SHIFT / sizeof(struct srm_qp_entry);
 	mqp->xrc_qp_arr = NULL;
 	mqp->xrc_qp_arr_cnt = 0;
+#if CHORD_ENABLE_XRC_POOL
+	if (attr->sender_side) {
+		mqp->srm_proxy_enabled = 1;
+		mqp->srm_thread_idx = attr->srm_thread_idx;
+	}
+#endif
 
 	return qp;
 }
@@ -2853,6 +2859,12 @@ static struct ibv_qp *create_qp(struct ibv_context *context,
 	cmd.flags = mlx5_create_flags;
 	if (attr->qp_type == IBV_QPT_RC && attr->sender_side)
 		cmd.flags |= MLX5_QP_FLAG_SRM_SENDER;
+#if CHORD_ENABLE_XRC_POOL
+	if (attr->qp_type == IBV_QPT_XRC_SEND && attr->sender_side) {
+		cmd.flags |= MLX5_QP_FLAG_SRM_SENDER;
+		cmd.flags |= MLX5_QP_FLAG_CHORD_XRC_POOL;
+	}
+#endif
 	qp->wq_sig = qp_sig_enabled();
 	if (qp->wq_sig)
 		cmd.flags |= MLX5_QP_FLAG_SIGNATURE;
@@ -3812,8 +3824,43 @@ int mlx5_detach_mcast(struct ibv_qp *qp, const union ibv_gid *gid, uint16_t lid)
 struct ibv_qp *mlx5_create_qp_ex(struct ibv_context *context,
 				 struct ibv_qp_init_attr_ex *attr)
 {
-	if (attr->qp_type == IBV_QPT_SRM)
-		return mlx5_create_srm_bundle_qp(context, attr);
+	if (attr->qp_type == IBV_QPT_SRM) {
+		struct ibv_qp *qp;
+
+		if (attr->srm_layout_valid) {
+			tls_srm_create_slot = attr->srm_thread_idx *
+				(SRM_NUM_LEVEL * SRM_NUM_SCHED) + attr->srm_qp_index;
+			tls_srm_create_slot_valid = 1;
+		}
+		qp = mlx5_create_srm_bundle_qp(context, attr);
+		tls_srm_create_slot_valid = 0;
+		return qp;
+	}
+
+	if (attr->qp_type == IBV_QPT_XRC_SEND && attr->sender_side) {
+#if CHORD_ENABLE_XRC_POOL
+		struct ibv_qp *qp;
+		struct mlx5_qp *mqp;
+
+		tls_srm_create_slot = attr->srm_qp_index;
+		tls_srm_create_slot_valid = 1;
+		qp = create_qp(context, attr, NULL);
+		tls_srm_create_slot_valid = 0;
+		if (!qp)
+			return NULL;
+		mqp = to_mqp(qp);
+		mqp->chord_xrc_pool = 1;
+		mqp->chord_pool_lane = attr->srm_qp_index;
+		mqp->chord_abs_post_bb = 0;
+		return qp;
+#else
+		/* A CHORD application linked against an ordinary rdma-core must fail
+		 * during initialization rather than silently ringing the XRC SQ from
+		 * userspace and bypassing the scheduler. */
+		errno = EOPNOTSUPP;
+		return NULL;
+#endif
+	}
 
 	if (attr->qp_type == IBV_QPT_RC && attr->rnode_num > 0) {
 		struct ibv_qp *qp;

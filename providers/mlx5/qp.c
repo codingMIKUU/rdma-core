@@ -1003,6 +1003,9 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 	uint32_t max_tso = 0;
 	FILE *fp = to_mctx(ibqp->context)->dbg_fp; /* The compiler ignores in non-debug mode */
 	uint32_t imm;
+#if CHORD_ENABLE_XRC_POOL
+	uint32_t chord_start_post = qp->sq.cur_post;
+#endif
 
 	uint64_t wr_id;
 	mlx5_spin_lock(&qp->sq.lock);
@@ -1359,7 +1362,19 @@ static inline int _mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 out:
 	qp->fm_cache = next_fence;
 	if (!err) {
+#if CHORD_ENABLE_XRC_POOL
+		if (qp->chord_xrc_pool) {
+			uint32_t posted_bb = qp->sq.cur_post - chord_start_post;
+
+			qp->chord_abs_post_bb += posted_bb;
+			qp->chord_last_end_bb = qp->chord_abs_post_bb;
+			qp->chord_last_ctrl = ctrl ? *(uint64_t *)ctrl : 0;
+		}
+		if ((ibqp->qp_type == IBV_QPT_RC && qp->sender_side) ||
+		    qp->chord_xrc_pool)
+#else
 		if (ibqp->qp_type == IBV_QPT_RC && qp->sender_side)
+#endif
 			fc_post_send_db(qp, bf, nreq, inl, size, ctrl);
 		else
 			post_send_db(qp, bf, nreq, inl, size, ctrl);
@@ -1449,6 +1464,14 @@ int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 				entry->qp_idx = xrc_qp_idx;
 				entry->ctrl = cur->wr_id;
 				entry->bytes = bytes;
+#if CHORD_ENABLE_XRC_POOL
+				/* This proxy ring carries an ordinary RC scheduling entry.
+				 * Clear the XRC-lane tag before publishing valid so an
+				 * XRC-capable provider/kernel pair remains RC-compatible. */
+				entry->end_bb = 0;
+				entry->flags = 0;
+				entry->owner_thread = mqp->srm_thread_idx;
+#endif
 				__atomic_store_n(&entry->valid, 1, __ATOMIC_RELEASE);
 
 				// if (rc_srm_dbg_cnt < 16) {
@@ -1496,8 +1519,84 @@ int mlx5_post_send(struct ibv_qp *ibqp, struct ibv_send_wr *wr,
 		return 0;
 	}
 
+#if CHORD_ENABLE_XRC_POOL
+	if (ibqp->qp_type == IBV_QPT_XRC_SEND && to_mqp(ibqp)->chord_xrc_pool) {
+		struct mlx5_qp *mqp = to_mqp(ibqp);
+		struct ibv_qp *proxy;
+		struct mlx5_qp *proxy_mqp;
+		struct srm_qp_entry *entry;
+		struct srm_aligned_u32 *wqe_table;
+		struct srm_aligned_u32 *level_table;
+		uint32_t proxy_idx, entry_idx, wqe_idx, level_idx;
+		uint64_t bytes = 0;
+		int i;
 
-	
+		if (!wr || wr->next || !wr->qp_type.xrc.schedule_qp ||
+		    (wr->opcode != IBV_WR_RDMA_READ &&
+		     wr->opcode != IBV_WR_RDMA_WRITE) ||
+		    !(wr->send_flags & IBV_SEND_SIGNALED) || wr->num_sge != 1 ||
+		    !wr->sg_list || (wr->send_flags & IBV_SEND_INLINE)) {
+			if (bad_wr)
+				*bad_wr = wr;
+			return EOPNOTSUPP;
+		}
+
+		proxy = wr->qp_type.xrc.schedule_qp;
+		proxy_mqp = to_mqp(proxy);
+		proxy_idx = wr->qp_type.xrc.level * SRM_NUM_SCHED;
+		if (proxy->qp_type != IBV_QPT_SRM ||
+		    wr->qp_type.xrc.level >= SRM_NUM_LEVEL ||
+		    wr->qp_type.xrc.pool_lane != mqp->chord_pool_lane) {
+			if (bad_wr)
+				*bad_wr = wr;
+			return EINVAL;
+		}
+
+		for (i = 0; i < wr->num_sge; i++)
+			bytes += wr->sg_list[i].length;
+
+		/* Reserve scheduler-ring capacity before consuming a physical SQ
+		 * WQEBB.  Each logical CHORD thread is the sole producer of its
+		 * proxy ring, so observing a busy next entry is sufficient. */
+		entry_idx = proxy_mqp->sq.cur_post &
+			(proxy_mqp->sq.srm_entries_cap - 1);
+		entry = mlx5_get_srm_qp_entry(proxy_mqp, entry_idx);
+		if (__atomic_load_n(&entry->valid, __ATOMIC_ACQUIRE) != 0) {
+			if (bad_wr)
+				*bad_wr = wr;
+			return EAGAIN;
+		}
+
+		ret = _mlx5_post_send(ibqp, wr, bad_wr);
+		if (ret)
+			return ret;
+
+		entry->qp_idx = mqp->chord_pool_lane;
+		entry->ctrl = mqp->chord_last_ctrl;
+		entry->bytes = bytes;
+		entry->cycles = 0;
+		entry->end_bb = mqp->chord_last_end_bb;
+		entry->flags = SRM_QP_ENTRY_F_XRC_POOL;
+		entry->owner_thread = wr->qp_type.xrc.owner_thread;
+		__atomic_store_n(&entry->valid, 1, __ATOMIC_RELEASE);
+
+		wqe_table = (struct srm_aligned_u32 *)proxy->srm_wqe_table;
+		level_table = (struct srm_aligned_u32 *)proxy->srm_level_table;
+		wqe_idx = wr->qp_type.xrc.owner_thread *
+			(SRM_NUM_LEVEL * SRM_NUM_SCHED) + proxy_idx;
+		level_idx = wr->qp_type.xrc.level;
+		if (wqe_table)
+			__atomic_fetch_add(&wqe_table[wqe_idx].val, 1,
+					   __ATOMIC_RELEASE);
+		if (level_table)
+			__atomic_fetch_add(&level_table[level_idx].val, 1,
+					   __ATOMIC_RELEASE);
+		proxy_mqp->sq.cur_post++;
+		return 0;
+	}
+#endif
+
+	return _mlx5_post_send(ibqp, wr, bad_wr);
 }
 
 enum {

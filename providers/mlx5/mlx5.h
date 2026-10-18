@@ -44,6 +44,10 @@
 #include <util/udma_barrier.h>
 #include <util/cl_qmap.h>
 #include <util/util.h>
+
+#ifndef CHORD_ENABLE_XRC_POOL
+#define CHORD_ENABLE_XRC_POOL 1
+#endif
 #include "mlx5-abi.h"
 #include <util/bitmap.h>
 #include <ccan/list.h>
@@ -755,6 +759,13 @@ struct mlx5_qp {
 	uint32_t srm_num_level;
 	uint32_t srm_num_sched;
 	uint32_t srm_max_xrc_qp_per_srm;
+#if CHORD_ENABLE_XRC_POOL
+	uint8_t chord_xrc_pool;
+	uint32_t chord_pool_lane;
+	uint64_t chord_abs_post_bb;
+	uint64_t chord_last_end_bb;
+	uint64_t chord_last_ctrl;
+#endif
 };
 
 struct mlx5_ah {
